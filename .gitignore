@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+jobs/
+*.AD.mkv
+*.AD.mp4
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

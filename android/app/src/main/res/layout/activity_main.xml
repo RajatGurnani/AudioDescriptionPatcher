@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="🎬 Audio Description Patcher"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:paddingBottom="16dp" />
+
+    <Button
+        android:id="@+id/pickVideo"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="📹  Choose video" />
+
+    <TextView
+        android:id="@+id/videoName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="no video selected"
+        android:textSize="13sp"
+        android:paddingBottom="8dp" />
+
+    <Button
+        android:id="@+id/pickAd"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="🎧  Choose audio description" />
+
+    <TextView
+        android:id="@+id/adName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="no AD file selected"
+        android:textSize="13sp"
+        android:paddingBottom="8dp" />
+
+    <Button
+        android:id="@+id/goButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:enabled="false"
+        android:text="▶  Patch it" />
+
+    <TextView
+        android:id="@+id/stage"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="12dp"
+        android:text="pick both files to start" />
+
+    <ProgressBar
+        android:id="@+id/bar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="1000" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:paddingTop="8dp">
+
+        <TextView
+            android:id="@+id/log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="11sp" />
+    </ScrollView>
+</LinearLayout>
