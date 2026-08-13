@@ -240,6 +240,21 @@ def fit_alignment(ad_env, vid_env, log=print):
     a, _, _ = _speed_scan(ad20, vid20, coarse_grid)
     fine_grid = np.arange(a - 0.002, a + 0.00201, 0.0002)
     a, lag20, peak = _speed_scan(ad20, vid20, fine_grid)
+
+    # Snap to a "special" ratio (exact 1.0, PAL<->film) when one sits
+    # within a coarse grid step of the winner and correlates almost as
+    # well. On weak-content scans the grid otherwise picks a spuriously
+    # drifted factor a few hundred ppm off, which turns into an audible
+    # sync slope across the runtime.
+    for special in (1.0, 25 / 23.976, 23.976 / 25, 25 / 24, 24 / 25):
+        if abs(special - a) < 0.003 and abs(special - a) > 1e-9:
+            fs, lag_s, peak_s = _speed_scan(ad20, vid20, [special])
+            if peak_s >= 0.98 * peak:
+                log(f"  snapped speed {a:.6f} -> {fs:.6f} "
+                    f"(peak {peak_s:.2f} vs grid {peak:.2f})")
+                a, lag20, peak = fs, lag_s, peak_s
+            break
+
     b = float(lag20 * pool)   # convert 20 Hz lag back to 100 Hz frames
     log(f"  coarse: speed {a:.4f}, offset {b / FPS:+.2f}s (peak {peak:.2f})")
 
@@ -275,6 +290,10 @@ def fit_alignment(ad_env, vid_env, log=print):
             if keep.all() or keep.sum() < 2:
                 break
             confident = [g for g, k in zip(confident, keep) if k]
+    elif len(confident) == 1:
+        # one trustworthy anchor: refine the offset only
+        b2 = confident[0][1] - confident[0][0]
+        log("  one confident segment match; refined offset only")
     else:
         log("  warning: too few confident segment matches; keeping the "
             "coarse global alignment")

@@ -220,10 +220,27 @@ object Aligner {
         var a = speedScan(ad20, vid20, coarse) { onProgress(it * 0.6f) }
             .factor
         val fine = DoubleArray(21) { a - 0.002 + it * 0.0002 }
-        val scan = speedScan(ad20, vid20, fine) {
+        var scan = speedScan(ad20, vid20, fine) {
             onProgress(0.6f + it * 0.3f)
         }
         a = scan.factor
+
+        // Snap to a "special" ratio (exact 1.0, PAL<->film) when one sits
+        // within a coarse grid step of the winner and correlates almost as
+        // well - weak-content scans otherwise pick a spuriously drifted
+        // factor that turns into an audible sync slope.
+        val specials = doubleArrayOf(1.0, 25 / 23.976, 23.976 / 25,
+            25.0 / 24, 24.0 / 25)
+        for (special in specials) {
+            if (abs(special - a) < 0.003 && abs(special - a) > 1e-9) {
+                val s = speedScan(ad20, vid20, doubleArrayOf(special)) {}
+                if (s.score >= 0.98f * scan.score) {
+                    log("snapped speed %.6f -> %.6f".format(a, special))
+                    scan = s; a = s.factor
+                }
+                break
+            }
+        }
         var b = scan.lag.toDouble() * poolF   // back to 100 Hz frames
         log("coarse: speed %.4f, offset %+.2fs (peak %.2f)"
             .format(a, b / fps, scan.score))
@@ -263,6 +280,10 @@ object Aligner {
                 if (kept.size == confident.size || kept.size < 2) return@repeat
                 confident = kept
             }
+        } else if (confident.size == 1) {
+            // one trustworthy anchor: refine the offset only
+            b2 = confident[0].vpos - confident[0].u
+            log("one confident segment match; refined offset only")
         } else {
             log("warning: too few confident matches; keeping coarse alignment")
         }
