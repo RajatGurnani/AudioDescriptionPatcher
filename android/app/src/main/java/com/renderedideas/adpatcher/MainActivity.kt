@@ -71,12 +71,15 @@ class MainActivity : AppCompatActivity() {
         bar = findViewById(R.id.bar)
         logView = findViewById(R.id.log)
 
+        // "*/*" keeps files selectable even when the provider reports an
+        // unexpected mime type (mkv often shows as octet-stream or worse)
         findViewById<Button>(R.id.pickVideo).setOnClickListener {
-            pickVideo.launch(arrayOf("video/*", "application/octet-stream"))
+            pickVideo.launch(arrayOf("video/*",
+                "application/octet-stream", "*/*"))
         }
         findViewById<Button>(R.id.pickAd).setOnClickListener {
             pickAd.launch(arrayOf("audio/*", "video/*",
-                "application/octet-stream"))
+                "application/octet-stream", "*/*"))
         }
         goButton.setOnClickListener {
             val base = displayName(videoUri!!).substringBeforeLast('.')
@@ -104,9 +107,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStage(text: String) = ui { stage.text = text }
 
-    /** Map a phase's 0..1 progress into the overall 0..1000 bar. */
+    /** Map a phase's 0..1 progress into the overall 0..1000 bar,
+     *  throttled so decode callbacks don't flood the UI thread. */
+    @Volatile private var lastBarUpdate = 0L
     private fun phaseProgress(from: Int, to: Int): (Float) -> Unit = { f ->
-        ui { bar.progress = from + ((to - from) * f).toInt() }
+        val now = System.currentTimeMillis()
+        if (f >= 1f || now - lastBarUpdate > 100) {
+            lastBarUpdate = now
+            val target = from + ((to - from) * f).toInt()
+            // never move backwards - jitter reads as flicker
+            ui { if (target > bar.progress) bar.progress = target }
+        }
     }
 
     private fun runPatch(outUri: Uri) {
@@ -123,20 +134,37 @@ class MainActivity : AppCompatActivity() {
 
         thread {
             try {
-                setStage("analyzing video audio…")
-                val vidEnv = AudioEngine.onsetEnvelope(this, videoUri!!,
-                    phaseProgress(0, 300))
+                // decode both audio streams concurrently (separate codecs).
+                // Progress is COMBINED into one monotonic value - two
+                // threads writing separate bar ranges makes it flicker.
+                setStage("analyzing both audio streams…")
+                var vidEnv: FloatArray? = null
+                var adEnv: FloatArray? = null
+                var decodeError: Throwable? = null
+                var pv = 0f
+                var pa = 0f
+                val combined = phaseProgress(0, 550)
+                val tv = Thread {
+                    try {
+                        vidEnv = AudioEngine.onsetEnvelope(this, videoUri!!)
+                        { f -> pv = f; combined((pv + pa) * 0.5f) }
+                    } catch (t: Throwable) { decodeError = t }
+                }
+                val ta = Thread {
+                    try {
+                        adEnv = AudioEngine.onsetEnvelope(this, adUri!!)
+                        { f -> pa = f; combined((pv + pa) * 0.5f) }
+                    } catch (t: Throwable) { decodeError = t }
+                }
+                tv.start(); ta.start(); tv.join(); ta.join()
+                decodeError?.let { throw it }
                 log("video: %.1f min".format(
-                    vidEnv.size / AudioEngine.FPS / 60))
-
-                setStage("analyzing AD audio…")
-                val adEnv = AudioEngine.onsetEnvelope(this, adUri!!,
-                    phaseProgress(300, 550))
+                    vidEnv!!.size / AudioEngine.FPS / 60))
                 log("AD audio: %.1f min".format(
-                    adEnv.size / AudioEngine.FPS / 60))
+                    adEnv!!.size / AudioEngine.FPS / 60))
 
                 setStage("aligning (speed + offset scan)…")
-                val result = Aligner.fitAlignment(adEnv, vidEnv,
+                val result = Aligner.fitAlignment(adEnv!!, vidEnv!!,
                     ::log, phaseProgress(550, 700))
                 log("offset %+.3fs, speed %.6f"
                     .format(result.bSec, result.a))

@@ -128,18 +128,35 @@ object Aligner {
         val n = nextPow2(vid.size + maxLen)
         val vidFft = fftOf(vid, n)
         val vidNorm = norm(vid)
-        var best = ScanResult(1.0, 0, -1f)
-        for ((fi, f) in factors.withIndex()) {
-            val stretched = stretch(ad, f)
-            val cc = crossCorrelate(null, stretched, n, vidFft)
-            var k = 0
-            for (i in cc.indices) if (cc[i] > cc[k]) k = i
-            val score = cc[k] / (vidNorm * norm(stretched) + 1e-9f)
-            if (score > best.score)
-                best = ScanResult(f, if (k > n / 2) k - n else k, score)
-            onProgress((fi + 1).toFloat() / factors.size)
+
+        // The grid is embarrassingly parallel: fan candidates out over the
+        // cores (capped to bound the ~3 float arrays of size 2n each
+        // worker holds live).
+        val workers = minOf(Runtime.getRuntime().availableProcessors(),
+            factors.size, 4)
+        val results = arrayOfNulls<ScanResult>(factors.size)
+        val next = java.util.concurrent.atomic.AtomicInteger(0)
+        val done = java.util.concurrent.atomic.AtomicInteger(0)
+        val threads = (0 until workers).map {
+            Thread {
+                while (true) {
+                    val i = next.getAndIncrement()
+                    if (i >= factors.size) break
+                    val f = factors[i]
+                    val stretched = stretch(ad, f)
+                    val cc = crossCorrelate(null, stretched, n, vidFft)
+                    var k = 0
+                    for (j in cc.indices) if (cc[j] > cc[k]) k = j
+                    val score = cc[k] / (vidNorm * norm(stretched) + 1e-9f)
+                    results[i] =
+                        ScanResult(f, if (k > n / 2) k - n else k, score)
+                    onProgress(done.incrementAndGet().toFloat() /
+                        factors.size)
+                }
+            }.apply { start() }
         }
-        return best
+        threads.forEach { it.join() }
+        return results.filterNotNull().maxByOrNull { it.score }!!
     }
 
     // ------------------------------------------------------------ stage 2
@@ -230,7 +247,7 @@ object Aligner {
         // well - weak-content scans otherwise pick a spuriously drifted
         // factor that turns into an audible sync slope.
         val specials = doubleArrayOf(1.0, 25 / 23.976, 23.976 / 25,
-            25.0 / 24, 24.0 / 25)
+            25.0 / 24, 24.0 / 25, 23.976 / 24, 24 / 23.976)
         for (special in specials) {
             if (abs(special - a) < 0.003 && abs(special - a) > 1e-9) {
                 val s = speedScan(ad20, vid20, doubleArrayOf(special)) {}

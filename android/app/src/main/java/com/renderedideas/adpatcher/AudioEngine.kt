@@ -58,10 +58,18 @@ object AudioEngine {
                 if (format!!.containsKey(MediaFormat.KEY_DURATION))
                     format.getLong(MediaFormat.KEY_DURATION) else 0L
 
-            val codec = MediaCodec.createDecoderByType(
-                format.getString(MediaFormat.KEY_MIME)!!)
-            codec.configure(format, null, null, 0)
-            codec.start()
+            val mime = format.getString(MediaFormat.KEY_MIME)!!
+            val codec = try {
+                MediaCodec.createDecoderByType(mime).apply {
+                    configure(format, null, null, 0)
+                    start()
+                }
+            } catch (e: Exception) {
+                throw RuntimeException(
+                    "this phone has no decoder for audio codec '$mime' " +
+                    "(common for AC3/DTS in MKVs). Re-encode the audio to " +
+                    "AAC on a PC, or use the web app instead.")
+            }
 
             val info = MediaCodec.BufferInfo()
             var inputDone = false

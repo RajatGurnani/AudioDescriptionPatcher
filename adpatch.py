@@ -246,7 +246,8 @@ def fit_alignment(ad_env, vid_env, log=print):
     # well. On weak-content scans the grid otherwise picks a spuriously
     # drifted factor a few hundred ppm off, which turns into an audible
     # sync slope across the runtime.
-    for special in (1.0, 25 / 23.976, 23.976 / 25, 25 / 24, 24 / 25):
+    for special in (1.0, 25 / 23.976, 23.976 / 25, 25 / 24, 24 / 25,
+                    23.976 / 24, 24 / 23.976):
         if abs(special - a) < 0.003 and abs(special - a) > 1e-9:
             fs, lag_s, peak_s = _speed_scan(ad20, vid20, [special])
             if peak_s >= 0.98 * peak:
