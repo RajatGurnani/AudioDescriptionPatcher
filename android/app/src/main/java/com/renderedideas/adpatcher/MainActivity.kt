@@ -101,9 +101,38 @@ class MainActivity : AppCompatActivity() {
 
     private fun ui(block: () -> Unit) = runOnUiThread(block)
 
-    private fun log(line: String) = ui {
-        logView.append(line + "\n")
+    // every log line goes to three places: the on-screen console, Logcat
+    // (adb logcat -s ADPatcher), and a session log file for post-mortems
+    private val sessionLog = StringBuilder()
+
+    private fun log(line: String) {
+        android.util.Log.i(TAG, line)
+        synchronized(sessionLog) { sessionLog.append(line).append('\n') }
+        ui { logView.append(line + "\n") }
     }
+
+    /** Write the session log next to the app's files; returns its path. */
+    private fun dumpSessionLog(): String? = try {
+        val dir = java.io.File(getExternalFilesDir(null), "logs")
+        dir.mkdirs()
+        val f = java.io.File(dir,
+            "adpatch-${System.currentTimeMillis()}.log")
+        f.writeText(synchronized(sessionLog) { sessionLog.toString() })
+        f.absolutePath
+    } catch (e: Exception) {
+        android.util.Log.w(TAG, "could not write session log", e)
+        null
+    }
+
+    private fun <T> timed(name: String, block: () -> T): T {
+        val start = android.os.SystemClock.elapsedRealtime()
+        val r = block()
+        log("⏱ %s: %.1fs".format(name,
+            (android.os.SystemClock.elapsedRealtime() - start) / 1000f))
+        return r
+    }
+
+    companion object { const val TAG = "ADPatcher" }
 
     private fun setStage(text: String) = ui { stage.text = text }
 
@@ -124,6 +153,11 @@ class MainActivity : AppCompatActivity() {
         goButton.isEnabled = false
         bar.progress = 0
         logView.text = ""
+        synchronized(sessionLog) { sessionLog.setLength(0) }
+        log("ADPatcher ${BuildConfig.VERSION_NAME} on " +
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, " +
+            "Android ${android.os.Build.VERSION.RELEASE}, " +
+            "${Runtime.getRuntime().availableProcessors()} cores")
 
         // stay awake for the whole job (long movies take a while)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -144,19 +178,22 @@ class MainActivity : AppCompatActivity() {
                 var pv = 0f
                 var pa = 0f
                 val combined = phaseProgress(0, 550)
-                val tv = Thread {
-                    try {
-                        vidEnv = AudioEngine.onsetEnvelope(this, videoUri!!)
-                        { f -> pv = f; combined((pv + pa) * 0.5f) }
-                    } catch (t: Throwable) { decodeError = t }
+                timed("audio analysis") {
+                    val tv = Thread {
+                        try {
+                            vidEnv = AudioEngine.onsetEnvelope(
+                                this, videoUri!!)
+                            { f -> pv = f; combined((pv + pa) * 0.5f) }
+                        } catch (t: Throwable) { decodeError = t }
+                    }
+                    val ta = Thread {
+                        try {
+                            adEnv = AudioEngine.onsetEnvelope(this, adUri!!)
+                            { f -> pa = f; combined((pv + pa) * 0.5f) }
+                        } catch (t: Throwable) { decodeError = t }
+                    }
+                    tv.start(); ta.start(); tv.join(); ta.join()
                 }
-                val ta = Thread {
-                    try {
-                        adEnv = AudioEngine.onsetEnvelope(this, adUri!!)
-                        { f -> pa = f; combined((pv + pa) * 0.5f) }
-                    } catch (t: Throwable) { decodeError = t }
-                }
-                tv.start(); ta.start(); tv.join(); ta.join()
                 decodeError?.let { throw it }
                 log("video: %.1f min".format(
                     vidEnv!!.size / AudioEngine.FPS / 60))
@@ -164,8 +201,10 @@ class MainActivity : AppCompatActivity() {
                     adEnv!!.size / AudioEngine.FPS / 60))
 
                 setStage("aligning (speed + offset scan)…")
-                val result = Aligner.fitAlignment(adEnv!!, vidEnv!!,
-                    ::log, phaseProgress(550, 700))
+                val result = timed("alignment") {
+                    Aligner.fitAlignment(adEnv!!, vidEnv!!,
+                        ::log, phaseProgress(550, 700))
+                }
                 log("offset %+.3fs, speed %.6f"
                     .format(result.bSec, result.a))
                 for (cp in result.report) {
@@ -179,14 +218,20 @@ class MainActivity : AppCompatActivity() {
                         "the AD file may be for a different cut!")
 
                 setStage("writing output…")
-                Patcher.mux(this, videoUri!!, adUri!!, outUri,
-                    result.a, result.bSec, ::log, phaseProgress(700, 1000))
+                timed("writing output") {
+                    Patcher.mux(this, videoUri!!, adUri!!, outUri,
+                        result.a, result.bSec, ::log,
+                        phaseProgress(700, 1000))
+                }
 
                 setStage("done ✅ saved as new file")
                 ui { bar.progress = 1000 }
+                dumpSessionLog()?.let { log("session log: $it") }
             } catch (t: Throwable) {
                 setStage("failed ❌")
                 log("error: ${t.message ?: t.toString()}")
+                android.util.Log.e(TAG, "patch failed", t)
+                dumpSessionLog()?.let { log("session log: $it") }
             } finally {
                 wakeLock.release()
                 ui {

@@ -26,6 +26,7 @@ import kotlin.math.sqrt
  *  through the (position, matched-position) pairs with outlier rejection.
  */
 object Aligner {
+    private const val TAG = "ADPatcher"
     const val MIN_SEGMENT_SCORE = 0.15f
     const val WEAK_SCORE = 0.12f
 
@@ -228,6 +229,9 @@ object Aligner {
         log: (String) -> Unit, onProgress: (Float) -> Unit
     ): Result {
         val fps = AudioEngine.FPS
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        fun elapsed() =
+            "${(android.os.SystemClock.elapsedRealtime() - t0) / 1000}s"
 
         // Stage 1: coarse (0.2%) then fine (0.02%) speed grid at 20 Hz.
         val poolF = 5
@@ -261,6 +265,8 @@ object Aligner {
         var b = scan.lag.toDouble() * poolF   // back to 100 Hz frames
         log("coarse: speed %.4f, offset %+.2fs (peak %.2f)"
             .format(a, b / fps, scan.score))
+        android.util.Log.d(TAG, "speed scan done at ${elapsed()}: " +
+            "a=$a lag20=${scan.lag} peak=${scan.score}")
 
         // Stage 2: segment refinement on the stretched envelope.
         val a0 = a
@@ -305,6 +311,9 @@ object Aligner {
             log("warning: too few confident matches; keeping coarse alignment")
         }
 
+        android.util.Log.d(TAG, "segment fit done at ${elapsed()}: " +
+            "${matches.size} matches, ${confident.size} confident, " +
+            "a2=$a2 b2=$b2")
         val finalA = a0 * a2
         val finalB = b2
         var weak = 0

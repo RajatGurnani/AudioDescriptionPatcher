@@ -18,6 +18,7 @@ import kotlin.math.sqrt
  * envelopes - a 3-hour film becomes ~1M floats.
  */
 object AudioEngine {
+    private const val TAG = "ADPatcher"
     const val SR = 8000
     const val HOP = 80
     const val FPS = SR.toDouble() / HOP   // envelope frames per second
@@ -59,6 +60,10 @@ object AudioEngine {
                     format.getLong(MediaFormat.KEY_DURATION) else 0L
 
             val mime = format.getString(MediaFormat.KEY_MIME)!!
+            android.util.Log.d(TAG, "decode start: $mime " +
+                "${format.getInteger(MediaFormat.KEY_SAMPLE_RATE)}Hz " +
+                "${format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)}ch " +
+                "dur=${durationUs / 1_000_000}s uri=$uri")
             val codec = try {
                 MediaCodec.createDecoderByType(mime).apply {
                     configure(format, null, null, 0)
@@ -128,6 +133,7 @@ object AudioEngine {
     fun onsetEnvelope(
         context: Context, uri: Uri, onProgress: (Float) -> Unit
     ): FloatArray {
+        val t0 = android.os.SystemClock.elapsedRealtime()
         val energies = ArrayList<Float>(1 shl 18)
         var acc = 0.0f
         var accCount = 0
@@ -182,6 +188,9 @@ object AudioEngine {
         }
         val std = sqrt(varSum / onset.size).toFloat()
         if (std > 0) for (i in onset.indices) onset[i] /= std
+        android.util.Log.d(TAG, "envelope done: ${onset.size} frames " +
+            "(${"%.1f".format(onset.size / FPS / 60)} min) in " +
+            "${(android.os.SystemClock.elapsedRealtime() - t0) / 1000}s")
         return onset
     }
 }

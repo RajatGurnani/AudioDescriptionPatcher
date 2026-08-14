@@ -24,6 +24,7 @@ import kotlin.math.min
  * inaudible for typical PAL drift, and zero when there is no drift.)
  */
 object Patcher {
+    private const val TAG = "ADPatcher"
     private const val OUT_RATE = 44100
     private const val OUT_CHANNELS = 2
     private const val AD_BITRATE = 192_000
@@ -36,6 +37,9 @@ object Patcher {
         a: Double, bSec: Double,
         log: (String) -> Unit, onProgress: (Float) -> Unit
     ) {
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        fun logT(msg: String) = android.util.Log.d(TAG,
+            "$msg at ${(android.os.SystemClock.elapsedRealtime() - t0) / 1000}s")
         val outPfd = context.contentResolver
             .openFileDescriptor(outUri, "rw")
             ?: throw RuntimeException("cannot open output")
@@ -100,6 +104,8 @@ object Patcher {
                             onProgress(0.45f * it / durationUs)
                     }
 
+                    logT("video copy done")
+
                     // ---- copy original audio samples
                     if (origTrackOut >= 0) {
                         log("copying original audio...")
@@ -116,6 +122,7 @@ object Patcher {
                         onProgress(0.55f + 0.45f * it)
                     }
 
+                    logT("AD encode + mux done")
                     muxer.stop()
                     muxer.release()
                 }
