@@ -83,6 +83,7 @@ thresholds; docs/USAGE.md for the user-facing guide.
 Proven approach; existing projects to study or build on:
 
 - **KinoSync** (iOS app) — real-time audio-fingerprint sync of AD tracks to movies; closest existing product, but real-time playback rather than file patching.
+- **[describealign](https://github.com/julbean/describealign)** (Python) — CLOSEST prior art, found late (2026-08): combines videos with AD audio files, piecewise rate alignment (handles mid-movie edit discontinuities our linear model can't), GUI+CLI, alignment plots. No mobile/web story. Benchmark against it; consider adopting its piecewise approach for v2 (check license first).
 - **[audalign](https://github.com/benfmiller/audalign)** (Python, PyPI) — aligns audio files via fingerprinting, cross-correlation, and spectrogram correlation; returns offsets. Strong candidate as the core alignment library.
 - **[SyncSink](https://github.com/JorenSix/SyncSink)** (Java) — fingerprint-based offset detection (~8ms accuracy) between a reference file and other recordings; also detects drift.
 - **[align-videos-by-sound](https://github.com/align-videos-by-sound/align-videos-by-sound)** (Python, ffmpeg + scipy/numpy) — reports time offsets between files sharing a soundtrack.
