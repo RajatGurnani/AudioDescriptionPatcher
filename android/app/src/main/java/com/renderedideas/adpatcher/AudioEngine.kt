@@ -23,6 +23,10 @@ object AudioEngine {
     const val HOP = 80
     const val FPS = SR.toDouble() / HOP   // envelope frames per second
 
+    /** Set from the UI Cancel button; checked in every long-running loop. */
+    @Volatile
+    var cancelRequested = false
+
     /** Decoded PCM chunk: interleaved 16-bit samples + stream properties. */
     class PcmChunk(
         val samples: ShortArray, val channels: Int,
@@ -76,13 +80,26 @@ object AudioEngine {
                     "AAC on a PC, or use the web app instead.")
             }
 
+            // Throughput-tuned decode loop: input is polled non-blocking,
+            // ALL ready output buffers are drained per pass, and the only
+            // blocking wait happens when neither side made progress.
+            // (A naive 10ms-timeout-per-dequeue loop throttles decode to
+            // near-realtime - fatal for 2-hour movies.)
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
+            var channels = 0
+            var sampleRate = 0
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            var nextThroughputLog = 300_000_000L   // every 300s of media
             while (!outputDone) {
+                if (cancelRequested)
+                    throw RuntimeException("cancelled")
+                var progressed = false
                 if (!inputDone) {
-                    val inIdx = codec.dequeueInputBuffer(10_000)
+                    val inIdx = codec.dequeueInputBuffer(0)
                     if (inIdx >= 0) {
+                        progressed = true
                         val buf = codec.getInputBuffer(inIdx)!!
                         val size = extractor.readSampleData(buf, 0)
                         if (size < 0) {
@@ -96,27 +113,53 @@ object AudioEngine {
                         }
                     }
                 }
-                val outIdx = codec.dequeueOutputBuffer(info, 10_000)
-                if (outIdx >= 0) {
+                while (true) {
+                    val outIdx = codec.dequeueOutputBuffer(info,
+                        if (progressed) 0 else 10_000)
+                    if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        val of = codec.outputFormat
+                        channels =
+                            of.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        sampleRate =
+                            of.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        continue
+                    }
+                    if (outIdx < 0) break
+                    progressed = true
                     if (info.size > 0) {
+                        if (channels == 0) {   // format never signalled
+                            val of = codec.outputFormat
+                            channels = of.getInteger(
+                                MediaFormat.KEY_CHANNEL_COUNT)
+                            sampleRate = of.getInteger(
+                                MediaFormat.KEY_SAMPLE_RATE)
+                        }
                         val outBuf = codec.getOutputBuffer(outIdx)!!
                         val shorts = ShortArray(info.size / 2)
                         outBuf.position(info.offset)
                         outBuf.asShortBuffer().get(shorts)
-                        val of = codec.outputFormat
-                        onChunk(PcmChunk(
-                            shorts,
-                            of.getInteger(MediaFormat.KEY_CHANNEL_COUNT),
-                            of.getInteger(MediaFormat.KEY_SAMPLE_RATE),
+                        onChunk(PcmChunk(shorts, channels, sampleRate,
                             info.presentationTimeUs))
                         if (durationUs > 0) onProgress(
                             (info.presentationTimeUs.toFloat() / durationUs)
                                 .coerceIn(0f, 1f))
+                        if (info.presentationTimeUs > nextThroughputLog) {
+                            val wall = (android.os.SystemClock
+                                .elapsedRealtime() - t0) / 1000.0
+                            android.util.Log.d(TAG,
+                                "decode throughput: %.0fs media in %.0fs (%.0fx realtime)"
+                                    .format(info.presentationTimeUs / 1e6,
+                                        wall,
+                                        info.presentationTimeUs / 1e6 / wall))
+                            nextThroughputLog += 300_000_000L
+                        }
                     }
                     codec.releaseOutputBuffer(outIdx, false)
                     if (info.flags and
-                        MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
+                        MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                         outputDone = true
+                        break
+                    }
                 }
             }
             codec.stop(); codec.release(); extractor.release()
@@ -134,7 +177,9 @@ object AudioEngine {
         context: Context, uri: Uri, onProgress: (Float) -> Unit
     ): FloatArray {
         val t0 = android.os.SystemClock.elapsedRealtime()
-        val energies = ArrayList<Float>(1 shl 18)
+        // primitive growth array - ArrayList<Float> boxes every value
+        var energies = FloatArray(1 shl 18)
+        var eCount = 0
         var acc = 0.0f
         var accCount = 0
         // streaming linear-resampler state (native rate -> SR)
@@ -162,17 +207,20 @@ object AudioEngine {
                 val v = s0 + (s1 - s0) * frac
                 acc += v * v
                 if (++accCount == HOP) {
-                    energies.add(acc); acc = 0f; accCount = 0
+                    if (eCount == energies.size)
+                        energies = energies.copyOf(energies.size * 2)
+                    energies[eCount++] = acc
+                    acc = 0f; accCount = 0
                 }
                 nextPos += step
             }
             prevLast = mono[n - 1]
             globalIn += n
         }
-        if (energies.size < 2) throw RuntimeException("audio too short")
+        if (eCount < 2) throw RuntimeException("audio too short")
 
         // log-energy delta, rectified, z-normalized (same as adpatch.py)
-        val logE = FloatArray(energies.size) {
+        val logE = FloatArray(eCount) {
             log10(energies[it].toDouble() + 1e-9).toFloat()
         }
         val onset = FloatArray(logE.size - 1) {

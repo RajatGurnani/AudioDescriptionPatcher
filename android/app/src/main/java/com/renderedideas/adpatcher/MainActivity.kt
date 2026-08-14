@@ -60,6 +60,11 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) runPatch(uri)
     }
 
+    private val askNotifPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()) { /* best effort */ }
+
+    private var isRunning = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -82,8 +87,13 @@ class MainActivity : AppCompatActivity() {
                 "application/octet-stream", "*/*"))
         }
         goButton.setOnClickListener {
-            val base = displayName(videoUri!!).substringBeforeLast('.')
-            createOutput.launch("$base.AD.mp4")
+            if (isRunning) {
+                AudioEngine.cancelRequested = true
+                setStage("cancelling…")
+            } else {
+                val base = displayName(videoUri!!).substringBeforeLast('.')
+                createOutput.launch("$base.AD.mp4")
+            }
         }
     }
 
@@ -150,10 +160,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runPatch(outUri: Uri) {
-        goButton.isEnabled = false
+        isRunning = true
+        AudioEngine.cancelRequested = false
+        goButton.text = "✖  Cancel"
         bar.progress = 0
         logView.text = ""
         synchronized(sessionLog) { sessionLog.setLength(0) }
+
+        // foreground service = full-speed CPU even when the user switches
+        // apps; notification permission is best-effort (Android 13+)
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission
+                .POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            askNotifPermission.launch(
+                android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        PatchService.start(this)
         log("ADPatcher ${BuildConfig.VERSION_NAME} on " +
             "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, " +
             "Android ${android.os.Build.VERSION.RELEASE}, " +
@@ -228,15 +251,23 @@ class MainActivity : AppCompatActivity() {
                 ui { bar.progress = 1000 }
                 dumpSessionLog()?.let { log("session log: $it") }
             } catch (t: Throwable) {
-                setStage("failed ❌")
-                log("error: ${t.message ?: t.toString()}")
-                android.util.Log.e(TAG, "patch failed", t)
-                dumpSessionLog()?.let { log("session log: $it") }
+                if (t.message == "cancelled") {
+                    setStage("cancelled ✋")
+                    log("job cancelled by user")
+                } else {
+                    setStage("failed ❌")
+                    log("error: ${t.message ?: t.toString()}")
+                    android.util.Log.e(TAG, "patch failed", t)
+                    dumpSessionLog()?.let { log("session log: $it") }
+                }
             } finally {
                 wakeLock.release()
+                PatchService.stop(this)
                 ui {
                     window.clearFlags(
                         WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    isRunning = false
+                    goButton.text = "▶  Patch it"
                     goButton.isEnabled = true
                 }
             }

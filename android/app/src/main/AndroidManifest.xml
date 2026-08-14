@@ -3,11 +3,20 @@
 
     <!-- keeps the CPU running while a patch job is in progress -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- foreground service exempts the job from background CPU throttling -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="AD Patcher"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar"
         android:allowBackup="true">
+        <service
+            android:name=".PatchService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

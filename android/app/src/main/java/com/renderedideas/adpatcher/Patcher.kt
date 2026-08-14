@@ -140,6 +140,8 @@ object Patcher {
         val buf = ByteBuffer.allocateDirect(4 shl 20)
         val info = MediaCodec.BufferInfo()
         while (true) {
+            if (AudioEngine.cancelRequested)
+                throw RuntimeException("cancelled")
             val size = extractor.readSampleData(buf, 0)
             if (size < 0) break
             info.set(0, size, extractor.sampleTime,

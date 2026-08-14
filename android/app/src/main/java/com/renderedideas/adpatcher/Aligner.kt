@@ -141,6 +141,7 @@ object Aligner {
         val threads = (0 until workers).map {
             Thread {
                 while (true) {
+                    if (AudioEngine.cancelRequested) break
                     val i = next.getAndIncrement()
                     if (i >= factors.size) break
                     val f = factors[i]
@@ -157,6 +158,8 @@ object Aligner {
             }.apply { start() }
         }
         threads.forEach { it.join() }
+        if (AudioEngine.cancelRequested)
+            throw RuntimeException("cancelled")
         return results.filterNotNull().maxByOrNull { it.score }!!
     }
 
