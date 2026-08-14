@@ -144,7 +144,28 @@ class MainActivity : AppCompatActivity() {
 
     companion object { const val TAG = "ADPatcher" }
 
-    private fun setStage(text: String) = ui { stage.text = text }
+    @Volatile private var stageBase = ""
+    @Volatile private var phaseStartMs = 0L
+
+    private fun setStage(text: String) {
+        stageBase = text
+        phaseStartMs = System.currentTimeMillis()
+        ui { stage.text = text }
+    }
+
+    /** "aligning…  42% · ~3 min left" - keeps slow phases from reading
+     *  as frozen. */
+    private fun stageWithEta(f: Float) {
+        if (f < 0.03f || f > 0.999f || phaseStartMs == 0L) return
+        val elapsed = System.currentTimeMillis() - phaseStartMs
+        val remainMs = (elapsed * (1 - f) / f).toLong()
+        val eta = when {
+            remainMs > 90_000 -> "~${remainMs / 60_000 + 1} min left"
+            else -> "~${remainMs / 1000 + 1}s left"
+        }
+        val text = "$stageBase  ${(f * 100).toInt()}% · $eta"
+        ui { stage.text = text }
+    }
 
     /** Map a phase's 0..1 progress into the overall 0..1000 bar,
      *  throttled so decode callbacks don't flood the UI thread. */
@@ -156,6 +177,7 @@ class MainActivity : AppCompatActivity() {
             val target = from + ((to - from) * f).toInt()
             // never move backwards - jitter reads as flicker
             ui { if (target > bar.progress) bar.progress = target }
+            stageWithEta(f)
         }
     }
 
@@ -204,14 +226,15 @@ class MainActivity : AppCompatActivity() {
                 timed("audio analysis") {
                     val tv = Thread {
                         try {
-                            vidEnv = AudioEngine.onsetEnvelope(
-                                this, videoUri!!)
+                            vidEnv = AudioEngine.onsetEnvelopeParallel(
+                                this, videoUri!!, 2)
                             { f -> pv = f; combined((pv + pa) * 0.5f) }
                         } catch (t: Throwable) { decodeError = t }
                     }
                     val ta = Thread {
                         try {
-                            adEnv = AudioEngine.onsetEnvelope(this, adUri!!)
+                            adEnv = AudioEngine.onsetEnvelopeParallel(
+                                this, adUri!!, 2)
                             { f -> pa = f; combined((pv + pa) * 0.5f) }
                         } catch (t: Throwable) { decodeError = t }
                     }

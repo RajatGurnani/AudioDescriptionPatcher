@@ -8,6 +8,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -17,20 +18,39 @@ import kotlin.math.min
  *   track 1: corrected AD audio, AAC 192k (offset + speed applied)
  *   track 2: original audio, copied when its codec fits in MP4
  *
- * The AD correction resamples on the fly: output frame j (at 48/44.1 kHz)
- * reads AD input position ((j/outRate - b) / a) * inRate with linear
- * interpolation - one pass handles offset, drift and sample-rate
- * conversion together. (When a != 1 pitch shifts by the same few percent;
- * inaudible for typical PAL drift, and zero when there is no drift.)
+ * Wall-clock structure: the video/original-audio copy (I/O-bound) and the
+ * AD decode->resample->encode chain (CPU-bound) run CONCURRENTLY into the
+ * muxer, guarded by a lock. Inside the AD chain, decoding runs on its own
+ * thread feeding a bounded queue, so the decoder, the sample math, and the
+ * AAC encoder overlap instead of taking turns.
+ *
+ * The AD correction resamples on the fly: output frame j reads AD input
+ * position ((j/outRate - b) / a) * inRate - maintained INCREMENTALLY
+ * (position += step per frame; no divisions in the hot loop). When a != 1
+ * pitch shifts by the same few percent; inaudible for typical drift and
+ * zero when there is no drift.
  */
 object Patcher {
     private const val TAG = "ADPatcher"
-    private const val OUT_RATE = 44100
     private const val OUT_CHANNELS = 2
     private const val AD_BITRATE = 192_000
 
     private val COPYABLE_AUDIO = setOf(
         MediaFormat.MIMETYPE_AUDIO_AAC, "audio/ac3", "audio/eac3")
+
+    // AAC AudioSpecificConfig frequency indices for supported output rates
+    private val AAC_FREQ_IDX = mapOf(
+        96000 to 0, 88200 to 1, 64000 to 2,
+        48000 to 3, 44100 to 4, 32000 to 5)
+
+    /** csd-0 for AAC-LC stereo at [rate], built by hand so the muxer can
+     *  start before the encoder produces any output. */
+    private fun aacCsd(rate: Int): ByteArray {
+        val idx = AAC_FREQ_IDX[rate]!!
+        val b0 = (2 shl 3) or (idx shr 1)               // objType=LC
+        val b1 = ((idx and 1) shl 7) or (OUT_CHANNELS shl 3)
+        return byteArrayOf(b0.toByte(), b1.toByte())
+    }
 
     fun mux(
         context: Context, videoUri: Uri, adUri: Uri, outUri: Uri,
@@ -40,14 +60,20 @@ object Patcher {
         val t0 = android.os.SystemClock.elapsedRealtime()
         fun logT(msg: String) = android.util.Log.d(TAG,
             "$msg at ${(android.os.SystemClock.elapsedRealtime() - t0) / 1000}s")
+
+        // match the AD file's native rate when AAC supports it - the
+        // common no-drift case then needs no rate conversion at all
+        val (_, adNativeRate) = AudioEngine.probeAudio(context, adUri)
+        val outRate =
+            if (AAC_FREQ_IDX.containsKey(adNativeRate)) adNativeRate
+            else 44100
+
         val outPfd = context.contentResolver
             .openFileDescriptor(outUri, "rw")
             ?: throw RuntimeException("cannot open output")
         outPfd.use { pfd ->
             val muxer = MediaMuxer(pfd.fileDescriptor,
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-
-            // ---- discover input tracks
             val vext = MediaExtractor()
             context.contentResolver.openFileDescriptor(videoUri, "r")!!
                 .use { vfd ->
@@ -72,13 +98,11 @@ object Patcher {
 
                     val videoTrackOut = muxer.addTrack(videoFormat!!)
 
-                    // AD track: AAC-LC 44100 stereo; csd-0 built by hand so
-                    // the muxer can start before the encoder produces output
                     val adFormat = MediaFormat.createAudioFormat(
                         MediaFormat.MIMETYPE_AUDIO_AAC,
-                        OUT_RATE, OUT_CHANNELS)
+                        outRate, OUT_CHANNELS)
                     adFormat.setByteBuffer("csd-0",
-                        ByteBuffer.wrap(byteArrayOf(0x12, 0x10)))
+                        ByteBuffer.wrap(aacCsd(outRate)))
                     val adTrackOut = muxer.addTrack(adFormat)
 
                     var origTrackOut = -1
@@ -92,37 +116,40 @@ object Patcher {
                     }
 
                     muxer.start()
-
-                    // ---- copy video samples
-                    log("copying video stream...")
+                    val muxerLock = Any()
                     val durationUs =
                         if (videoFormat.containsKey(MediaFormat.KEY_DURATION))
                             videoFormat.getLong(MediaFormat.KEY_DURATION)
                         else 0L
-                    copyTrack(vext, videoTrackIn, muxer, videoTrackOut) {
-                        if (durationUs > 0)
-                            onProgress(0.45f * it / durationUs)
-                    }
 
-                    logT("video copy done")
+                    // copy thread: video samples, then original audio -
+                    // I/O-bound, hides inside the AD encode below
+                    var copyError: Throwable? = null
+                    val copyThread = Thread {
+                        try {
+                            log("copying video stream...")
+                            copyTrack(vext, videoTrackIn, muxer,
+                                muxerLock, videoTrackOut)
+                            logT("video copy done")
+                            if (origTrackOut >= 0) {
+                                log("copying original audio...")
+                                copyTrack(vext, audioTrackIn, muxer,
+                                    muxerLock, origTrackOut)
+                                logT("original audio copy done")
+                            }
+                        } catch (t: Throwable) { copyError = t }
+                    }.apply { start() }
 
-                    // ---- copy original audio samples
-                    if (origTrackOut >= 0) {
-                        log("copying original audio...")
-                        copyTrack(vext, audioTrackIn, muxer, origTrackOut) {
-                            if (durationUs > 0)
-                                onProgress(0.45f + 0.1f * it / durationUs)
-                        }
-                    }
-                    vext.release()
-
-                    // ---- corrected AD audio
                     log("writing aligned AD audio...")
-                    writeAdTrack(context, adUri, muxer, adTrackOut, a, bSec) {
-                        onProgress(0.55f + 0.45f * it)
-                    }
-
+                    var adError: Throwable? = null
+                    try {
+                        writeAdTrack(context, adUri, muxer, muxerLock,
+                            adTrackOut, a, bSec, outRate, onProgress)
+                    } catch (t: Throwable) { adError = t }
+                    copyThread.join()
                     logT("AD encode + mux done")
+                    (adError ?: copyError)?.let { throw it }
+
                     muxer.stop()
                     muxer.release()
                 }
@@ -132,11 +159,12 @@ object Patcher {
     /** Copy every sample of one extractor track into a muxer track. */
     private fun copyTrack(
         extractor: MediaExtractor, trackIn: Int,
-        muxer: MediaMuxer, trackOut: Int,
-        onPts: (Long) -> Unit
+        muxer: MediaMuxer, muxerLock: Any, trackOut: Int
     ) {
-        extractor.selectTrack(trackIn)
-        extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        synchronized(extractor) {
+            extractor.selectTrack(trackIn)
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        }
         val buf = ByteBuffer.allocateDirect(4 shl 20)
         val info = MediaCodec.BufferInfo()
         while (true) {
@@ -148,26 +176,28 @@ object Patcher {
                 if (extractor.sampleFlags and
                     MediaExtractor.SAMPLE_FLAG_SYNC != 0)
                     MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
-            muxer.writeSampleData(trackOut, buf, info)
-            onPts(extractor.sampleTime)
+            synchronized(muxerLock) {
+                muxer.writeSampleData(trackOut, buf, info)
+            }
             extractor.advance()
         }
         extractor.unselectTrack(trackIn)
     }
 
     /**
-     * Decode the AD file, apply `t_out = a * t_in + b` by resampled
-     * streaming, AAC-encode and mux. Everything is pipelined inside the
-     * decode callback; only a small PCM window is held in memory.
+     * Decode the AD file on a feeder thread, resample/shift on this
+     * thread with an incremental position accumulator, AAC-encode, and
+     * mux. Only a small PCM window is ever in memory.
      */
     private fun writeAdTrack(
-        context: Context, adUri: Uri, muxer: MediaMuxer, track: Int,
-        a: Double, bSec: Double, onProgress: (Float) -> Unit
+        context: Context, adUri: Uri, muxer: MediaMuxer, muxerLock: Any,
+        track: Int, a: Double, bSec: Double, outRate: Int,
+        onProgress: (Float) -> Unit
     ) {
         val encoder = MediaCodec.createEncoderByType(
             MediaFormat.MIMETYPE_AUDIO_AAC)
         val fmt = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC, OUT_RATE, OUT_CHANNELS)
+            MediaFormat.MIMETYPE_AUDIO_AAC, outRate, OUT_CHANNELS)
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, AD_BITRATE)
         fmt.setInteger(MediaFormat.KEY_AAC_PROFILE,
             MediaCodecInfo.CodecProfileLevel.AACObjectLC)
@@ -175,45 +205,63 @@ object Patcher {
         encoder.configure(fmt, null, null,
             MediaCodec.CONFIGURE_FLAG_ENCODE)
         encoder.start()
+        val sink = EncoderSink(encoder, muxer, muxerLock, track, outRate)
 
-        val sink = EncoderSink(encoder, muxer, track)
+        // feeder: decoder runs concurrently, pushing into a bounded queue
+        val sentinel = AudioEngine.PcmChunk(ShortArray(0), 0, 0, -1)
+        val queue = ArrayBlockingQueue<AudioEngine.PcmChunk>(64)
+        var decodeError: Throwable? = null
+        val feeder = Thread {
+            try {
+                AudioEngine.decodeAudio(context, adUri,
+                    onProgress = onProgress) { queue.put(it) }
+            } catch (t: Throwable) {
+                decodeError = t
+            } finally {
+                // offer (not put): if the consumer died, don't hang forever
+                queue.offer(sentinel, 5,
+                    java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }.apply { start() }
 
         // sliding window of decoded stereo PCM, absolute frame indexing
-        val capacity = 1 shl 19            // ~12 s of stereo at 44.1k
+        val capacity = 1 shl 19
         val window = FloatArray(capacity * OUT_CHANNELS)
-        var winStart = 0L                   // absolute index of window[0]
-        var winCount = 0                    // valid frames in window
+        var winStart = 0L
+        var winCount = 0
         var inRate = 0
-        var outFrame = 0L                   // next output frame index
+        var outFrame = 0L
         var totalIn = 0L
         var inputDone = false
+        // incremental resampler state: p = input-frame position of the
+        // next output frame; advances by `step` per output frame
+        var p = 0.0
+        var step = 0.0
 
-        // generate as many output frames as the window allows
+        val frame = ShortArray(1024 * OUT_CHANNELS)
+
         fun pump() {
             if (inRate == 0) return
-            val step = inRate / (OUT_RATE * a)
-            val frame = ShortArray(1024 * OUT_CHANNELS)
             while (true) {
                 var produced = 0
                 while (produced < 1024) {
-                    val t = outFrame / OUT_RATE.toDouble()
-                    val p = (t - bSec) / a * inRate
-                    if (p < 0) {                        // before AD start
+                    if (p < 0) {
                         frame[produced * 2] = 0
                         frame[produced * 2 + 1] = 0
                     } else {
                         val i = p.toLong()
-                        if (!inputDone && i + 1 >= winStart + winCount) {
-                            // need more decoded data for this frame
-                            if (produced > 0) sink.feed(frame, produced,
-                                outFrame - produced)
-                            return
-                        }
-                        if (i + 1 >= totalIn && inputDone) {
-                            if (produced > 0) sink.feed(frame, produced,
-                                outFrame - produced)
-                            sink.finish()
-                            return
+                        if (i + 1 >= winStart + winCount) {
+                            if (!inputDone) {
+                                if (produced > 0) sink.feed(frame,
+                                    produced, outFrame - produced)
+                                return
+                            }
+                            if (i + 1 >= totalIn) {
+                                if (produced > 0) sink.feed(frame,
+                                    produced, outFrame - produced)
+                                sink.finish()
+                                return
+                            }
                         }
                         val local = ((i - winStart).toInt()) * OUT_CHANNELS
                         val f = (p - i).toFloat()
@@ -225,12 +273,11 @@ object Patcher {
                                 v.coerceIn(-32768f, 32767f).toInt().toShort()
                         }
                     }
-                    produced++; outFrame++
+                    produced++; outFrame++; p += step
                 }
                 sink.feed(frame, produced, outFrame - produced)
                 // drop consumed window data (keep 4 frames of guard)
-                val needed = ((outFrame / OUT_RATE.toDouble() - bSec)
-                    / a * inRate).toLong() - 4
+                val needed = p.toLong() - 4
                 if (needed > winStart) {
                     val drop = min(needed - winStart, winCount.toLong())
                         .toInt()
@@ -238,15 +285,29 @@ object Patcher {
                         (winCount - drop) * OUT_CHANNELS)
                     winStart += drop; winCount -= drop
                 }
-                if (step <= 0) return
             }
         }
 
-        var adDurationUs = 0L
-        adDurationUs = AudioEngine.decodeAudio(context, adUri,
-            onProgress = onProgress) { chunk ->
-            if (inRate == 0) inRate = chunk.sampleRate
+        while (true) {
+            if (AudioEngine.cancelRequested) {
+                feeder.interrupt()
+                throw RuntimeException("cancelled")
+            }
+            val chunk = queue.take()
+            if (chunk === sentinel) break
+            if (inRate == 0) {
+                inRate = chunk.sampleRate
+                step = inRate / (outRate * a)
+                p = (-bSec / a) * inRate
+            }
             val frames = chunk.samples.size / chunk.channels
+            // input wholly before the first needed position (large trim):
+            // skip it without buffering, or the window would overflow
+            if (p > 4 && totalIn + frames < p.toLong() - 4) {
+                totalIn += frames
+                winStart = totalIn
+                continue
+            }
             if (winCount + frames > capacity) pump()
             if (winCount + frames > capacity)
                 throw RuntimeException("internal: PCM window overflow")
@@ -269,19 +330,23 @@ object Patcher {
             totalIn += frames
             pump()
         }
+        decodeError?.let { throw it }
         inputDone = true
-        pump()          // flush the tail
-        sink.finish()   // no-op if already finished
+        pump()
+        sink.finish()
     }
 
     /**
      * Feeds PCM into the AAC encoder and writes encoded packets to the
-     * muxer. CODEC_CONFIG packets are skipped (csd-0 was set manually).
+     * muxer (under the shared lock). CODEC_CONFIG packets are skipped
+     * (csd-0 was set manually).
      */
     private class EncoderSink(
         private val encoder: MediaCodec,
         private val muxer: MediaMuxer,
-        private val track: Int
+        private val muxerLock: Any,
+        private val track: Int,
+        private val outRate: Int
     ) {
         private val info = MediaCodec.BufferInfo()
         private var finished = false
@@ -298,7 +363,7 @@ object Patcher {
                 buf.clear()
                 buf.asShortBuffer().put(frames, offset * OUT_CHANNELS,
                     n * OUT_CHANNELS)
-                val ptsUs = (firstFrame + offset) * 1_000_000L / OUT_RATE
+                val ptsUs = (firstFrame + offset) * 1_000_000L / outRate
                 encoder.queueInputBuffer(idx, 0, n * 2 * OUT_CHANNELS,
                     ptsUs, 0)
                 offset += n
@@ -310,7 +375,7 @@ object Patcher {
             if (finished) return
             finished = true
             var tries = 0
-            while (tries++ < 50) {   // keep draining until EOS is accepted
+            while (tries++ < 50) {
                 val idx = encoder.dequeueInputBuffer(100_000)
                 if (idx >= 0) {
                     encoder.queueInputBuffer(idx, 0, 0, 0,
@@ -333,8 +398,10 @@ object Patcher {
                 if (idx < 0) continue
                 if (info.size > 0 && info.flags and
                     MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                    muxer.writeSampleData(track,
-                        encoder.getOutputBuffer(idx)!!, info)
+                    synchronized(muxerLock) {
+                        muxer.writeSampleData(track,
+                            encoder.getOutputBuffer(idx)!!, info)
+                    }
                 }
                 encoder.releaseOutputBuffer(idx, false)
                 if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
