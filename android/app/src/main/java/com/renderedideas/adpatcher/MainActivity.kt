@@ -75,6 +75,8 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.google.android.material.color.DynamicColors
+            .applyToActivityIfAvailable(this)
         setContentView(R.layout.activity_main)
 
         videoName = findViewById(R.id.videoName)
@@ -83,6 +85,19 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
         stage = findViewById(R.id.stage)
         bar = findViewById(R.id.bar)
         logView = findViewById(R.id.log)
+
+        val toolbar = findViewById<
+            com.google.android.material.appbar.MaterialToolbar>(R.id.toolbar)
+        toolbar.inflateMenu(R.menu.main_menu)
+        toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.menuLogs -> startActivity(
+                    Intent(this, LogsActivity::class.java))
+                R.id.menuUpdate -> UpdateChecker.check(this, manual = true)
+                R.id.menuClear -> confirmClearCache()
+            }
+            true
+        }
 
         findViewById<Button>(R.id.pickVideo).setOnClickListener {
             pickVideo.launch(arrayOf("video/*",
@@ -102,15 +117,6 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
         }
         findViewById<Button>(R.id.btnVault).setOnClickListener {
             startActivity(Intent(this, VaultActivity::class.java))
-        }
-        findViewById<Button>(R.id.btnLogs).setOnClickListener {
-            startActivity(Intent(this, LogsActivity::class.java))
-        }
-        findViewById<Button>(R.id.btnUpdate).setOnClickListener {
-            UpdateChecker.check(this, manual = true)
-        }
-        findViewById<Button>(R.id.btnClear).setOnClickListener {
-            confirmClearCache()
         }
 
         restoreInputs()
@@ -154,12 +160,19 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
             JobRunner.stageBase
         else "${JobRunner.stageBase}  ${JobRunner.stageDetail}"
         bar.progress = JobRunner.barProgress
-        logView.text = JobRunner.logSnapshot()
+        val logSnap = JobRunner.logSnapshot()
+        logView.text = logSnap
+        findViewById<android.view.View>(R.id.progressCard).visibility =
+            if (s == JobRunner.Status.IDLE) android.view.View.GONE
+            else android.view.View.VISIBLE
+        findViewById<android.view.View>(R.id.logScroll).visibility =
+            if (logSnap.isBlank()) android.view.View.GONE
+            else android.view.View.VISIBLE
 
         if (s != lastRenderedStatus) {
             lastRenderedStatus = s
             val running = s == JobRunner.Status.RUNNING
-            goButton.text = if (running) "✖  Cancel" else "▶  Patch it"
+            goButton.text = if (running) "Cancel" else "Patch it"
             goButton.isEnabled = running ||
                     (videoUri != null && adUri != null)
             if (running)

@@ -25,6 +25,8 @@ class LogsActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.google.android.material.color.DynamicColors
+            .applyToActivityIfAvailable(this)
         title = "Logs"
 
         val root = LinearLayout(this).apply {

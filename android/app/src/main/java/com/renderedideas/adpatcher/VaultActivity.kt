@@ -65,6 +65,8 @@ class VaultActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.google.android.material.color.DynamicColors
+            .applyToActivityIfAvailable(this)
         webView = WebView(this)
         setContentView(webView)
         title = "AudioVault"

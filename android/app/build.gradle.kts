@@ -11,8 +11,8 @@ android {
         applicationId = "com.renderedideas.adpatcher"
         minSdk = 26        // MediaMuxer multi-track needs API 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.3.0"
+        versionCode = 5
+        versionName = "0.3.1"
     }
 
     buildTypes {

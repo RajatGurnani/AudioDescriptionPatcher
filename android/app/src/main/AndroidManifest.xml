@@ -16,7 +16,8 @@
 
     <application
         android:label="AD Patcher"
-        android:theme="@style/Theme.Material3.DayNight.NoActionBar"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.ADPatcher"
         android:allowBackup="true">
 
         <service

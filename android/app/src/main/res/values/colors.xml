@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="adp_background">#0F1014</color>
+    <color name="adp_surface">#17181D</color>
+    <color name="adp_surface_high">#1E2027</color>
+    <color name="ic_launcher_background">#274690</color>
+</resources>

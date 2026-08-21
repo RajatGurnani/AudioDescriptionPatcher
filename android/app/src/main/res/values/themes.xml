@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Committed dark look: consistent surfaces, no light status bar
+         clash. Dynamic color (Android 12+) is applied at runtime and
+         re-tints primaries from the user's wallpaper. -->
+    <style name="Theme.ADPatcher"
+        parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:colorBackground">@color/adp_background</item>
+        <item name="colorSurface">@color/adp_surface</item>
+        <item name="colorSurfaceContainer">@color/adp_surface_high</item>
+        <item name="android:statusBarColor">@color/adp_background</item>
+        <item name="android:navigationBarColor">@color/adp_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

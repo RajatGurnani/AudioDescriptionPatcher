@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/menuLogs"
+        android:title="Logs"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/menuUpdate"
+        android:title="Check for updates"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/menuClear"
+        android:title="Clear cache"
+        app:showAsAction="never" />
+</menu>
