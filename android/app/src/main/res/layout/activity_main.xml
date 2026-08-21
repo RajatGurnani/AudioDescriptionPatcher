@@ -11,12 +11,57 @@
         android:text="🎬 Audio Description Patcher"
         android:textSize="20sp"
         android:textStyle="bold"
-        android:paddingBottom="16dp" />
+        android:paddingBottom="8dp" />
+
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnVault"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Open AudioVault to download audio description files"
+                android:text="🌐 Get AD files" />
+
+            <Button
+                android:id="@+id/btnLogs"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="View session logs"
+                android:text="📋 Logs" />
+
+            <Button
+                android:id="@+id/btnUpdate"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Check for app updates"
+                android:text="⬇ Update" />
+
+            <Button
+                android:id="@+id/btnClear"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Clear cached logs and downloads"
+                android:text="🧹 Clear cache" />
+        </LinearLayout>
+    </HorizontalScrollView>
 
     <Button
         android:id="@+id/pickVideo"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:contentDescription="Choose the video file"
         android:text="📹  Choose video" />
 
     <TextView
@@ -31,6 +76,7 @@
         android:id="@+id/pickAd"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:contentDescription="Choose the audio description file"
         android:text="🎧  Choose audio description" />
 
     <TextView
@@ -53,6 +99,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingTop="12dp"
+        android:accessibilityLiveRegion="polite"
         android:text="pick both files to start" />
 
     <ProgressBar
@@ -73,6 +120,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:fontFamily="monospace"
+            android:importantForAccessibility="no"
             android:textSize="11sp" />
     </ScrollView>
 </LinearLayout>

@@ -1,27 +1,26 @@
 package com.renderedideas.adpatcher
 
-import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import kotlin.concurrent.thread
+import java.io.File
 
 /**
- * One-screen flow: pick video -> pick AD audio -> pick where to save ->
- * watch progress. The heavy lifting lives in AudioEngine (decode +
- * envelopes), Aligner (find offset/speed) and Patcher (write the MP4).
- *
- * A partial wake lock + FLAG_KEEP_SCREEN_ON hold the device awake for the
- * whole job so long movies don't get killed mid-patch.
+ * UI shell over [JobRunner]: pick video -> pick AD audio -> pick where to
+ * save -> watch progress. The job itself runs in JobRunner under the
+ * foreground [PatchService], so it survives this activity being closed
+ * or swiped away; reopening the app reattaches to the live job.
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), JobRunner.Listener {
 
     private var videoUri: Uri? = null
     private var adUri: Uri? = null
@@ -33,13 +32,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bar: ProgressBar
     private lateinit var logView: TextView
 
+    private var lastRenderedStatus: JobRunner.Status? = null
+
     private val pickVideo = registerForActivityResult(
         ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             contentResolver.takePersistableUriPermission(uri,
-                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                Intent.FLAG_GRANT_READ_URI_PERMISSION)
             videoUri = uri
             videoName.text = displayName(uri)
+            JobStore.saveLastInputs(this, uri, null)
             updateButton()
         }
     }
@@ -48,22 +50,28 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             contentResolver.takePersistableUriPermission(uri,
-                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                Intent.FLAG_GRANT_READ_URI_PERMISSION)
             adUri = uri
             adName.text = displayName(uri)
+            JobStore.saveLastInputs(this, null, uri)
             updateButton()
         }
     }
 
     private val createOutput = registerForActivityResult(
         ActivityResultContracts.CreateDocument("video/mp4")) { uri ->
-        if (uri != null) runPatch(uri)
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            } catch (_: Exception) { /* some providers refuse; job still runs */ }
+            startJob(uri)
+        }
     }
 
     private val askNotifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()) { /* best effort */ }
-
-    private var isRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,8 +84,6 @@ class MainActivity : AppCompatActivity() {
         bar = findViewById(R.id.bar)
         logView = findViewById(R.id.log)
 
-        // "*/*" keeps files selectable even when the provider reports an
-        // unexpected mime type (mkv often shows as octet-stream or worse)
         findViewById<Button>(R.id.pickVideo).setOnClickListener {
             pickVideo.launch(arrayOf("video/*",
                 "application/octet-stream", "*/*"))
@@ -87,110 +93,96 @@ class MainActivity : AppCompatActivity() {
                 "application/octet-stream", "*/*"))
         }
         goButton.setOnClickListener {
-            if (isRunning) {
-                AudioEngine.cancelRequested = true
-                setStage("cancelling…")
+            if (JobRunner.status == JobRunner.Status.RUNNING) {
+                JobRunner.cancel()
             } else {
                 val base = displayName(videoUri!!).substringBeforeLast('.')
                 createOutput.launch("$base.AD.mp4")
             }
         }
+        findViewById<Button>(R.id.btnVault).setOnClickListener {
+            startActivity(Intent(this, VaultActivity::class.java))
+        }
+        findViewById<Button>(R.id.btnLogs).setOnClickListener {
+            startActivity(Intent(this, LogsActivity::class.java))
+        }
+        findViewById<Button>(R.id.btnUpdate).setOnClickListener {
+            UpdateChecker.check(this, manual = true)
+        }
+        findViewById<Button>(R.id.btnClear).setOnClickListener {
+            confirmClearCache()
+        }
+
+        restoreInputs()
+        offerResumeIfAny()
+        UpdateChecker.check(this, manual = false)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        JobRunner.attach(this)
+    }
+
+    override fun onStop() {
+        JobRunner.attach(null)
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // an AudioVault download finished while we were away?
+        JobStore.takeVaultDownload(this)?.let { path ->
+            val f = File(path)
+            if (f.exists()) {
+                adUri = Uri.fromFile(f)
+                adName.text = f.name
+                JobStore.saveLastInputs(this, null, adUri)
+                updateButton()
+            }
+        }
+    }
+
+    // ------------------------------------------------------ job rendering
+
+    override fun onJobUpdate() {
+        runOnUiThread { render() }
+    }
+
+    private fun render() {
+        val s = JobRunner.status
+        stage.text = if (JobRunner.stageDetail.isEmpty())
+            JobRunner.stageBase
+        else "${JobRunner.stageBase}  ${JobRunner.stageDetail}"
+        bar.progress = JobRunner.barProgress
+        logView.text = JobRunner.logSnapshot()
+
+        if (s != lastRenderedStatus) {
+            lastRenderedStatus = s
+            val running = s == JobRunner.Status.RUNNING
+            goButton.text = if (running) "✖  Cancel" else "▶  Patch it"
+            goButton.isEnabled = running ||
+                    (videoUri != null && adUri != null)
+            if (running)
+                window.addFlags(
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else
+                window.clearFlags(
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            // announce terminal states for TalkBack users
+            if (s == JobRunner.Status.DONE ||
+                s == JobRunner.Status.FAILED)
+                stage.announceForAccessibility(stage.text)
+        }
     }
 
     private fun updateButton() {
-        goButton.isEnabled = videoUri != null && adUri != null
+        if (JobRunner.status != JobRunner.Status.RUNNING)
+            goButton.isEnabled = videoUri != null && adUri != null
     }
 
-    private fun displayName(uri: Uri): String {
-        contentResolver.query(uri, null, null, null, null)?.use { c ->
-            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (idx >= 0 && c.moveToFirst()) return c.getString(idx)
-        }
-        return uri.lastPathSegment ?: "file"
-    }
+    // ------------------------------------------------------ start / resume
 
-    private fun ui(block: () -> Unit) = runOnUiThread(block)
-
-    // every log line goes to three places: the on-screen console, Logcat
-    // (adb logcat -s ADPatcher), and a session log file for post-mortems
-    private val sessionLog = StringBuilder()
-
-    private fun log(line: String) {
-        android.util.Log.i(TAG, line)
-        synchronized(sessionLog) { sessionLog.append(line).append('\n') }
-        ui { logView.append(line + "\n") }
-    }
-
-    /** Write the session log next to the app's files; returns its path. */
-    private fun dumpSessionLog(): String? = try {
-        val dir = java.io.File(getExternalFilesDir(null), "logs")
-        dir.mkdirs()
-        val f = java.io.File(dir,
-            "adpatch-${System.currentTimeMillis()}.log")
-        f.writeText(synchronized(sessionLog) { sessionLog.toString() })
-        f.absolutePath
-    } catch (e: Exception) {
-        android.util.Log.w(TAG, "could not write session log", e)
-        null
-    }
-
-    private fun <T> timed(name: String, block: () -> T): T {
-        val start = android.os.SystemClock.elapsedRealtime()
-        val r = block()
-        log("⏱ %s: %.1fs".format(name,
-            (android.os.SystemClock.elapsedRealtime() - start) / 1000f))
-        return r
-    }
-
-    companion object { const val TAG = "ADPatcher" }
-
-    @Volatile private var stageBase = ""
-    @Volatile private var phaseStartMs = 0L
-
-    private fun setStage(text: String) {
-        stageBase = text
-        phaseStartMs = System.currentTimeMillis()
-        ui { stage.text = text }
-    }
-
-    /** "aligning…  42% · ~3 min left" - keeps slow phases from reading
-     *  as frozen. */
-    private fun stageWithEta(f: Float) {
-        if (f < 0.03f || f > 0.999f || phaseStartMs == 0L) return
-        val elapsed = System.currentTimeMillis() - phaseStartMs
-        val remainMs = (elapsed * (1 - f) / f).toLong()
-        val eta = when {
-            remainMs > 90_000 -> "~${remainMs / 60_000 + 1} min left"
-            else -> "~${remainMs / 1000 + 1}s left"
-        }
-        val text = "$stageBase  ${(f * 100).toInt()}% · $eta"
-        ui { stage.text = text }
-    }
-
-    /** Map a phase's 0..1 progress into the overall 0..1000 bar,
-     *  throttled so decode callbacks don't flood the UI thread. */
-    @Volatile private var lastBarUpdate = 0L
-    private fun phaseProgress(from: Int, to: Int): (Float) -> Unit = { f ->
-        val now = System.currentTimeMillis()
-        if (f >= 1f || now - lastBarUpdate > 100) {
-            lastBarUpdate = now
-            val target = from + ((to - from) * f).toInt()
-            // never move backwards - jitter reads as flicker
-            ui { if (target > bar.progress) bar.progress = target }
-            stageWithEta(f)
-        }
-    }
-
-    private fun runPatch(outUri: Uri) {
-        isRunning = true
-        AudioEngine.cancelRequested = false
-        goButton.text = "✖  Cancel"
-        bar.progress = 0
-        logView.text = ""
-        synchronized(sessionLog) { sessionLog.setLength(0) }
-
-        // foreground service = full-speed CPU even when the user switches
-        // apps; notification permission is best-effort (Android 13+)
+    private fun startJob(outUri: Uri, a: Double? = null, b: Double? = null) {
         if (android.os.Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission
                 .POST_NOTIFICATIONS) !=
@@ -198,102 +190,91 @@ class MainActivity : AppCompatActivity() {
             askNotifPermission.launch(
                 android.Manifest.permission.POST_NOTIFICATIONS)
         }
-        PatchService.start(this)
-        log("ADPatcher ${BuildConfig.VERSION_NAME} on " +
-            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, " +
-            "Android ${android.os.Build.VERSION.RELEASE}, " +
-            "${Runtime.getRuntime().availableProcessors()} cores")
+        lastRenderedStatus = null
+        JobRunner.start(this, videoUri!!, adUri!!, outUri, a, b)
+    }
 
-        // stay awake for the whole job (long movies take a while)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val wakeLock = (getSystemService(Context.POWER_SERVICE)
-                as PowerManager).newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK, "adpatcher:patch")
-        wakeLock.acquire(4 * 60 * 60 * 1000L)   // 4 h safety limit
-
-        thread {
-            try {
-                // decode both audio streams concurrently (separate codecs).
-                // Progress is COMBINED into one monotonic value - two
-                // threads writing separate bar ranges makes it flicker.
-                setStage("analyzing both audio streams…")
-                var vidEnv: FloatArray? = null
-                var adEnv: FloatArray? = null
-                var decodeError: Throwable? = null
-                var pv = 0f
-                var pa = 0f
-                val combined = phaseProgress(0, 550)
-                timed("audio analysis") {
-                    val tv = Thread {
-                        try {
-                            vidEnv = AudioEngine.onsetEnvelopeParallel(
-                                this, videoUri!!, 2)
-                            { f -> pv = f; combined((pv + pa) * 0.5f) }
-                        } catch (t: Throwable) { decodeError = t }
-                    }
-                    val ta = Thread {
-                        try {
-                            adEnv = AudioEngine.onsetEnvelopeParallel(
-                                this, adUri!!, 2)
-                            { f -> pa = f; combined((pv + pa) * 0.5f) }
-                        } catch (t: Throwable) { decodeError = t }
-                    }
-                    tv.start(); ta.start(); tv.join(); ta.join()
-                }
-                decodeError?.let { throw it }
-                log("video: %.1f min".format(
-                    vidEnv!!.size / AudioEngine.FPS / 60))
-                log("AD audio: %.1f min".format(
-                    adEnv!!.size / AudioEngine.FPS / 60))
-
-                setStage("aligning (speed + offset scan)…")
-                val result = timed("alignment") {
-                    Aligner.fitAlignment(adEnv!!, vidEnv!!,
-                        ::log, phaseProgress(550, 700))
-                }
-                log("offset %+.3fs, speed %.6f"
-                    .format(result.bSec, result.a))
-                for (cp in result.report) {
-                    log("  %5.1fm -> %5.1fm  score %.2f  %+dms%s".format(
-                        cp.adSec / 60, cp.videoSec / 60, cp.score,
-                        cp.residualMs.toInt(),
-                        if (cp.score <= Aligner.WEAK_SCORE)
-                            "  (weak)" else ""))
-                }
-                if (result.suspect) log("⚠ most segments matched poorly - " +
-                        "the AD file may be for a different cut!")
-
-                setStage("writing output…")
-                timed("writing output") {
-                    Patcher.mux(this, videoUri!!, adUri!!, outUri,
-                        result.a, result.bSec, ::log,
-                        phaseProgress(700, 1000))
-                }
-
-                setStage("done ✅ saved as new file")
-                ui { bar.progress = 1000 }
-                dumpSessionLog()?.let { log("session log: $it") }
-            } catch (t: Throwable) {
-                if (t.message == "cancelled") {
-                    setStage("cancelled ✋")
-                    log("job cancelled by user")
-                } else {
-                    setStage("failed ❌")
-                    log("error: ${t.message ?: t.toString()}")
-                    android.util.Log.e(TAG, "patch failed", t)
-                    dumpSessionLog()?.let { log("session log: $it") }
-                }
-            } finally {
-                wakeLock.release()
-                PatchService.stop(this)
-                ui {
-                    window.clearFlags(
-                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    isRunning = false
-                    goButton.text = "▶  Patch it"
-                    goButton.isEnabled = true
-                }
-            }
+    /** Reload the last-used inputs if their permissions still hold. */
+    private fun restoreInputs() {
+        fun tryRestore(uri: Uri?): Uri? {
+            uri ?: return null
+            return try {
+                contentResolver.openFileDescriptor(uri, "r")?.close()
+                uri
+            } catch (e: Exception) { null }
         }
+        videoUri = tryRestore(JobStore.lastVideo(this))
+        adUri = tryRestore(JobStore.lastAd(this))
+        videoUri?.let { videoName.text = displayName(it) }
+        adUri?.let { adName.text = displayName(it) }
+        updateButton()
+    }
+
+    private fun offerResumeIfAny() {
+        if (JobRunner.status == JobRunner.Status.RUNNING) return
+        val job = JobStore.incompleteJob(this) ?: return
+        val skipAnalysis = job.a != null && job.b != null
+        AlertDialog.Builder(this)
+            .setTitle("Unfinished job")
+            .setMessage("The last patch of " +
+                "\"${displayName(job.video)}\" did not finish." +
+                if (skipAnalysis)
+                    "\n\nAlignment is already computed - resuming " +
+                    "skips straight to writing the output."
+                else "\n\nResume it from the start?")
+            .setPositiveButton("Resume") { _, _ ->
+                videoUri = job.video
+                adUri = job.ad
+                videoName.text = displayName(job.video)
+                adName.text = displayName(job.ad)
+                lastRenderedStatus = null
+                JobRunner.start(this, job.video, job.ad, job.out,
+                    job.a, job.b)
+            }
+            .setNegativeButton("Discard") { _, _ ->
+                JobStore.markComplete(this)
+            }
+            .show()
+    }
+
+    private fun confirmClearCache() {
+        AlertDialog.Builder(this)
+            .setTitle("Clear cache")
+            .setMessage("Deletes saved logs, downloaded AD files, update " +
+                "downloads and remembered jobs. Your patched videos are " +
+                "not touched.")
+            .setPositiveButton("Clear") { _, _ ->
+                var freed = 0L
+                fun wipe(dir: File?) {
+                    dir?.walkBottomUp()?.forEach {
+                        if (it.isFile) { freed += it.length(); it.delete() }
+                        else if (it != dir) it.delete()
+                    }
+                }
+                wipe(JobRunner.logsDir(this))
+                wipe(getExternalFilesDir(
+                    android.os.Environment.DIRECTORY_DOWNLOADS))
+                wipe(cacheDir)
+                JobStore.clearAll(this)
+                videoUri = null; adUri = null
+                videoName.text = "no video selected"
+                adName.text = "no AD file selected"
+                updateButton()
+                Toast.makeText(this,
+                    "Cleared ${freed / 1_048_576} MB",
+                    Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun displayName(uri: Uri): String {
+        if (uri.scheme == "file")
+            return uri.lastPathSegment ?: "file"
+        contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) return c.getString(idx)
+        }
+        return uri.lastPathSegment ?: "file"
     }
 }

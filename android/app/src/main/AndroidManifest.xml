@@ -8,15 +8,22 @@
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- AudioVault browser + update checks -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- launching the installer for downloaded updates -->
+    <uses-permission
+        android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:label="AD Patcher"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar"
         android:allowBackup="true">
+
         <service
             android:name=".PatchService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -26,5 +33,24 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".VaultActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <activity
+            android:name=".LogsActivity"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>
