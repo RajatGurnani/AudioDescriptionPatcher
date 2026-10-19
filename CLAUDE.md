@@ -41,7 +41,7 @@ unit test, skipped without the export):
 
 ```
 .venv\Scripts\python tools\parity_export.py
-cd android && gradle testReleaseUnitTest -Dparity.dir=%TEMP%dpatch-parity
+cd android && gradle testReleaseUnitTest -Dparity.dir=%TEMP%\adpatch-parity
 ```
 
 Never build truth with `atempo` (adds 5-20 ms WSOLA latency) or
