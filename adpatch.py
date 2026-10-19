@@ -68,6 +68,224 @@ AD_RATE = 48000            # sample rate of the encoded AD track
 AD_ENCODERS = (("aac_mf", 0), ("aac", 1024))
 _ad_encoder = None
 
+# AD codec choices -> (encoder, priming samples mkv doesn't trim), measured
+# against the source at sample level (tools/options_test.py re-checks).
+# "aac" means ad_encoder() (aac_mf, falling back to ffmpeg's aac).
+AD_CODECS = {"opus": ("libopus", 0), "ac3": ("ac3", 256),
+             "eac3": ("eac3", 256)}
+
+# Output options (patch(options=...), CLI flags, web/desktop panel,
+# presets). None = today's behaviour.
+DEFAULT_OPTIONS = {
+    "container": "mkv",        # mkv | mp4 (when no output path is given)
+    "ad_codec": "aac",         # aac | opus | ac3 | eac3
+    "ad_bitrate": "192k",
+    "ad_channels": None,       # None = as the AD file, or 1 / 2
+    "ad_language": "eng",
+    "ad_title": "Audio Description",
+    "default_track": "ad",     # ad | original: which plays by default
+    "keep_audio": "first",     # all | first | none | [type indexes]
+    "keep_subs": "all",        # all | none | [type indexes]
+    "add_subs": [],            # [{"path", "language", "title",
+                               #   "default", "forced"}]
+    "loudness_match": False,   # level the AD to the original's loudness
+    "fit_gb": None,            # re-encode video to fit N GB (slow)
+    "max_height": None,        # with fit_gb: downscale to this height
+}
+MP4_AUDIO_OK = {"aac", "mp3", "ac3", "eac3", "opus", "flac", "alac"}
+TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+VIDEO_ENCODERS = ("hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265")
+_video_encoder = None
+
+
+# Named option sets. Built-ins are read-only; user presets live in
+# %LOCALAPPDATA%\ADPatcher\presets.json (web/desktop "Save preset").
+BUILTIN_PRESETS = {
+    "Default (MKV, AAC, AD + original)": {},
+    "TV-friendly (MP4, AC-3, all audio)": {
+        "container": "mp4", "ad_codec": "ac3", "ad_bitrate": "448k",
+        "keep_audio": "all"},
+    "Archive (MKV, Opus, every track)": {
+        "container": "mkv", "ad_codec": "opus", "ad_bitrate": "160k",
+        "keep_audio": "all", "keep_subs": "all"},
+    "Phone (MP4, 720p, max 2 GB)": {
+        "container": "mp4", "fit_gb": 2.0, "max_height": 720},
+    "AD only (replace original audio)": {"keep_audio": "none"},
+}
+PRESETS_FILE = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "ADPatcher", "presets.json")
+
+
+def load_presets():
+    """Built-in presets + the user's saved ones (user wins on a name)."""
+    presets = {k: dict(v) for k, v in BUILTIN_PRESETS.items()}
+    try:
+        with open(PRESETS_FILE, encoding="utf-8") as f:
+            presets.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return presets
+
+
+def save_preset(name, options):
+    """Store a user preset (only keys that differ from the defaults)."""
+    try:
+        with open(PRESETS_FILE, encoding="utf-8") as f:
+            user = json.load(f)
+    except (OSError, ValueError):
+        user = {}
+    user[name] = {k: v for k, v in options.items()
+                  if k in DEFAULT_OPTIONS and v != DEFAULT_OPTIONS[k]}
+    os.makedirs(os.path.dirname(PRESETS_FILE), exist_ok=True)
+    with open(PRESETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(user, f, indent=1)
+
+
+def add_option_args(p):
+    """Output-option flags shared by the single-file and batch CLIs."""
+    g = p.add_argument_group("output options")
+    g.add_argument("--preset", help="start from a named preset "
+                   "(see --list-presets); flags below override it")
+    g.add_argument("--list-presets", action="store_true")
+    g.add_argument("--container", choices=("mkv", "mp4"))
+    g.add_argument("--ad-codec", choices=("aac", "opus", "ac3", "eac3"))
+    g.add_argument("--ad-bitrate", help="e.g. 192k")
+    g.add_argument("--ad-channels", type=int, choices=(1, 2))
+    g.add_argument("--ad-lang", help="AD track language (default eng)")
+    g.add_argument("--ad-title", help="AD track title")
+    g.add_argument("--original-default", action="store_true",
+                   help="make the original audio the default track")
+    g.add_argument("--keep-audio", help="original audio tracks to keep: "
+                   "all | first (default) | none | e.g. 0,2")
+    g.add_argument("--keep-subs", help="subtitle tracks to keep: all "
+                   "(default) | none | e.g. 1")
+    g.add_argument("--add-subs", action="append", default=[],
+                   metavar="FILE[:LANG[:forced]]",
+                   help="add an external subtitle file (repeatable)")
+    g.add_argument("--loudness-match", action="store_true",
+                   help="level the AD to the original's loudness")
+    g.add_argument("--fit-gb", type=float, help="re-encode the video to "
+                   "fit this size (GPU if available; slow)")
+    g.add_argument("--max-height", type=int, help="with --fit-gb: "
+                   "downscale to this height, e.g. 720")
+
+
+def options_from_args(args):
+    """Options dict from add_option_args() flags (preset first)."""
+    if args.list_presets:
+        for name, o in load_presets().items():
+            print(f"{name}: {o or '(defaults)'}")
+        sys.exit(0)
+    opts = {}
+    if args.preset:
+        presets = load_presets()
+        if args.preset not in presets:
+            sys.exit(f"unknown preset {args.preset!r} - see --list-presets")
+        opts.update(presets[args.preset])
+
+    def tracks(v):
+        return v if v in ("all", "first", "none") else \
+            [int(x) for x in v.split(",") if x.strip()]
+    for key, val in (("container", args.container),
+                     ("ad_codec", args.ad_codec),
+                     ("ad_bitrate", args.ad_bitrate),
+                     ("ad_channels", args.ad_channels),
+                     ("ad_language", args.ad_lang),
+                     ("ad_title", args.ad_title),
+                     ("fit_gb", args.fit_gb),
+                     ("max_height", args.max_height)):
+        if val is not None:
+            opts[key] = val
+    if args.original_default:
+        opts["default_track"] = "original"
+    if args.keep_audio:
+        opts["keep_audio"] = tracks(args.keep_audio)
+    if args.keep_subs:
+        opts["keep_subs"] = tracks(args.keep_subs)
+    if args.loudness_match:
+        opts["loudness_match"] = True
+    subs = []
+    for spec in args.add_subs:
+        # FILE[:LANG[:forced]] - careful with drive letters (C:\...)
+        parts = spec.rsplit(":", 2)
+        while len(parts) > 1 and (len(parts[0]) == 1 or
+                                  not os.path.exists(parts[0])):
+            parts = [parts[0] + ":" + parts[1]] + parts[2:]
+        subs.append({"path": parts[0],
+                     "language": parts[1] if len(parts) > 1 else "",
+                     "forced": len(parts) > 2 and parts[2] == "forced"})
+    if subs:
+        opts["add_subs"] = subs
+    return opts
+
+
+def resolve_options(options=None, replace=False):
+    """DEFAULT_OPTIONS overlaid with `options`; `replace` (old API) means
+    keep no original audio."""
+    o = dict(DEFAULT_OPTIONS)
+    o.update({k: v for k, v in (options or {}).items() if v is not None
+              or k in ("fit_gb", "max_height", "ad_channels")})
+    if replace:
+        o["keep_audio"] = "none"
+    return o
+
+
+def video_encoder():
+    """First working HEVC encoder: NVIDIA, Intel, AMD GPUs, then CPU."""
+    global _video_encoder
+    if _video_encoder is None:
+        _video_encoder = VIDEO_ENCODERS[-1]
+        for name in VIDEO_ENCODERS:
+            r = subprocess.run(
+                [FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+                 "testsrc2=s=256x256:d=0.2", "-c:v", name, "-f", "null",
+                 "-"], capture_output=True)
+            if r.returncode == 0:
+                _video_encoder = name
+                break
+    return _video_encoder
+
+
+def _bitrate_bps(text):
+    text = str(text).strip().lower()
+    mult = 1000 if text.endswith("k") else 1_000_000 \
+        if text.endswith("m") else 1
+    return float(text.rstrip("km")) * mult
+
+
+def _video_args(opts, streams, duration, audio_bps):
+    """Encoder args for a fit-to-size re-encode of the first video stream
+    (`-c:v copy` when not requested)."""
+    if not opts.get("fit_gb"):
+        return ["-map", "0:v", "-c:v", "copy"], []
+    vids = [st for st in streams if st["type"] == "video"
+            and not st["attached_pic"]]
+    if vids and vids[0]["hdr"]:
+        raise ValueError("HDR video: fit-to-size would wash out the "
+                         "colours - use HandBrake for HDR re-encodes")
+    total = opts["fit_gb"] * 8e9 * 0.985        # ~1.5 % container overhead
+    v_bps = (total - audio_bps * duration) / duration
+    if v_bps < 300_000:
+        raise ValueError(f"{opts['fit_gb']} GB is too small for this "
+                         f"length ({duration / 60:.0f} min)")
+    enc = video_encoder()
+    b = f"{int(v_bps)}"
+    args = ["-map", "0:v:0", "-c:v", enc, "-b:v", b,
+            "-maxrate", f"{int(v_bps * 1.5)}", "-bufsize", f"{int(v_bps * 2)}"]
+    if enc == "hevc_nvenc":
+        args += ["-preset", "p5", "-rc", "vbr", "-multipass", "fullres"]
+    elif enc == "hevc_amf":
+        args += ["-rc", "vbr_peak"]
+    elif enc == "libx265":
+        args += ["-preset", "medium"]
+    args += ["-tag:v", "hvc1"]   # plays in Apple/TV players from mp4
+    if opts.get("max_height"):
+        args += ["-vf", f"scale=-2:'min({int(opts['max_height'])},ih)'"]
+    notes = [f"video re-encoded with {enc} at {v_bps / 1e6:.2f} Mb/s "
+             f"to fit {opts['fit_gb']} GB"]
+    return args, notes
+
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv",
               ".flv", ".ts", ".mpg", ".mpeg", ".vob", ".3gp"}
 
@@ -85,6 +303,55 @@ def probe_has_video(path):
                           capture_output=True, text=True, errors="replace")
     return any("Video:" in line and "attached pic" not in line
                for line in proc.stderr.splitlines())
+
+
+_STREAM_RE = re.compile(
+    r"Stream #0:(\d+)(?:\[0x[0-9a-f]+\])?(?:\((\w+)\))?: "
+    r"(Video|Audio|Subtitle|Data|Attachment): (\w+)(.*)")
+
+
+def probe_streams(path):
+    """Streams of a media file from `ffmpeg -i` (no ffprobe available):
+    [{index, type, type_index, codec, language, title, default, forced,
+      channels, kbps, attached_pic, hdr, details}] - type_index counts
+    per type, i.e. the N of ffmpeg's 0:a:N / 0:s:N specifiers."""
+    proc = subprocess.run([FFMPEG, "-hide_banner", "-i", path],
+                          capture_output=True, text=True, errors="replace")
+    streams, counts, cur = [], {}, None
+    for line in proc.stderr.splitlines():
+        m = _STREAM_RE.search(line)
+        if m:
+            idx, lang, typ, codec, rest = m.groups()
+            typ = typ.lower()
+            n = counts.get(typ, 0)
+            counts[typ] = n + 1
+            kbps = re.search(r"(\d+) kb/s", rest)
+            ch = re.search(r"Hz, ([^,]+)", rest)
+            cur = {"index": int(idx), "type": typ, "type_index": n,
+                   "codec": codec, "language": lang or "", "title": "",
+                   "default": "(default)" in rest,
+                   "forced": "(forced)" in rest,
+                   "channels": ch.group(1).strip() if ch else "",
+                   "kbps": int(kbps.group(1)) if kbps else None,
+                   "attached_pic": "attached pic" in rest,
+                   "hdr": "smpte2084" in rest or "arib-std-b67" in rest,
+                   "details": rest.strip(" ,")}
+            streams.append(cur)
+        elif cur is not None and re.match(r"\s+title\s*:", line):
+            cur["title"] = line.split(":", 1)[1].strip()
+        elif cur is not None and not line.startswith("      "):
+            cur = None if "Stream #" not in line else cur
+    return streams
+
+
+def mean_volume_db(path, stream="0:a:0"):
+    """Average loudness (dB) of one audio stream via ffmpeg volumedetect -
+    a full decode, so only used for the opt-in loudness match."""
+    proc = subprocess.run([FFMPEG, "-hide_banner", "-i", path, "-map",
+                           stream, "-af", "volumedetect", "-f", "null", "-"],
+                          capture_output=True, text=True, errors="replace")
+    m = re.search(r"mean_volume: (-?[\d.]+) dB", proc.stderr)
+    return float(m.group(1)) if m else None
 
 
 def probe_has_audio(path):
@@ -905,7 +1172,7 @@ def plan_pieces(a, pieces, priming_s=0.0):
     return segments, gaps
 
 
-def _piecewise_graph(a, pieces, priming_s, fill_gaps):
+def _piecewise_graph(a, pieces, priming_s, fill_gaps, gain=""):
     """filter_complex for a multi-piece AD: each piece trimmed, tempo-
     corrected, faded (10 ms - no clicks at splices) and delayed to its
     video position, plus optional original-audio fill for gaps; all
@@ -928,7 +1195,8 @@ def _piecewise_graph(a, pieces, priming_s, fill_gaps):
                  "".join(f"[s{i}]" for i in range(len(segments))))
     for i, (s0, s1, d0) in enumerate(segments):
         parts.append(f"[s{i}]atrim=start={s0:.4f}:end={s1:.4f},"
-                     f"asetpts=PTS-STARTPTS,aresample={AD_RATE}{tempo}{fmt}"
+                     f"asetpts=PTS-STARTPTS,aresample={AD_RATE}{tempo}"
+                     f"{gain}{fmt}"
                      f"{tail((s1 - s0) * a, d0)}[p{i}]")
         labels.append(f"[p{i}]")
     if gaps:
@@ -946,31 +1214,42 @@ def _piecewise_graph(a, pieces, priming_s, fill_gaps):
     return ";".join(parts)
 
 
-def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
-                  encoder=None, pieces=None, fill_gaps=True):
+def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
+                  streams=None, encoder=None, pieces=None, fill_gaps=True,
+                  with_subs=True, gain_db=0.0, duration=None):
     """Assemble the ffmpeg command that applies the alignment and muxes.
 
     The AD audio gets: atempo (speed correction, skipped when negligible),
-    then adelay (positive offset) or atrim (negative offset). The video
-    stream is copied bit-for-bit. The corrected AD track becomes the
-    default audio; the original audio is copied as track 2 unless
-    `replace`. `encoder` is an AD_ENCODERS entry (default: ad_encoder()).
-    With 2+ `pieces` (a different edit) the AD is spliced per piece and,
-    if `fill_gaps`, holes are filled with the original audio.
+    then adelay (positive offset) or atrim (negative offset); with 2+
+    `pieces` (a different edit) it is spliced per piece and, if
+    `fill_gaps`, holes get the original audio. It becomes track a:0.
+    `opts` (resolve_options()) picks the AD codec, which original audio
+    and subtitle tracks to keep, external subtitles, default track and
+    an optional fit-to-size video re-encode; otherwise the video is
+    copied bit-for-bit. `streams` = probe_streams(video). Returns
+    (cmd, notes) - notes say what was converted or dropped and why.
     """
+    opts = opts or resolve_options()
+    streams = streams if streams is not None else probe_streams(video)
+    mp4 = os.path.splitext(output)[1].lower() in (".mp4", ".m4v")
+    if opts["ad_codec"] in AD_CODECS:
+        encoder = AD_CODECS[opts["ad_codec"]]
     enc_name, priming = encoder or ad_encoder()
-    priming_s = (priming / AD_RATE
-                 if os.path.splitext(output)[1].lower() == ".mkv" else 0.0)
-    # Fixed output rate: keeps the encoder priming delay known (see below).
+    # Encoders may prepend priming samples (ffmpeg aac: 1024, ac3: 256);
+    # mp4 trims them via an edit list, mkv doesn't - so the AD would play
+    # late. Start it that much earlier to cancel it.
+    priming_s = 0.0 if mp4 else priming / AD_RATE
+    gain = f",volume={gain_db:.2f}dB" if abs(gain_db) >= 0.1 else ""
+    notes = []
+
+    # Fixed output rate: keeps the encoder priming delay known.
     filters = [f"aresample={AD_RATE}"]
     if abs(a - 1.0) > NEGLIGIBLE_DRIFT:
         # content at ad_time t must land at a*t, so play at rate 1/a
         filters.append(f"atempo={1.0 / a:.8f}")
-    if os.path.splitext(output)[1].lower() == ".mkv":
-        # Encoders may prepend priming samples (ffmpeg aac: 1024); mp4
-        # trims them via an edit list, mkv doesn't - so the track would
-        # play ~21 ms late. Start the AD that much earlier to cancel it.
-        b_sec -= priming / AD_RATE
+    if gain:
+        filters.append(gain[1:])
+    b_sec -= priming_s
     if b_sec >= 0:
         delay_ms = int(round(b_sec * 1000))
         if delay_ms:
@@ -978,27 +1257,86 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
     else:
         filters.append(f"atrim=start={-b_sec:.4f}")
         filters.append("asetpts=PTS-STARTPTS")
-    chain = ",".join(filters) if filters else "anull"
-    graph = f"[1:a:0]{chain}[ad]"
+    graph = f"[1:a:0]{','.join(filters)}[ad]"
     if pieces and len(pieces) > 1:
-        graph = _piecewise_graph(a, pieces, priming_s, fill_gaps)
+        graph = _piecewise_graph(a, pieces, priming_s, fill_gaps, gain)
 
-    cmd = [FFMPEG, "-y", "-v", "error",
-           "-i", video, "-i", ad_audio,
-           "-filter_complex", graph,
-           "-map", "0:v", "-c:v", "copy",
-           "-map", "[ad]", "-c:a:0", enc_name, "-b:a:0", "192k",
-           "-metadata:s:a:0", "title=Audio Description",
-           "-metadata:s:a:0", "language=eng",
-           "-disposition:a:0", "default"]
-    if not replace:
-        cmd += ["-map", "0:a:0?", "-c:a:1", "copy",
-                "-disposition:a:1", "0",
-                "-metadata:s:a:1", "title=Original Audio"]
-    if with_subs:
-        cmd += ["-map", "0:s?", "-c:s", "copy"]
+    audio = [st for st in streams if st["type"] == "audio"]
+    subs = [st for st in streams if st["type"] == "subtitle"]
+
+    def pick(choice, tracks):
+        if choice == "all":
+            return tracks
+        if choice == "first":
+            return tracks[:1]
+        if choice in ("none", None):
+            return []
+        return [t for t in tracks if t["type_index"] in choice]
+    keep_a, keep_s = pick(opts["keep_audio"], audio), \
+        pick(opts["keep_subs"], subs) if with_subs else []
+
+    cmd = [FFMPEG, "-y", "-v", "error", "-i", video, "-i", ad_audio]
+    for sub in opts["add_subs"]:
+        cmd += ["-i", sub["path"]]
+    cmd += ["-filter_complex", graph]
+
+    # video (copy, or fit-to-size re-encode)
+    audio_bps = _bitrate_bps(opts["ad_bitrate"]) + sum(
+        (t["kbps"] or 640) * 1000 for t in keep_a)
+    v_args, v_notes = _video_args(opts, streams, duration or 1.0, audio_bps)
+    cmd += v_args
+    notes += v_notes
+
+    # a:0 = the AD track
+    ad_default = opts["default_track"] != "original" or not keep_a
+    cmd += ["-map", "[ad]", "-c:a:0", enc_name,
+            "-b:a:0", str(opts["ad_bitrate"]),
+            "-metadata:s:a:0", f"title={opts['ad_title']}",
+            "-metadata:s:a:0", f"language={opts['ad_language']}",
+            "-disposition:a:0", "default" if ad_default else "0"]
+    if opts["ad_channels"]:
+        cmd += ["-ac:a:0", str(int(opts["ad_channels"]))]
+
+    # kept original audio tracks
+    for k, t in enumerate(keep_a, start=1):
+        cmd += ["-map", f"0:a:{t['type_index']}"]
+        if mp4 and t["codec"] not in MP4_AUDIO_OK:
+            cmd += [f"-c:a:{k}", "aac", f"-b:a:{k}", "384k"]
+            notes.append(f"original audio track {t['type_index'] + 1} "
+                         f"({t['codec']}) converted to AAC - mp4 can't "
+                         "hold it")
+        else:
+            cmd += [f"-c:a:{k}", "copy"]
+        cmd += [f"-disposition:a:{k}",
+                "default" if (k == 1 and not ad_default) else "0"]
+        if not t["title"]:
+            cmd += [f"-metadata:s:a:{k}", "title=Original Audio"]
+
+    # subtitles: kept + external
+    out_s = 0
+    for t in keep_s:
+        if mp4 and t["codec"] not in TEXT_SUBS:
+            notes.append(f"subtitle track {t['type_index'] + 1} "
+                         f"({t['codec']}, image-based) dropped - mp4 "
+                         "can't hold it")
+            continue
+        cmd += ["-map", f"0:s:{t['type_index']}",
+                f"-c:s:{out_s}", "mov_text" if mp4 else "copy"]
+        out_s += 1
+    for i, sub in enumerate(opts["add_subs"], start=2):
+        ext = os.path.splitext(sub["path"])[1].lower()
+        cmd += ["-map", f"{i}:s:0", f"-c:s:{out_s}",
+                "mov_text" if mp4 else ("webvtt" if ext == ".vtt"
+                                        else "copy")]
+        if sub.get("language"):
+            cmd += [f"-metadata:s:s:{out_s}", f"language={sub['language']}"]
+        if sub.get("title"):
+            cmd += [f"-metadata:s:s:{out_s}", f"title={sub['title']}"]
+        flags = [f for f in ("default", "forced") if sub.get(f)]
+        cmd += [f"-disposition:s:{out_s}", "+".join(flags) or "0"]
+        out_s += 1
     cmd += ["-map_chapters", "0", output]
-    return cmd
+    return cmd, notes
 
 
 # --------------------------------------------------------------------------
@@ -1034,7 +1372,8 @@ def plot_data(vid_env, ad_env, a, b_sec, hz=PLOT_HZ, pieces=None):
 def report_json(result):
     """The JSON-serialisable part of a patch() result."""
     keys = ("output", "a", "b", "confidence", "band", "warnings",
-            "signals", "segments", "pieces", "weak", "suspect", "timings")
+            "signals", "segments", "pieces", "notes", "weak", "suspect",
+            "timings")
     return {k: result[k] for k in keys}
 
 
@@ -1110,7 +1449,7 @@ def write_report_svg(path, result, plot):
 # --------------------------------------------------------------------------
 
 def patch(input_a, input_b, output=None, replace=False, log=print,
-          progress=None, save_report=False):
+          progress=None, save_report=False, options=None):
     """Full pipeline: classify inputs, align, verify, mux.
 
     Returns a dict:
@@ -1130,7 +1469,9 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
                     total
     `progress(phase, fraction)`, if given, is called as work advances;
     phases in order: "analyze", "align", "mux". `save_report` also writes
-    <output>.sync.json and <output>.sync.svg.
+    <output>.sync.json and <output>.sync.svg. `options`: see
+    DEFAULT_OPTIONS (container, AD codec, tracks, subtitles, size...);
+    result["notes"] lists conversions/drops they caused.
 
     Raises ValueError / RuntimeError with a user-readable message on
     failure.
@@ -1142,9 +1483,18 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         if not os.path.isfile(f):
             raise ValueError(f"file not found: {f}")
     video, ad_audio = classify_inputs(input_a, input_b)
-    output = output or os.path.splitext(video)[0] + ".AD.mkv"
+    opts = resolve_options(options, replace)
+    output = output or (os.path.splitext(video)[0] + ".AD." +
+                        ("mp4" if opts["container"] == "mp4" else "mkv"))
     if os.path.splitext(output)[1].lower() not in (".mkv", ".mp4", ".m4v"):
         output += ".mkv"
+    for sub in opts["add_subs"]:
+        if not os.path.isfile(sub["path"]):
+            raise ValueError(f"subtitle file not found: {sub['path']}")
+    if opts["fit_gb"]:   # fail fast, before minutes of analysis
+        _video_args(opts, probe_streams(video),
+                    probe_duration(video) or 1.0,
+                    _bitrate_bps(opts["ad_bitrate"]))
 
     timings = {}
     t_start = clock = time.perf_counter()
@@ -1219,7 +1569,18 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             "description, which pauses the video and cannot be patched "
             "with a time shift). Output may be out of sync.")
 
-    log("muxing (video stream copied, AD audio encoded)...")
+    streams = probe_streams(video)
+    gain_db = 0.0
+    if opts["loudness_match"]:
+        log("measuring loudness (original vs AD)...")
+        orig = mean_volume_db(video) if any(
+            st["type"] == "audio" for st in streams) else None
+        adv = mean_volume_db(ad_audio)
+        if orig is not None and adv is not None:
+            gain_db = max(-12.0, min(12.0, orig - adv))
+            log(f"  AD level {gain_db:+.1f} dB to match the original")
+    log("muxing (" + ("video re-encoded" if opts["fit_gb"] else
+                      "video stream copied") + ", AD audio encoded)...")
     duration = len(vid_env) / FPS
 
     # gaps between pieces get the original audio - only if there is one
@@ -1233,23 +1594,30 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             f"{max(0.0, drop_s):.0f}s of AD has no matching video "
             "(dropped)")
 
-    def mux(with_subs, encoder):
-        return run_ffmpeg(build_mux_cmd(video, ad_audio, output, a, b_sec,
-                                        replace, with_subs, encoder,
-                                        pieces, fill),
-                          duration, report("mux"))
+    notes = []
 
-    encoder = ad_encoder()
+    def mux(with_subs, encoder):
+        cmd, n = build_mux_cmd(video, ad_audio, output, a, b_sec, opts,
+                               streams, encoder, pieces, fill, with_subs,
+                               gain_db, duration)
+        notes[:] = n
+        return run_ffmpeg(cmd, duration, report("mux"))
+
+    encoder = None if opts["ad_codec"] in AD_CODECS else ad_encoder()
     rc, err = mux(True, encoder)
     if rc != 0 and "Subtitle" in err:
-        # some subtitle codecs (e.g. mp4 mov_text) can't be copied into
-        # mkv - retry without subtitles rather than failing the whole job
+        # some subtitle codecs can't go into the container - retry
+        # without subtitles rather than failing the whole job
+        log("  subtitles couldn't be muxed - retrying without them")
         rc, err = mux(False, encoder)
-    if rc != 0 and encoder != AD_ENCODERS[-1]:
+        notes.append("subtitles dropped: the container rejected them")
+    if rc != 0 and encoder is not None and encoder != AD_ENCODERS[-1]:
         # the fast encoder can reject odd inputs (channel layouts etc.)
         log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
         encoder = AD_ENCODERS[-1]
-        rc, err = mux(False, encoder)
+        rc, err = mux(True, encoder)
+    for n in notes:
+        log(f"  note: {n}")
     if rc != 0:
         raise RuntimeError(f"muxing failed:\n{err}")
     lap("mux")
@@ -1262,15 +1630,15 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         f"{mb / max(timings['video_env'], 1e-9):.0f} MB/s; AD "
         f"{timings['ad_env']:.1f}s) | align {timings['align']:.1f}s | "
         f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s")
-    log("AD track is the default audio; original audio kept as track 2."
-        if not replace else "original audio replaced with AD track.")
+    log("AD track is the default audio." if opts["default_track"] != "original"
+        else "original audio is the default; AD is track 1.")
     result = {
         "output": output, "a": a, "b": b_sec,
         "confidence": conf, "band": band, "warnings": warnings,
         "signals": signals,
         "segments": [{"ad": r[0], "video": r[1], "score": r[2],
                       "residual_ms": r[3], "used": r[4]} for r in rows],
-        "pieces": pieces or [],
+        "pieces": pieces or [], "notes": notes,
         "report": rows, "weak": weak, "suspect": suspect,
         "timings": timings,
         "plot": plot_data(vid_env, ad_env, a, b_sec, pieces=pieces),
@@ -1290,7 +1658,7 @@ def main():
         return batch.main(sys.argv[2:])
     p = argparse.ArgumentParser(
         description="Patch a video with its audio-description track.")
-    p.add_argument("inputs", nargs=2, metavar="FILE",
+    p.add_argument("inputs", nargs="*", metavar="FILE",
                    help="the video and the AD audio file, in any order")
     p.add_argument("-o", "--output", help="output path (default: "
                    "<video name>.AD.mkv next to the video)")
@@ -1300,12 +1668,30 @@ def main():
     p.add_argument("--report", action="store_true",
                    help="also write <output>.sync.json and .sync.svg "
                         "(drift + waveform-match plot)")
+    p.add_argument("--list-streams", action="store_true",
+                   help="show the tracks of the given file(s) and exit "
+                        "(indexes for --keep-audio / --keep-subs)")
+    add_option_args(p)
     args = p.parse_args()
+    options = options_from_args(args)
+    if args.list_streams:
+        for f in args.inputs:
+            print(f)
+            for st in probe_streams(f):
+                if st["type"] in ("audio", "subtitle", "video"):
+                    flags = " ".join(x for x in ("default", "forced")
+                                     if st[x])
+                    print(f"  {st['type']:<8} {st['type_index']}  "
+                          f"{st['codec']:<10} {st['language'] or '-':<4} "
+                          f"{st['title'] or ''}  {flags}")
+        return
+    if len(args.inputs) != 2:
+        p.error("give the video and the AD audio file")
     bar = ConsoleProgress() if sys.stderr.isatty() else None
     try:
         patch(args.inputs[0], args.inputs[1],
               output=args.output, replace=args.replace,
-              save_report=args.report,
+              save_report=args.report, options=options,
               log=bar.log if bar else print,
               progress=bar.update if bar else None)
     except (ValueError, RuntimeError) as e:

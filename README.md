@@ -55,6 +55,13 @@ device awake during long jobs and shows per-phase progress. Output is MP4
 with the AD track first (default) and the original audio kept when its
 codec allows.
 
+## Output options
+
+MKV or MP4, AD codec (AAC/Opus/AC-3/E-AC-3) and bitrate, which audio and
+subtitle tracks to keep, extra subtitle files, loudness matching, and an
+optional "fit to N GB" GPU re-encode — in the app's **Output options**
+or as CLI flags, with presets. See [docs/USAGE.md](docs/USAGE.md).
+
 ## Limits worth knowing
 
 - **Extended audio description isn't supported.** If the AD version

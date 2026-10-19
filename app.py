@@ -59,7 +59,7 @@ def is_local(request):
 
 
 def run_job(job_id, video_path, ad_path, output_path, replace,
-            cleanup=True):
+            cleanup=True, options=None):
     job = jobs[job_id]
     job["status"] = "running"
     job["started"] = time.time()
@@ -70,7 +70,7 @@ def run_job(job_id, video_path, ad_path, output_path, replace,
     try:
         result = adpatch.patch(video_path, ad_path, output=output_path,
                                replace=replace, log=job["log"].append,
-                               progress=progress)
+                               progress=progress, options=options)
         job["output"] = result["output"]
         job["result"] = adpatch.report_json(result)
         job["plot"] = result["plot"]
@@ -82,17 +82,31 @@ def run_job(job_id, video_path, ad_path, output_path, replace,
     finally:
         # uploads are no longer needed once the job has finished (local
         # jobs work on the user's own files: never delete those)
-        for p in (video_path, ad_path) if cleanup else ():
+        extra = [x["path"] for x in (options or {}).get("add_subs", [])]
+        for p in [video_path, ad_path] + extra if cleanup else ():
             try:
                 os.remove(p)
             except OSError:
                 pass
 
 
+def _parse_options(raw):
+    """Options JSON from the page (see adpatch.DEFAULT_OPTIONS)."""
+    import json
+    try:
+        opts = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except ValueError:
+        return {}
+    return {k: v for k, v in opts.items() if k in adpatch.DEFAULT_OPTIONS}
+
+
 @app.post("/api/patch")
 async def start_patch(video: UploadFile = File(...),
                       ad: UploadFile = File(...),
-                      replace: bool = Form(False)):
+                      replace: bool = Form(False),
+                      options: str = Form("{}"),
+                      subs: list[UploadFile] = File(default=[]),
+                      subs_lang: str = Form("")):
     job_id = uuid.uuid4().hex[:12]
     job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -106,16 +120,21 @@ async def start_patch(video: UploadFile = File(...),
 
     video_path = save(video, "video.mp4")
     ad_path = save(ad, "ad.mp3")
+    opts = _parse_options(options)
+    opts["add_subs"] = [{"path": save(sub, "subs.srt"),
+                         "language": subs_lang} for sub in subs
+                        if sub.filename]
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    output_path = os.path.join(job_dir, stem + ".AD.mkv")
+    ext = "mp4" if opts.get("container") == "mp4" else "mkv"
+    output_path = os.path.join(job_dir, f"{stem}.AD.{ext}")
 
     jobs[job_id] = {"status": "queued", "log": [], "output": None,
-                    "error": None, "name": stem + ".AD.mkv",
+                    "error": None, "name": f"{stem}.AD.{ext}",
                     "phase": None, "frac": 0.0}
     threading.Thread(target=run_job,
                      args=(job_id, video_path, ad_path, output_path,
                            bool(replace)),
-                     daemon=True).start()
+                     kwargs={"options": opts}, daemon=True).start()
     return {"job": job_id}
 
 
@@ -136,17 +155,20 @@ def start_patch_local(request: Request, payload: dict = Body(...)):
         video, ad = adpatch.classify_inputs(video, ad)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    opts = _parse_options(payload.get("options"))
     stem = os.path.splitext(os.path.basename(video))[0]
+    ext = "mp4" if opts.get("container") == "mp4" else "mkv"
     output = os.path.join(payload.get("outdir") or os.path.dirname(video),
-                          stem + ".AD.mkv")
+                          f"{stem}.AD.{ext}")
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {"status": "queued", "log": [], "output": None,
-                    "error": None, "name": stem + ".AD.mkv",
+                    "error": None, "name": f"{stem}.AD.{ext}",
                     "phase": None, "frac": 0.0}
     threading.Thread(target=run_job,
                      args=(job_id, video, ad, output,
                            bool(payload.get("replace"))),
-                     kwargs={"cleanup": False}, daemon=True).start()
+                     kwargs={"cleanup": False, "options": opts},
+                     daemon=True).start()
     return {"job": job_id}
 
 
@@ -183,7 +205,8 @@ def job_download(job_id: str):
     if not job or job["status"] != "done":
         return JSONResponse({"error": "not ready"}, status_code=404)
     return FileResponse(job["output"], filename=job["name"],
-                        media_type="video/x-matroska")
+                        media_type="video/mp4" if job["output"]
+                        .endswith(".mp4") else "video/x-matroska")
 
 
 # ---- batch (folders on this PC; localhost only) ----
@@ -259,8 +282,9 @@ def batch_start(request: Request, payload: dict = Body(...)):
              if p.get("video") and p.get("ad")]
     if not pairs:
         return JSONResponse({"error": "no pairs selected"}, status_code=400)
-    _start_queue(batch.Queue.create(pairs, payload.get("outdir"),
-                                    bool(payload.get("replace"))))
+    _start_queue(batch.Queue.create(
+        pairs, payload.get("outdir"), bool(payload.get("replace")),
+        options=_parse_options(payload.get("options"))))
     return {"started": len(pairs)}
 
 
@@ -288,6 +312,79 @@ def batch_stop(request: Request):
 def batch_status():
     q = batch_state["queue"]
     return {"items": q.items if q else [], "running": _batch_running()}
+
+
+# ---- output options, presets, track probe, hand-offs ----
+TOOLS = {   # hand-off targets: env override, else default install paths
+    "mkvtoolnix": ("ADPATCH_MKVTOOLNIX", "mkvtoolnix-gui",
+                   r"C:\Program Files\MKVToolNix\mkvtoolnix-gui.exe"),
+    "handbrake": ("ADPATCH_HANDBRAKE", "HandBrake",
+                  r"C:\Program Files\HandBrake\HandBrake.exe"),
+}
+
+
+def tool_path(name):
+    env, exe, default = TOOLS[name]
+    for cand in (os.environ.get(env), shutil.which(exe), default):
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+@app.get("/api/options")
+def options_info():
+    return {"defaults": adpatch.DEFAULT_OPTIONS,
+            "presets": adpatch.load_presets(),
+            "builtin": list(adpatch.BUILTIN_PRESETS),
+            "tools": {t: tool_path(t) is not None for t in TOOLS}}
+
+
+@app.post("/api/presets")
+def save_preset(request: Request, payload: dict = Body(...)):
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    name = (payload.get("name") or "").strip()
+    if not name or name in adpatch.BUILTIN_PRESETS:
+        return JSONResponse({"error": "choose a new preset name"},
+                            status_code=400)
+    adpatch.save_preset(name, _parse_options(payload.get("options")))
+    return {"saved": name}
+
+
+@app.get("/api/probe")
+def probe(request: Request, path: str):
+    """Tracks of a local file (desktop track picker). Localhost only."""
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    if not os.path.isfile(path):
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    return {"streams": [st for st in adpatch.probe_streams(path)
+                        if st["type"] in ("audio", "subtitle")]}
+
+
+@app.post("/api/handoff")
+def handoff(request: Request, payload: dict = Body(...)):
+    """Open a finished output in MKVToolNix (track editing) or HandBrake
+    (re-encodes) - separately installed GPL programs, launched as-is."""
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    exe = tool_path(payload.get("tool", ""))
+    path = payload.get("path", "")
+    if not exe or not os.path.isfile(path):
+        return JSONResponse({"error": "tool or file not found"},
+                            status_code=404)
+    # MKVToolNix opens the file in its multiplexer; HandBrake's GUI has no
+    # documented "open file" argument, so it gets the path anyway (newer
+    # versions take it) and Explorer shows the file to drag in.
+    # (CREATE_NO_WINDOW only hides console windows; GUIs open normally)
+    subprocess.Popen([exe, path],
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if payload.get("tool") == "handbrake":
+        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+    return {"launched": os.path.basename(exe)}
 
 
 @app.get("/api/info")
@@ -372,6 +469,11 @@ INDEX_HTML = """<!doctype html>
   body.dragging main { outline: 3px dashed #3d6bd6; outline-offset: 6px;
                        border-radius: 12px; }
   details { margin-top: .6rem; }
+  details.opts { margin: 0 0 .8rem; }
+  details.opts summary { cursor: pointer; }
+  .og { display: flex; flex-wrap: wrap; gap: .4rem .9rem; margin: .5rem 0;
+        align-items: center; font-size: .9rem; }
+  .og select, .og input:not([type=checkbox]) { margin-left: .3rem; }
   textarea, input:not([type]), select { background: #14161a; color: #e8e8e8;
     border: 1px solid #3a3f4a; border-radius: 8px; padding: .5rem;
     font: inherit; }
@@ -414,9 +516,69 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
     </label>
     <div class="hint" style="margin:-.3rem 0 .8rem">
       Tip: drop both files anywhere on the page at once.</div>
-    <label style="display:block;margin-bottom:.8rem">
-      <input type="checkbox" id="rep"> replace original audio entirely
-    </label>
+    <details id="opts" class="opts">
+      <summary>Output options <span class="hint" id="optsum"></span></summary>
+      <div class="og">
+        <label>Preset <select id="o_preset"></select></label>
+        <button class="stop" id="o_save" type="button">Save as preset&hellip;</button>
+      </div>
+      <div class="og">
+        <label>Container <select id="o_container">
+          <option value="mkv">MKV (everything fits)</option>
+          <option value="mp4">MP4 (TVs, phones)</option></select></label>
+        <label>Default audio <select id="o_default">
+          <option value="ad">Audio description</option>
+          <option value="original">Original</option></select></label>
+      </div>
+      <div class="og">
+        <label>AD codec <select id="o_codec">
+          <option value="aac">AAC</option><option value="opus">Opus</option>
+          <option value="ac3">AC-3 (Dolby)</option>
+          <option value="eac3">E-AC-3</option></select></label>
+        <label>Bitrate <select id="o_bitrate">
+          <option>96k</option><option>128k</option><option>160k</option>
+          <option selected>192k</option><option>256k</option>
+          <option>384k</option><option>448k</option><option>640k</option>
+        </select></label>
+        <label>Channels <select id="o_channels">
+          <option value="">as the AD file</option>
+          <option value="2">stereo</option><option value="1">mono</option>
+        </select></label>
+      </div>
+      <div class="og">
+        <label>Original audio <select id="o_keepa">
+          <option value="first">first track</option>
+          <option value="all">all tracks</option>
+          <option value="none">none (AD only)</option></select></label>
+        <label>Subtitles <select id="o_keeps">
+          <option value="all">keep all</option>
+          <option value="none">drop</option></select></label>
+      </div>
+      <div id="o_tracks" class="hint" hidden></div>
+      <div class="og">
+        <label>Add subtitles <input type="file" id="o_subfile"
+          accept=".srt,.ass,.ssa,.vtt"></label>
+        <button class="stop" id="o_subpick" type="button" hidden>Add subtitle file&hellip;</button>
+        <label>language <input id="o_sublang" size="4" placeholder="eng"></label>
+        <span class="hint" id="o_subname"></span>
+      </div>
+      <div class="og">
+        <label><input type="checkbox" id="o_loud"> match AD loudness to the original</label>
+      </div>
+      <div class="og">
+        <label>Size <select id="o_fit">
+          <option value="">keep the video as is (fast)</option>
+          <option value="fit">fit to a size (re-encodes, slow)</option>
+        </select></label>
+        <span id="o_fitbox" hidden>
+          <input id="o_gb" type="number" min="0.1" step="0.1" value="2"
+                 style="width:5em"> GB,
+          <select id="o_height">
+            <option value="">keep resolution</option>
+            <option>2160</option><option>1080</option><option>720</option>
+            <option>480</option></select></span>
+      </div>
+    </details>
     <button id="go" disabled>Patch it</button>
   </div>
   <div class="card" id="prog" hidden>
@@ -427,6 +589,10 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
       <pre id="log"></pre></details>
     <a class="dl" id="dl" hidden>&#11015;&#65039; Download patched video</a>
     <button id="reveal" hidden>&#128194; Show in folder</button>
+    <div style="display:flex;gap:.5rem;margin-top:.5rem">
+      <button class="stop" id="h_mkvtoolnix" hidden></button>
+      <button class="stop" id="h_handbrake" hidden></button></div>
+    <ul class="hint" id="notes"></ul>
   </div>
   <div class="card" id="sync" hidden>
     <div><span class="badge" id="badge"></span>
@@ -516,6 +682,7 @@ function isVideo(f) { return VIDEO_EXTS.includes(ext(f.name)) ||
 
 function setFile(slot, f) {
   files[slot] = f;
+  if (slot === 'video' && f.path) probeTracks(f.path);
   const [lab, hint] = ui[slot];
   document.getElementById(lab).classList.add('set');
   document.getElementById(hint).textContent =
@@ -611,7 +778,7 @@ go.onclick = async () => {
     const r = await fetch('api/patch_local', {method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({video: files.video.path, ad: files.ad.path,
-                            replace: document.getElementById('rep').checked})});
+                            options: collectOptions()})});
     const j = await r.json();
     if (!r.ok) { fail(j.error); return; }
     poll(j.job);
@@ -621,7 +788,12 @@ go.onclick = async () => {
   const fd = new FormData();
   fd.append('video', files.video);
   fd.append('ad', files.ad);
-  fd.append('replace', document.getElementById('rep').checked);
+  const opts = collectOptions(); delete opts.add_subs;
+  fd.append('options', JSON.stringify(opts));
+  if (extraSub && !extraSub.path) {
+    fd.append('subs', extraSub);
+    fd.append('subs_lang', O('o_sublang').value.trim());
+  }
   document.getElementById('prog').hidden = false;
   document.getElementById('dl').hidden = true;
   document.getElementById('sync').hidden = true;
@@ -679,12 +851,15 @@ function poll(id) {
         pct.textContent += '  \u00b7  saved ' + j.output;
         const rv = document.getElementById('reveal');
         rv.hidden = false; rv.onclick = () => api().reveal(j.output);
+        showHandoffs(j.output);
       } else {
         const a = document.getElementById('dl');
         a.href = 'api/jobs/' + id + '/download'; a.hidden = false;
       }
       go.disabled = !(files.video && files.ad);
       if (j.result) showSync(id, j.result);
+      O('notes').replaceChildren(...((j.result && j.result.notes) || []).map(n =>
+        Object.assign(document.createElement('li'), {textContent: n})));
     } else if (j.status === 'error') {
       clearInterval(t); fail(j.error);
     }
@@ -869,7 +1044,9 @@ $('bstart').onclick = async () => {
   const r = await fetch('api/batch/start', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({pairs, outdir: $('boutdir').value.trim() || null,
-                          replace: $('rep').checked})});
+                          options: Object.assign(collectOptions(),
+                            {keep_audio: O('o_keepa').value,
+                             keep_subs: O('o_keeps').value, add_subs: []})})});
   if (!r.ok) { alert((await r.json()).error); return; }
   $('bpairs').hidden = true; pollQueue();
 };
@@ -919,6 +1096,132 @@ fetch('api/info').then(r => r.json()).then(j => {
   if (!j.can_shutdown) return;   // batch reads folders on this PC only
   $('batch').hidden = false; pollQueue();
 }).catch(() => {});
+
+// ---- output options (see adpatch.DEFAULT_OPTIONS) ----
+const O = id => document.getElementById(id);
+let optInfo = {presets: {}, builtin: [], tools: {}};
+let probedTracks = null;   // desktop: tracks of the chosen video
+let extraSub = null;       // {path} (desktop) or File (browser)
+
+function collectOptions() {
+  const o = {container: O('o_container').value,
+             default_track: O('o_default').value,
+             ad_codec: O('o_codec').value, ad_bitrate: O('o_bitrate').value,
+             ad_channels: O('o_channels').value ? +O('o_channels').value : null,
+             keep_audio: O('o_keepa').value, keep_subs: O('o_keeps').value,
+             loudness_match: O('o_loud').checked,
+             fit_gb: O('o_fit').value ? +O('o_gb').value : null,
+             max_height: O('o_fit').value && O('o_height').value ? +O('o_height').value : null};
+  if (probedTracks) {   // per-track picks override the coarse choices
+    const picked = t => [...document.querySelectorAll('#o_tracks input[data-t="' + t + '"]')]
+      .filter(c => c.checked).map(c => +c.dataset.i);
+    o.keep_audio = picked('audio'); o.keep_subs = picked('subtitle');
+  }
+  if (extraSub && extraSub.path)
+    o.add_subs = [{path: extraSub.path, language: O('o_sublang').value.trim()}];
+  return o;
+}
+
+function applyOptions(o) {
+  const d = Object.assign({}, optInfo.defaults || {}, o);
+  O('o_container').value = d.container; O('o_default').value = d.default_track;
+  O('o_codec').value = d.ad_codec; O('o_bitrate').value = d.ad_bitrate;
+  O('o_channels').value = d.ad_channels || '';
+  O('o_keepa').value = Array.isArray(d.keep_audio) ? 'all' : d.keep_audio;
+  O('o_keeps').value = Array.isArray(d.keep_subs) ? 'all' : d.keep_subs;
+  O('o_loud').checked = !!d.loudness_match;
+  O('o_fit').value = d.fit_gb ? 'fit' : '';
+  if (d.fit_gb) O('o_gb').value = d.fit_gb;
+  O('o_height').value = d.max_height || '';
+  syncOptionsUi();
+}
+
+function syncOptionsUi() {
+  O('o_fitbox').hidden = !O('o_fit').value;
+  const o = collectOptions();
+  O('optsum').textContent = '  ' + [o.container.toUpperCase(),
+    o.ad_codec.toUpperCase() + ' ' + o.ad_bitrate,
+    o.fit_gb ? 'fit ' + o.fit_gb + ' GB' : null,
+    o.loudness_match ? 'loudness' : null].filter(Boolean).join(' · ');
+  try { localStorage.setItem('adp-options', JSON.stringify(o)); } catch {}
+}
+document.querySelectorAll('#opts select, #opts input').forEach(el =>
+  el.addEventListener('change', syncOptionsUi));
+
+O('o_preset').onchange = () => {
+  const p = optInfo.presets[O('o_preset').value];
+  if (p) applyOptions(p);
+};
+O('o_save').onclick = async () => {
+  const name = prompt('Preset name:');
+  if (!name) return;
+  const o = collectOptions(); delete o.add_subs;
+  const r = await fetch('api/presets', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, options: o})});
+  if (!r.ok) { alert((await r.json()).error); return; }
+  await loadOptions(); O('o_preset').value = name;
+};
+
+// extra subtitle file: native dialog on desktop, file input in browsers
+O('o_subfile').onchange = () => {
+  extraSub = O('o_subfile').files[0] || null;
+  O('o_subname').textContent = extraSub ? extraSub.name : '';
+};
+O('o_subpick').onclick = async () => {
+  const f = await api().pick_file('subs');
+  if (f) { extraSub = f; O('o_subname').textContent = f.name; }
+};
+
+async function loadOptions() {
+  optInfo = await (await fetch('api/options')).json();
+  const sel = O('o_preset'); sel.replaceChildren(new Option('(custom)', ''));
+  for (const name of Object.keys(optInfo.presets)) sel.append(new Option(name, name));
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem('adp-options')); } catch {}
+  applyOptions(saved || {});
+}
+loadOptions();
+if (DESKTOP) { O('o_subfile').parentElement.hidden = true; O('o_subpick').hidden = false; }
+
+// desktop: list the video's tracks with checkboxes
+async function probeTracks(path) {
+  probedTracks = null; O('o_tracks').hidden = true;
+  const r = await fetch('api/probe?path=' + encodeURIComponent(path));
+  if (!r.ok) return;
+  const {streams} = await r.json();
+  const box = O('o_tracks'); box.replaceChildren();
+  const keepA = O('o_keepa').value, keepS = O('o_keeps').value;
+  for (const st of streams) {
+    const l = document.createElement('label'); l.style.display = 'block';
+    const c = document.createElement('input'); c.type = 'checkbox';
+    c.dataset.t = st.type; c.dataset.i = st.type_index;
+    c.checked = st.type === 'audio'
+      ? (keepA === 'all' || (keepA === 'first' && st.type_index === 0))
+      : keepS === 'all';
+    c.onchange = syncOptionsUi;
+    l.append(c, ' ' + (st.type === 'audio' ? 'Audio ' : 'Subtitle ') +
+      (st.type_index + 1) + ': ' + [st.language, st.codec, st.channels,
+      st.title].filter(Boolean).join(', '));
+    box.append(l);
+  }
+  if (streams.length) { probedTracks = streams; box.hidden = false;
+    box.prepend(Object.assign(document.createElement('div'),
+      {textContent: 'Keep these tracks from the video:'})); }
+}
+
+// hand-off buttons after a job (desktop / same PC)
+function showHandoffs(path) {
+  for (const [tool, label] of [['mkvtoolnix', 'Open in MKVToolNix'],
+                               ['handbrake', 'Open in HandBrake']]) {
+    const b = O('h_' + tool);
+    b.hidden = !(DESKTOP && optInfo.tools[tool]);
+    b.textContent = label;
+    b.onclick = () => fetch('api/handoff', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tool, path})});
+  }
+}
 
 function fmtTime(s) {
   s = Math.round(s);

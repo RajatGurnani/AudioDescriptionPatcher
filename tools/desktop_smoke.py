@@ -37,9 +37,9 @@ def selftest(win, api):
         work = os.path.join(tempfile.gettempdir(), "adpatch-desktop-smoke")
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
-        h = os.path.join(tempfile.gettempdir(), "adpatch-harness")
-        video = shutil.copy(os.path.join(h, "video_pcm_10m.mkv"), work)
-        ad = shutil.copy(os.path.join(h, "ad4_cut_pal_10m.mp3"), work)
+        h = os.path.join(tempfile.gettempdir(), "adpatch-options")
+        video = shutil.copy(os.path.join(h, "movie.mkv"), work)
+        ad = shutil.copy(os.path.join(h, "movie_AD.mp3"), work)
         time.sleep(1.5)
         js = win.evaluate_js
         check("desktop mode", js("DESKTOP && !!window.pywebview.api") is True)
@@ -51,6 +51,15 @@ def selftest(win, api):
         time.sleep(1.5)
         got = js("[files.video && files.video.path, files.ad && files.ad.path]")
         check("drop fills slots", got == [video, ad], str(got))
+        # track picker: keep both audio tracks, drop the French subtitle
+        boxes = js("[...document.querySelectorAll('#o_tracks input')]"
+                   ".map(c => c.dataset.t + c.dataset.i + ':' + c.checked)")
+        check("track picker lists 2 audio + 2 subs", boxes ==
+              ["audio0:true", "audio1:false", "subtitle0:true",
+               "subtitle1:true"], str(boxes))
+        js("document.querySelector('#o_tracks input[data-t=audio][data-i=\"1\"]').checked = true;"
+           "document.querySelector('#o_tracks input[data-t=subtitle][data-i=\"1\"]').checked = false;"
+           "O('o_codec').value = 'opus'; syncOptionsUi()")
         js("go.click()")
         stage = ""
         for _ in range(120):
@@ -60,14 +69,31 @@ def selftest(win, api):
                 break
         check("job done", stage.startswith("Done"), stage)
         time.sleep(1.5)
-        out = os.path.join(work, "video_pcm_10m.AD.mkv")
+        out = os.path.join(work, "movie.AD.mkv")
         check("output next to video", os.path.exists(out))
+        import adpatch
+        st = adpatch.probe_streams(out)
+        got = [(x["type"][0], x["codec"], x["language"]) for x in st
+               if x["type"] in ("audio", "subtitle")]
+        check("picked tracks in output", got == [
+            ("a", "opus", "eng"), ("a", "pcm_s16le", "eng"),
+            ("a", "ac3", "spa"), ("s", "subrip", "eng")], str(got))
         check("Show in folder", js("!document.getElementById('reveal').hidden")
               is True)
         badge = js("document.getElementById('badge').textContent") or ""
         piece = js("document.getElementById('align').textContent") or ""
-        check("verdict + pieces", "In sync" in badge and "2 pieces" in piece,
-              f"{badge} | {piece}")
+        check("verdict", "In sync" in badge, f"{badge} | {piece}")
+        # hand-off: a stand-in "MKVToolNix" (.bat) records what it got
+        check("MKVToolNix button",
+              js("!document.getElementById('h_mkvtoolnix').hidden") is True)
+        js("O('h_mkvtoolnix').click()")
+        for _ in range(20):
+            time.sleep(0.5)
+            if os.path.exists(MARKER):
+                break
+        got = open(MARKER).read().strip() if os.path.exists(MARKER) else ""
+        check("hand-off launched with the output", got.strip('"') == out,
+              got)
         result["done"] = True
     except Exception as e:   # report, then close the window anyway
         check("selftest crashed", False, repr(e))
@@ -75,8 +101,19 @@ def selftest(win, api):
         win.destroy()
 
 
+MARKER = os.path.join(tempfile.gettempdir(), "adpatch-handoff.txt")
+
 if __name__ == "__main__":
     os.environ["ADPATCH_DESKTOP_HIDDEN"] = "1"   # headless: never shown
+    # isolated app data, and a fake MKVToolNix that writes its argument
+    os.environ["LOCALAPPDATA"] = os.path.join(tempfile.gettempdir(),
+                                              "adpatch-smoke-appdata")
+    fake = os.path.join(tempfile.gettempdir(), "fake-mkvtoolnix.bat")
+    with open(fake, "w") as f:
+        f.write(f'@echo %~1> "{MARKER}"\n')
+    if os.path.exists(MARKER):
+        os.remove(MARKER)
+    os.environ["ADPATCH_MKVTOOLNIX"] = fake
     import desktop
     t0 = time.time()
     desktop.main(selftest=selftest)

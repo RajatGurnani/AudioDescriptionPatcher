@@ -1,6 +1,8 @@
 # Roadmap: v0.4 → v1.0 (PC engine + web/desktop app)
 
-Status: iterations **0–6 done** (2026-10-19); 7 pending. Results
+Status: **all iterations (0–7) done** on Windows (2026-10-19).
+Android has the alignment work through iteration 4; iteration 7's
+options are PC-only for now (Android later, per owner). Results
 per iteration in [BENCHMARKS.md](../BENCHMARKS.md). Written
 2026-10-19 after a review of the feature wishlist (GPU, desktop app,
 track editing, size limits, torrents, AudioVault, waveforms, speed).

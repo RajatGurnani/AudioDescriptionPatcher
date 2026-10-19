@@ -95,6 +95,12 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   priming; fallback ffmpeg `aac`, whose 1024-sample priming is
   compensated in mkv only) as default track a:0, original audio copied as a:1 unless `--replace`;
   retries without subtitles if subtitle copy fails (e.g., mov_text→mkv).
+- Output options: `DEFAULT_OPTIONS` / `resolve_options()` /
+  `BUILTIN_PRESETS` + presets.json; `build_mux_cmd()` returns
+  (cmd, notes). Per-codec mkv priming in `AD_CODECS` (ac3/eac3 256,
+  opus 0) + `AD_ENCODERS` (aac_mf 0, aac 1024). Fit-to-size picks
+  `video_encoder()` (NVENC → QSV → AMF → x265). Test:
+  `tools\options_test.py` (streams, per-codec sync, loudness, size).
 - ffmpeg comes from `imageio_ffmpeg.get_ffmpeg_exe()` (pip-bundled binary,
   no ffprobe available — stream detection parses `ffmpeg -i` stderr).
 

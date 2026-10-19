@@ -233,17 +233,21 @@ class Queue:
         self.stop = threading.Event()
 
     @classmethod
-    def create(cls, pairs, outdir=None, replace=False, path=QUEUE_FILE):
+    def create(cls, pairs, outdir=None, replace=False, path=QUEUE_FILE,
+               options=None):
+        opts = adpatch.resolve_options(options, replace)
+        ext = "mp4" if opts["container"] == "mp4" else "mkv"
         items = []
         for i, (video, ad) in enumerate(pairs):
             stem = os.path.splitext(os.path.basename(video))[0]
             out = os.path.join(outdir or os.path.dirname(video),
-                               stem + ".AD.mkv")
+                               f"{stem}.AD.{ext}")
             items.append({"id": i, "video": video, "ad": ad, "output": out,
                           "status": "skipped" if os.path.exists(out)
                           else "pending",
                           "phase": None, "frac": 0.0})
         q = cls(items, {"outdir": outdir, "replace": replace,
+                        "patch_options": options or {},
                         "created": time.time()}, path)
         q.save()
         return q
@@ -298,6 +302,8 @@ class Queue:
                 res = adpatch.patch(it["video"], it["ad"],
                                     output=it["output"],
                                     replace=self.options.get("replace"),
+                                    options=self.options.get(
+                                        "patch_options"),
                                     log=log, progress=progress)
                 it.update(status="done", confidence=res["confidence"],
                           band=res["band"], warnings=res["warnings"],
@@ -342,7 +348,9 @@ def main(argv=None):
     p.add_argument("--no-recursive", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="continue the last interrupted batch")
+    adpatch.add_option_args(p)
     args = p.parse_args(argv)
+    options = adpatch.options_from_args(args)
 
     if args.resume:
         q = Queue.load()
@@ -367,7 +375,7 @@ def main(argv=None):
                     .lower() != "y":
                 sys.exit("cancelled")
         q = Queue.create([(r["video"], r["ad"]) for r in chosen],
-                         args.outdir, args.replace)
+                         args.outdir, args.replace, options=options)
 
     bar = adpatch.ConsoleProgress() if sys.stderr.isatty() else None
     try:

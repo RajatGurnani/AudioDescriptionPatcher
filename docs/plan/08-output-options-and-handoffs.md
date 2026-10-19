@@ -1,5 +1,18 @@
 # 08 — Output options + hand-offs to existing tools (Iteration 7, v1.0.0)
 
+> **Outcome (2026-10-19):** 8.1 done (all table rows; loudness via
+> volumedetect mean level, ±12 dB). 8.2 done: fit-to-N-GB with
+> NVENC/QSV/AMF/x265 auto-pick, optional max height, HDR refused,
+> fail-fast size check (verified: 0.292 GB for a 0.3 GB target with
+> hevc_nvenc). 8.3: MKVToolNix + HandBrake buttons (desktop app;
+> detected or env-overridden); **qBittorrent hand-off dropped** — low
+> value, and torrent workflows stay outside the app. 8.4 presets done
+> (5 built-in + user presets). Verified on Windows only:
+> tools/options_test.py, headless tools/desktop_smoke.py (track picks,
+> hand-off via a stand-in tool), the built exe over HTTP. Neither
+> MKVToolNix nor HandBrake is installed on the dev PC, so the real
+> launches are untested. Android: later.
+
 Principle: implement the options that are *one ffmpeg flag* in our
 existing mux; hand off anything that needs a full editor or re-encode
 pipeline to the tools that already do it well.

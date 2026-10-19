@@ -104,6 +104,21 @@ breakpoints once real pairs have been measured.
   AAC-encoded. Resampling shifts pitch by |a−1| (≤ a few %); acceptable
   on mobile, and exactly zero in the common no-drift case. Output MP4.
 
+### 5b. Output options
+
+`resolve_options()` merges `DEFAULT_OPTIONS` with the caller's (CLI
+flags, presets, the app's panel); `build_mux_cmd()` turns them into maps
+and codecs using `probe_streams()` (parsed `ffmpeg -i`): kept original
+audio copied (converted to AAC only where mp4 can't hold it), subtitles
+copied (mkv) or converted to mov_text (mp4, image subs dropped),
+external subtitles as extra inputs. AD codec priming that mkv doesn't
+trim, measured at sample level: ffmpeg `aac` 1024, `ac3`/`eac3` 256,
+`libopus` and `aac_mf` 0 (mp4's edit list trims all of them).
+Fit-to-size: video bitrate = (N GB × 8 × 0.985 − audio bits) ÷ duration,
+encoder = first working of hevc_nvenc / hevc_qsv / hevc_amf / libx265
+(1-frame probe), VBR with 1.5× maxrate; checked before analysis starts.
+Everything returns `notes` that the UI and CLI show.
+
 ### 6. Different edits: piecewise alignment
 
 When the linear fit leaves ≥ 10 % of its segments unmatched while the

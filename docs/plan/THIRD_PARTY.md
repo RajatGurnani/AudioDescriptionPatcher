@@ -39,7 +39,7 @@ program, never link/copy · **Idea**: read for design only, no code ·
 | [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz) | MIT | No | stdlib `difflib` is enough for name tie-breaks |
 | [Nuitka](https://github.com/Nuitka/Nuitka) | AGPL-3.0 (GitHub) | **No** | — |
 | PySide6 / PyQt6 | LGPL-3 / GPL-3 | No | second UI codebase; pywebview reuses the web UI |
-| [qbittorrent-api](https://github.com/rmartin16/qbittorrent-api) | MIT | Optional (08) | magnet hand-off to a user-installed qBittorrent |
+| [qbittorrent-api](https://github.com/rmartin16/qbittorrent-api) | MIT | **No** (dropped in iteration 7) | torrent hand-off not built |
 | [audiovault-downloader](https://github.com/cartertemm/audiovault-downloader) | no licence file | **No** | own WebView approach instead (mirrors Android `VaultActivity`) |
 
 ## External programs (Run only)

@@ -122,6 +122,42 @@ Batch is PC-only (phones get the single-file page).
    and the sync report appear on screen. A 2-hour movie takes several
    minutes depending on the phone.
 
+## Output options
+
+In the web app and the desktop app, open **Output options** above the
+Patch button (the CLI has the same as flags — `adpatch.py --help`).
+Choices are remembered; **Presets** store whole sets (built-in: Default,
+TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
+**Save as preset…** adds your own).
+
+| Option | What it does |
+|---|---|
+| Container | MKV holds everything; MP4 plays on more TVs/phones — subtitles become mov_text, image subtitles (PGS/DVD) are dropped, audio MP4 can't hold (e.g. PCM, DTS) is converted to AAC. Each conversion is listed under the result. |
+| Default audio | which track players start with: the AD or the original |
+| AD codec / bitrate / channels | AAC (default), Opus (small, great quality), AC-3 / E-AC-3 (TV receivers) |
+| Original audio | first track (default), all, or none (AD only) |
+| Subtitles | keep all or drop |
+| Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox |
+| Add subtitles | an external .srt/.ass/.vtt with its language |
+| Match AD loudness | measures both and levels the AD to the original (±12 dB max; costs one extra decode of each) |
+| Size | *fit to N GB* re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down; N is an upper limit (simple footage comes out smaller). Refused for HDR video: use HandBrake. Slow compared to the default copy. |
+
+CLI examples:
+
+```
+adpatch.py movie.mkv ad.mp3 --preset "TV-friendly (MP4, AC-3, all audio)"
+adpatch.py movie.mkv ad.mp3 --keep-audio all --keep-subs none --add-subs extra.srt:spa:forced
+adpatch.py movie.mkv ad.mp3 --container mp4 --fit-gb 2 --max-height 720
+adpatch.py --list-streams movie.mkv
+```
+
+**Hand-offs (desktop app):** after a job, **Open in MKVToolNix** (full
+track/chapter editing) and **Open in HandBrake** (advanced re-encodes)
+appear when those free programs are installed in their default folders
+(or set `ADPATCH_MKVTOOLNIX` / `ADPATCH_HANDBRAKE` to the exe).
+HandBrake's window has no "open this file" switch, so Explorer also
+opens with the file selected — drag it in.
+
 ## Reading the sync report
 
 Every run prints one line per checked segment:
