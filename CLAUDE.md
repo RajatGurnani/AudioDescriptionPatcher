@@ -54,6 +54,11 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   2. stretch AD envelope by best factor, then 30 s `segment_match()`
      windows across the runtime → weighted linear fit with outlier
      rejection → final a, b + per-segment sync report.
+- `patch(..., log, progress)` — `progress(phase, frac)` with phases
+  video/ad/align/mux; decode % from bytes vs `probe_duration()`, mux %
+  from ffmpeg `-progress pipe:1` (`run_ffmpeg()`). All ffmpeg stderr is
+  drained on a thread (`_drain`) — reading it after stdout deadlocks on
+  Windows. CLI draws `ConsoleProgress` when stderr is a TTY.
 - `build_mux_cmd()` — ffmpeg mux: `atempo=1/a` (skipped if |a-1|<5e-5),
   `adelay` (b≥0) or `atrim` (b<0); video `-c:v copy`; AD encoded AAC as
   default track a:0, original audio copied as a:1 unless `--replace`;

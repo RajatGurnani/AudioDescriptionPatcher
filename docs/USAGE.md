@@ -22,6 +22,7 @@ pip, and can even fetch Python itself when none is installed.
 
 1. Select the video and the AD file in Explorer (both at once) and drag
    them onto `patch.bat`.
+   A progress bar shows each step (1/4 … 4/4) as it runs.
 2. Read the sync report it prints (see "Reading the sync report" below).
 3. Play the new `<video name>.AD.mkv`. The AD track is the default;
    switch back to the original audio in your player's audio-track menu.
@@ -35,7 +36,15 @@ CLI flags (via `adpatch.py`): `-o OUTPUT` to choose the output path,
    Allow Python through the Windows firewall if prompted.
 2. On the phone: scan the QR code printed in the terminal (or type the
    `http://<ip>:8756` URL). Phone and PC must be on the same Wi-Fi.
-3. Choose the video and the AD file, tap **Patch it**, wait, download.
+3. Choose the video and the AD file — tap each box, or drag both files
+   onto the page at once (they're sorted by type) — then **Patch it**.
+   A progress bar shows upload speed, then each step (1/4 analyzing
+   video … 4/4 writing output) with % and elapsed time; the full log is
+   under "log".
+
+On the PC in Chrome/Edge the file dialogs remember the last folder
+separately for videos and for AD files, across sessions. (Phones and
+Firefox use the standard picker, which can't be told where to start.)
 
 The PC does all processing; the phone just uploads/downloads. Nothing is
 sent to the internet.

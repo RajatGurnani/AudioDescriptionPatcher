@@ -34,6 +34,7 @@ the video itself. Such files are detected and reported as weak matches.
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -77,6 +78,52 @@ def probe_has_video(path):
                for line in proc.stderr.splitlines())
 
 
+def probe_duration(path):
+    """Container duration in seconds from `ffmpeg -i` (no ffprobe in the
+    pip-bundled ffmpeg), or None if unknown."""
+    proc = subprocess.run([FFMPEG, "-hide_banner", "-i", path],
+                          capture_output=True, text=True, errors="replace")
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr)
+    if not m:
+        return None
+    h, mnt, sec = m.groups()
+    return int(h) * 3600 + int(mnt) * 60 + float(sec)
+
+
+def _drain(pipe):
+    """Read a pipe to the end on a background thread; returns a function
+    that joins it and yields the bytes. Prevents the pipe-buffer deadlock
+    (~4 KB on Windows) when ffmpeg writes lots of warnings to stderr
+    while we're blocked reading its other output."""
+    chunks = []
+    t = threading.Thread(target=lambda: chunks.append(pipe.read()),
+                         daemon=True)
+    t.start()
+
+    def result():
+        t.join()
+        return b"".join(chunks)
+    return result
+
+
+def run_ffmpeg(cmd, duration=None, progress=None):
+    """Run an ffmpeg command, reporting completion 0..1 to `progress` from
+    its -progress output. Returns (returncode, stderr_text)."""
+    cmd = [cmd[0], "-nostats", "-progress", "pipe:1"] + cmd[1:]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    err = _drain(proc.stderr)
+    for line in proc.stdout:
+        if progress and duration and line.startswith(b"out_time_us="):
+            try:
+                us = int(line.split(b"=", 1)[1])
+            except ValueError:   # "N/A" before the first frame
+                continue
+            progress(min(1.0, max(0.0, us / 1e6 / duration)))
+    rc = proc.wait()
+    return rc, err().decode(errors="replace")
+
+
 def classify_inputs(a, b):
     """Return (video_path, audio_path) from two paths given in any order.
 
@@ -98,7 +145,7 @@ def classify_inputs(a, b):
 # Envelope extraction
 # --------------------------------------------------------------------------
 
-def onset_envelope(path):
+def onset_envelope(path, progress=None):
     """Decode the first audio stream and return its onset-strength envelope.
 
     The envelope is the half-wave-rectified frame-to-frame change in log
@@ -106,35 +153,37 @@ def onset_envelope(path):
     narration mixed over the AD soundtrack and level/EQ differences between
     releases, which makes this far more robust than correlating waveforms.
 
-    Decoding is streamed through ffmpeg a minute at a time - a 3-hour movie
-    never occupies more than a few MB of memory here.
+    Decoding is streamed through ffmpeg 20 s at a time - a 3-hour movie
+    never occupies more than a few MB of memory here. `progress`, if
+    given, is called with the fraction decoded (0..1).
     """
+    total = None
+    if progress:
+        dur = probe_duration(path)
+        total = dur * SR * 4 if dur else None
     cmd = [FFMPEG, "-v", "error", "-i", path, "-map", "0:a:0",
            "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
-    # Drain stderr concurrently: if ffmpeg writes more warnings than the
-    # pipe buffer holds (~4 KB on Windows) while we block on stdout, both
-    # processes wait on each other forever.
-    err_chunks = []
-    err_thread = threading.Thread(
-        target=lambda: err_chunks.append(proc.stderr.read()), daemon=True)
-    err_thread.start()
+    err = _drain(proc.stderr)
     energies = []
     leftover = b""
-    bytes_per_read = 4 * SR * 60
+    done = 0
+    bytes_per_read = 4 * SR * 20
     while True:
         chunk = proc.stdout.read(bytes_per_read)
         if not chunk:
             break
+        done += len(chunk)
+        if total:
+            progress(min(1.0, done / total))
         buf = leftover + chunk
         usable = (len(buf) // 4 // HOP) * HOP * 4
         if usable:
             x = np.frombuffer(buf[:usable], dtype=np.float32)
             energies.append((x.reshape(-1, HOP) ** 2).sum(axis=1))
         leftover = buf[usable:]
-    err_thread.join()
-    err = b"".join(err_chunks).decode(errors="replace")
+    err = err().decode(errors="replace")
     if proc.wait() != 0:
         raise RuntimeError(f"ffmpeg failed decoding {path}:\n{err}")
     if not energies:
@@ -354,7 +403,7 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs):
         filters.append("asetpts=PTS-STARTPTS")
     chain = ",".join(filters) if filters else "anull"
 
-    cmd = [FFMPEG, "-y", "-v", "error", "-stats",
+    cmd = [FFMPEG, "-y", "-v", "error",
            "-i", video, "-i", ad_audio,
            "-filter_complex", f"[1:a:0]{chain}[ad]",
            "-map", "0:v", "-c:v", "copy",
@@ -376,7 +425,8 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs):
 # Pipeline
 # --------------------------------------------------------------------------
 
-def patch(input_a, input_b, output=None, replace=False, log=print):
+def patch(input_a, input_b, output=None, replace=False, log=print,
+          progress=None):
     """Full pipeline: classify inputs, align, verify, mux.
 
     Returns a dict:
@@ -388,9 +438,15 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
                     different cut / extended audio description)
         timings     {phase: seconds} for video_env, ad_env, align, mux,
                     total
+    `progress(phase, fraction)`, if given, is called as work advances;
+    phases in order: "video", "ad", "align", "mux".
+
     Raises ValueError / RuntimeError with a user-readable message on
     failure.
     """
+    def report(phase):
+        return (lambda f: progress(phase, f)) if progress else None
+
     for f in (input_a, input_b):
         if not os.path.isfile(f):
             raise ValueError(f"file not found: {f}")
@@ -412,16 +468,20 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
     log(f"AD audio: {os.path.basename(ad_audio)}")
 
     log("analyzing video audio...")
-    vid_env = onset_envelope(video)
+    vid_env = onset_envelope(video, progress=report("video"))
     log(f"  {len(vid_env) / FPS / 60:.1f} min")
     lap("video_env")
     log("analyzing AD audio...")
-    ad_env = onset_envelope(ad_audio)
+    ad_env = onset_envelope(ad_audio, progress=report("ad"))
     log(f"  {len(ad_env) / FPS / 60:.1f} min")
     lap("ad_env")
 
     log("aligning...")
-    a, b_sec, report = fit_alignment(ad_env, vid_env, log=log)
+    if progress:
+        progress("align", 0.0)
+    a, b_sec, rows = fit_alignment(ad_env, vid_env, log=log)
+    if progress:
+        progress("align", 1.0)
     lap("align")
 
     drift_ppm = (a - 1.0) * 1e6
@@ -433,14 +493,14 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
 
     log("  sync check (AD time -> video time, match score, residual):")
     weak = 0
-    for ad_t, vid_t, score, resid in report:
+    for ad_t, vid_t, score, resid in rows:
         flag = ""
         if score <= WEAK_SCORE:
             weak += 1
             flag = "  <- weak match"
         log(f"    {ad_t / 60:6.1f}m -> {vid_t / 60:6.1f}m   "
             f"score {score:4.2f}   {resid:+6.0f} ms{flag}")
-    suspect = weak > len(report) // 2
+    suspect = weak > len(rows) // 2
     if suspect:
         log("  warning: most segments matched poorly - the AD file may be "
             "for a different cut of this video (or an extended audio "
@@ -448,17 +508,18 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
             "with a time shift). Output may be out of sync.")
 
     log("muxing (video stream copied, AD audio encoded)...")
-    r = subprocess.run(build_mux_cmd(video, ad_audio, output, a, b_sec,
-                                     replace, with_subs=True),
-                       capture_output=True, text=True, errors="replace")
-    if r.returncode != 0 and "Subtitle" in r.stderr:
+    duration = len(vid_env) / FPS
+    rc, err = run_ffmpeg(build_mux_cmd(video, ad_audio, output, a, b_sec,
+                                       replace, with_subs=True),
+                         duration, report("mux"))
+    if rc != 0 and "Subtitle" in err:
         # some subtitle codecs (e.g. mp4 mov_text) can't be copied into
         # mkv - retry without subtitles rather than failing the whole job
-        r = subprocess.run(build_mux_cmd(video, ad_audio, output, a, b_sec,
-                                         replace, with_subs=False),
-                           capture_output=True, text=True, errors="replace")
-    if r.returncode != 0:
-        raise RuntimeError(f"muxing failed:\n{r.stderr}")
+        rc, err = run_ffmpeg(build_mux_cmd(video, ad_audio, output, a,
+                                           b_sec, replace, with_subs=False),
+                             duration, report("mux"))
+    if rc != 0:
+        raise RuntimeError(f"muxing failed:\n{err}")
     lap("mux")
     timings["total"] = time.perf_counter() - t_start
 
@@ -470,7 +531,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
         f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s")
     log("AD track is the default audio; original audio kept as track 2."
         if not replace else "original audio replaced with AD track.")
-    return {"output": output, "a": a, "b": b_sec, "report": report,
+    return {"output": output, "a": a, "b": b_sec, "report": rows,
             "weak": weak, "suspect": suspect, "timings": timings}
 
 
@@ -485,11 +546,62 @@ def main():
                    help="drop the original audio instead of keeping it "
                         "as a second track")
     args = p.parse_args()
+    bar = ConsoleProgress() if sys.stderr.isatty() else None
     try:
         patch(args.inputs[0], args.inputs[1],
-              output=args.output, replace=args.replace)
+              output=args.output, replace=args.replace,
+              log=bar.log if bar else print,
+              progress=bar.update if bar else None)
     except (ValueError, RuntimeError) as e:
+        if bar:
+            bar.clear()
         sys.exit(f"error: {e}")
+
+
+PHASE_LABELS = {"video": "1/4 analyzing video audio",
+                "ad": "2/4 analyzing AD audio",
+                "align": "3/4 aligning",
+                "mux": "4/4 writing output"}
+
+
+class ConsoleProgress:
+    """One self-redrawing progress line on stderr, kept below the log:
+    log lines clear it, print, and redraw it. ASCII only (cp1252/cp437
+    consoles)."""
+
+    WIDTH = 30
+
+    def __init__(self):
+        self.line = ""
+        self.last = None
+
+    def clear(self):
+        if self.line:
+            sys.stderr.write("\r" + " " * len(self.line) + "\r")
+            sys.stderr.flush()
+
+    def draw(self):
+        sys.stderr.write("\r" + self.line)
+        sys.stderr.flush()
+
+    def log(self, msg):
+        self.clear()
+        print(msg, flush=True)
+        self.draw()
+
+    def update(self, phase, frac):
+        pct = int(frac * 100)
+        if (phase, pct) == self.last:
+            return
+        self.last = (phase, pct)
+        filled = int(frac * self.WIDTH)
+        self.clear()
+        self.line = (f"  [{'#' * filled}{'-' * (self.WIDTH - filled)}] "
+                     f"{pct:3d}%  {PHASE_LABELS.get(phase, phase)}")
+        self.draw()
+        if phase == "mux" and pct >= 100:
+            sys.stderr.write("\n")
+            self.line = ""
 
 
 if __name__ == "__main__":
