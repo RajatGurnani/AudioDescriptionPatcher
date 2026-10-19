@@ -1,6 +1,6 @@
 # Roadmap: v0.4 → v1.0 (PC engine + web/desktop app)
 
-Status: **plan only** — nothing here is implemented yet. Written
+Status: iterations **0 and 1 done** (2026-10-19); 2+ pending. Written
 2026-10-19 after a review of the feature wishlist (GPU, desktop app,
 track editing, size limits, torrents, AudioVault, waveforms, speed).
 

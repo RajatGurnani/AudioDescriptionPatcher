@@ -16,14 +16,23 @@ back. Nothing leaves the local network.
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import threading
+import time
+import urllib.request
 import uuid
+import webbrowser
 
-import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-
-import adpatch
+try:
+    import uvicorn
+    from fastapi import FastAPI, File, Form, Request, UploadFile
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    import adpatch
+except ImportError as e:
+    sys.exit(f"missing package: {e.name} - run start_app.bat, which "
+             "installs the dependencies (or: pip install -r "
+             "requirements.txt)")
 
 PORT = 8756
 JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
@@ -33,6 +42,14 @@ app = FastAPI(title="AudioDescriptionPatcher")
 # job id -> {"status": queued|running|done|error, "log": [...],
 #            "output": path|None, "error": str|None, "name": str}
 jobs = {}
+
+server = None   # the uvicorn.Server, so /api/shutdown can stop it
+
+
+def is_local(request):
+    """Only this PC may stop the server - not phones on the LAN."""
+    return (request.client is not None
+            and request.client.host in ("127.0.0.1", "::1"))
 
 
 def run_job(job_id, video_path, ad_path, output_path, replace):
@@ -102,6 +119,37 @@ def job_download(job_id: str):
                         media_type="video/x-matroska")
 
 
+@app.get("/api/info")
+def info(request: Request):
+    return {"app": "adpatch", "can_shutdown": is_local(request)}
+
+
+@app.post("/api/shutdown")
+def shutdown(request: Request, force: bool = False):
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    running = [j["name"] for j in jobs.values()
+               if j["status"] in ("queued", "running")]
+    if running and not force:
+        return JSONResponse({"error": "jobs running", "running": running},
+                            status_code=409)
+
+    def stop():
+        time.sleep(0.5)   # let this response reach the browser first
+        if running and os.name == "nt":
+            # running jobs have ffmpeg children that would outlive us:
+            # take down the whole process tree
+            subprocess.run(["taskkill", "/F", "/T", "/PID",
+                            str(os.getpid())], capture_output=True)
+        elif running:
+            os._exit(0)
+        server.should_exit = True
+
+    threading.Thread(target=stop, daemon=True).start()
+    return {"stopping": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return INDEX_HTML
@@ -139,11 +187,19 @@ INDEX_HTML = """<!doctype html>
          color: white; padding: .9rem; border-radius: 10px;
          text-decoration: none; font-size: 1.05rem; }
   .warn { color: #e6b355; }
+  header { display: flex; align-items: center;
+           justify-content: space-between; }
+  button.stop { width: auto; padding: .45rem .8rem; font-size: .85rem;
+                background: #5a2a2a; }
 </style>
 </head>
 <body>
 <main>
-  <h1>&#127909; Audio Description Patcher</h1>
+  <header>
+    <h1>&#127909; Audio Description Patcher</h1>
+    <button class="stop" id="stop" hidden
+            title="Stop the server on this PC and close">&#9211; Stop</button>
+  </header>
   <div class="card">
     <label class="file" id="lv">&#128249; Choose video
       <div class="hint" id="hv">tap to select</div>
@@ -167,6 +223,24 @@ INDEX_HTML = """<!doctype html>
   </div>
 </main>
 <script>
+const stopBtn = document.getElementById('stop');
+fetch('api/info').then(r => r.json())
+  .then(j => { stopBtn.hidden = !j.can_shutdown; }).catch(() => {});
+stopBtn.onclick = async () => {
+  if (!confirm('Stop the AD Patcher server?')) return;
+  let r = await fetch('api/shutdown', {method: 'POST'});
+  if (r.status === 409) {
+    const j = await r.json();
+    if (!confirm(j.running.length + ' job(s) still running:\\n' +
+                 j.running.join('\\n') + '\\n\\nStop anyway?')) return;
+    r = await fetch('api/shutdown?force=true', {method: 'POST'});
+  }
+  if (!r.ok) { alert('Could not stop: ' + (await r.text())); return; }
+  document.body.innerHTML = '<main style="text-align:center;margin-top:30vh">' +
+    '<h1>Server stopped</h1><p class="hint">You can close this tab.</p></main>';
+  window.close();   // only works if a script opened this tab
+};
+
 const fv = document.getElementById('fv'), fa = document.getElementById('fa');
 const go = document.getElementById('go');
 function upd() {
@@ -239,18 +313,61 @@ def lan_ip():
         return "127.0.0.1"
 
 
+def already_running():
+    """True if an adpatch server already answers on PORT."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/api/info",
+                                    timeout=2) as r:
+            return b"adpatch" in r.read()
+    except OSError:
+        return False
+
+
+def port_free():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", PORT))
+            return True
+        except OSError:
+            return False
+
+
+def clean_old_jobs(max_age_h=24):
+    """Delete job folders (uploads + outputs) older than max_age_h."""
+    cutoff = time.time() - max_age_h * 3600
+    for name in os.listdir(JOBS_DIR):
+        path = os.path.join(JOBS_DIR, name)
+        if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 if __name__ == "__main__":
+    local_url = f"http://localhost:{PORT}"
+    if not port_free():
+        if already_running():
+            print(f"AD Patcher is already running - opening {local_url}")
+            if not os.environ.get("ADPATCH_NO_BROWSER"):
+                webbrowser.open(local_url)
+            sys.exit(0)
+        sys.exit(f"port {PORT} is in use by another program - close it "
+                 "and try again")
     os.makedirs(JOBS_DIR, exist_ok=True)
+    clean_old_jobs()
     url = f"http://{lan_ip()}:{PORT}"
-    print(f"\n  On this PC:    http://localhost:{PORT}")
+    print(f"\n  On this PC:    {local_url}")
     print(f"  On your phone: {url}   (same Wi-Fi)\n")
     try:
         import qrcode
         qr = qrcode.QRCode(border=1)
         qr.add_data(url)
         qr.print_ascii(invert=True)
-    except ImportError:
+    except (ImportError, UnicodeEncodeError):   # no qrcode / non-UTF-8 console
         pass
     print("If the phone can't connect, allow Python through the Windows "
           "firewall (a prompt appears on first run).\n")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    print("Stop it with the Stop button on this PC's page, or Ctrl+C.\n")
+    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=PORT,
+                                           log_level="warning"))
+    if not os.environ.get("ADPATCH_NO_BROWSER"):
+        threading.Timer(1.0, webbrowser.open, args=(local_url,)).start()
+    server.run()

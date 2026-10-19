@@ -9,13 +9,16 @@ A tool that "patches" a regular video file with its audio-described (AD) version
 ## Commands
 
 ```
-# setup (venv already exists in .venv)
+# setup: start_app.bat / patch.bat self-bootstrap via tools\ensure_env.bat
+# (creates .venv, pip/uv installs when requirements.txt changes)
 .venv\Scripts\pip install -r requirements.txt
 
 # CLI (inputs in any order; auto-detects which is the video)
 .venv\Scripts\python adpatch.py <video> <ad_audio> [-o out] [--replace]
 
 # web app (PC browser + phones on same Wi-Fi), port 8756
+# ADPATCH_NO_BROWSER=1 skips auto-opening the browser (tests)
+# POST /api/shutdown: localhost only; 409 if jobs run, ?force=true kills tree
 .venv\Scripts\python app.py
 
 # Android APK (needs Gradle 8.9 on PATH or a downloaded dist;

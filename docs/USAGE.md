@@ -9,17 +9,21 @@
    the same moment or run at the same speed as your video; that's what
    this tool fixes.
 
+## Setup (PC)
+
+Install Python 3.10+ from python.org (tick *Add python.exe to PATH*).
+That's all: the first run of `patch.bat` or `start_app.bat` creates
+`.venv` and installs everything (needs internet once, ~30 s). Later runs
+skip installation unless `requirements.txt` changed. If
+[uv](https://github.com/astral-sh/uv) is on PATH it's used instead of
+pip, and can even fetch Python itself when none is installed.
+
 ## Option 1 — PC, drag and drop
 
-1. One-time setup:
-   ```
-   python -m venv .venv
-   .venv\Scripts\pip install -r requirements.txt
-   ```
-2. Select the video and the AD file in Explorer (both at once) and drag
+1. Select the video and the AD file in Explorer (both at once) and drag
    them onto `patch.bat`.
-3. Read the sync report it prints (see "Reading the sync report" below).
-4. Play the new `<video name>.AD.mkv`. The AD track is the default;
+2. Read the sync report it prints (see "Reading the sync report" below).
+3. Play the new `<video name>.AD.mkv`. The AD track is the default;
    switch back to the original audio in your player's audio-track menu.
 
 CLI flags (via `adpatch.py`): `-o OUTPUT` to choose the output path,
@@ -27,14 +31,19 @@ CLI flags (via `adpatch.py`): `-o OUTPUT` to choose the output path,
 
 ## Option 2 — phone (or any browser) via the web app
 
-1. Run `start_app.bat` on the PC. Allow Python through the Windows
-   firewall if prompted.
+1. Run `start_app.bat` on the PC. It opens the page in your browser.
+   Allow Python through the Windows firewall if prompted.
 2. On the phone: scan the QR code printed in the terminal (or type the
    `http://<ip>:8756` URL). Phone and PC must be on the same Wi-Fi.
 3. Choose the video and the AD file, tap **Patch it**, wait, download.
 
 The PC does all processing; the phone just uploads/downloads. Nothing is
 sent to the internet.
+
+To stop the server, press **Stop** on the page *on the PC* (phones don't
+get the button). If jobs are still running it asks first, then ends them
+too. Running `start_app.bat` again while the server is up just reopens
+the page. Job folders older than 24 h are cleaned up on start.
 
 ## Option 3 — Android app (fully on-phone, offline)
 
@@ -67,6 +76,14 @@ description" that pauses the video). The output will still be written,
 but listen before keeping it.
 
 ## Troubleshooting
+
+- **"Python 3.10 or newer is required"** — install it from python.org
+  with *Add python.exe to PATH* ticked, then rerun the .bat.
+- **Setup failed / no internet on that PC** — on a PC with internet run
+  `pip download -r requirements.txt -d wheels`, copy the `wheels` folder
+  over, then `.venv\Scripts\pip install --no-index -f wheels -r requirements.txt`.
+- **"port 8756 is in use by another program"** — something else holds
+  the port; close it (or change `PORT` in `app.py`).
 
 - **"could not tell which input is the video"** — both files look like
   videos (or neither does). Pass the video first, AD second.

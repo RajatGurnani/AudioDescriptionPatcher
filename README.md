@@ -22,13 +22,10 @@ actually works.
 ## Quick start (PC)
 
 Requires Python 3.10+. ffmpeg is bundled via pip — no separate install.
+The first run of `patch.bat` / `start_app.bat` sets up `.venv` and
+installs dependencies automatically (internet needed once).
 
-```
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-```
-
-Then drag the video **and** the AD file together onto `patch.bat`, or:
+Drag the video **and** the AD file together onto `patch.bat`, or:
 
 ```
 patch.bat "Movie (2020).mp4" "Movie AD.mp3"
@@ -44,8 +41,10 @@ track, original audio as track 2.
 start_app.bat
 ```
 
-Scan the QR code it prints with your phone (same Wi-Fi). Upload the two
-files, wait, download the patched video. Files never leave your network.
+It opens the page on this PC; scan the QR code it prints with your phone
+(same Wi-Fi). Upload the two files, wait, download the patched video.
+Files never leave your network. Stop the server with the **Stop** button
+on the PC's page.
 
 ## Quick start (Android app)
 
