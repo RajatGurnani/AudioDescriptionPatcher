@@ -39,13 +39,13 @@ object Patcher {
         MediaFormat.MIMETYPE_AUDIO_AAC, "audio/ac3", "audio/eac3")
 
     // AAC AudioSpecificConfig frequency indices for supported output rates
-    private val AAC_FREQ_IDX = mapOf(
+    internal val AAC_FREQ_IDX = mapOf(
         96000 to 0, 88200 to 1, 64000 to 2,
         48000 to 3, 44100 to 4, 32000 to 5)
 
     /** csd-0 for AAC-LC stereo at [rate], built by hand so the muxer can
      *  start before the encoder produces any output. */
-    private fun aacCsd(rate: Int): ByteArray {
+    internal fun aacCsd(rate: Int): ByteArray {
         val idx = AAC_FREQ_IDX[rate]!!
         val b0 = (2 shl 3) or (idx shr 1)               // objType=LC
         val b1 = ((idx and 1) shl 7) or (OUT_CHANNELS shl 3)
@@ -56,7 +56,8 @@ object Patcher {
         context: Context, videoUri: Uri, adUri: Uri, outUri: Uri,
         a: Double, bSec: Double,
         log: (String) -> Unit, onProgress: (Float) -> Unit,
-        pieces: List<Aligner.Piece> = emptyList()
+        pieces: List<Aligner.Piece> = emptyList(),
+        boost: VoiceBoost.Options = VoiceBoost.Options.load(context)
     ) {
         val t0 = android.os.SystemClock.elapsedRealtime()
         fun logT(msg: String) = android.util.Log.d(TAG,
@@ -116,6 +117,25 @@ object Patcher {
                             "into MP4 - output will have the AD track only")
                     }
 
+                    // optional extra track: original audio + voice boost
+                    // (AD + original tracks are left as they are)
+                    var boostTrackOut = -1
+                    var boostRate = 0
+                    if (audioFormat != null && boost.addsTrack) {
+                        val r = audioFormat.getInteger(
+                            MediaFormat.KEY_SAMPLE_RATE)
+                        boostRate = if (AAC_FREQ_IDX.containsKey(r)) r
+                            else 48000
+                        val bf = MediaFormat.createAudioFormat(
+                            MediaFormat.MIMETYPE_AUDIO_AAC,
+                            boostRate, OUT_CHANNELS)
+                        bf.setByteBuffer("csd-0",
+                            ByteBuffer.wrap(aacCsd(boostRate)))
+                        boostTrackOut = muxer.addTrack(bf)
+                    }
+                    if (boost.level != VoiceBoost.Level.OFF)
+                        log("voice boost: $boost")
+
                     muxer.start()
                     val muxerLock = Any()
                     val durationUs =
@@ -141,16 +161,30 @@ object Patcher {
                         } catch (t: Throwable) { copyError = t }
                     }.apply { start() }
 
+                    var boostError: Throwable? = null
+                    val boostThread = if (boostTrackOut < 0) null else
+                        Thread {
+                            try {
+                                VoiceBoost.writeTrack(context, videoUri,
+                                    muxer, muxerLock, boostTrackOut,
+                                    boostRate, boost.level)
+                                logT("voice-boost track done")
+                            } catch (t: Throwable) { boostError = t }
+                        }.apply { start() }
+
                     log("writing aligned AD audio...")
                     var adError: Throwable? = null
                     try {
                         writeAdTrack(context, adUri, muxer, muxerLock,
                             adTrackOut, a, bSec, outRate, onProgress,
-                            pieces)
+                            pieces,
+                            if (boost.boostsAd) boost.level
+                            else VoiceBoost.Level.OFF)
                     } catch (t: Throwable) { adError = t }
                     copyThread.join()
+                    boostThread?.join()
                     logT("AD encode + mux done")
-                    (adError ?: copyError)?.let { throw it }
+                    (adError ?: copyError ?: boostError)?.let { throw it }
 
                     muxer.stop()
                     muxer.release()
@@ -186,7 +220,7 @@ object Patcher {
         extractor.unselectTrack(trackIn)
     }
 
-    private fun encoderFormat(outRate: Int): MediaFormat =
+    internal fun encoderFormat(outRate: Int): MediaFormat =
         MediaFormat.createAudioFormat(
             MediaFormat.MIMETYPE_AUDIO_AAC, outRate, OUT_CHANNELS).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, AD_BITRATE)
@@ -207,7 +241,7 @@ object Patcher {
      * once per rate by a loopback - encode a noise burst, decode it, find
      * it - so it holds for whatever encoder the phone picks.
      */
-    private fun encoderDelay(outRate: Int): Int = synchronized(delayCache) {
+    internal fun encoderDelay(outRate: Int): Int = synchronized(delayCache) {
         delayCache.getOrPut(outRate) {
             try {
                 measureEncoderDelay(outRate).also {
@@ -345,7 +379,8 @@ object Patcher {
         context: Context, adUri: Uri, muxer: MediaMuxer, muxerLock: Any,
         track: Int, a: Double, bSec: Double, outRate: Int,
         onProgress: (Float) -> Unit,
-        pieces: List<Aligner.Piece> = emptyList()
+        pieces: List<Aligner.Piece> = emptyList(),
+        boostLevel: VoiceBoost.Level = VoiceBoost.Level.OFF
     ) {
         // Different edit: AD is placed piece by piece (output frame ranges
         // [startJ, endJ) read AD from adFrom on), silence in gaps, 10 ms
@@ -371,7 +406,8 @@ object Patcher {
             MediaCodec.CONFIGURE_FLAG_ENCODE)
         encoder.start()
         val sink = EncoderSink(encoder, muxer, muxerLock, track, outRate,
-            delay)
+            delay, if (boostLevel == VoiceBoost.Level.OFF) null
+            else VoiceBoost(outRate, boostLevel))
 
         // feeder: decoder runs concurrently, pushing into a bounded queue
         val sentinel = AudioEngine.PcmChunk(ShortArray(0), 0, 0, -1)
@@ -539,19 +575,21 @@ object Patcher {
      * muxer (under the shared lock). CODEC_CONFIG packets are skipped
      * (csd-0 was set manually).
      */
-    private class EncoderSink(
+    internal class EncoderSink(
         private val encoder: MediaCodec,
         private val muxer: MediaMuxer,
         private val muxerLock: Any,
         private val track: Int,
         private val outRate: Int,
-        private val delay: Int        // frames rendered ahead of pts 0
+        private val delay: Int,       // frames rendered ahead of pts 0
+        private val fx: VoiceBoost? = null
     ) {
         private val info = MediaCodec.BufferInfo()
         private var finished = false
 
         fun feed(frames: ShortArray, count: Int, firstFrame: Long) {
             if (finished) return
+            fx?.processShorts(frames, count)
             var offset = 0
             while (offset < count) {
                 val idx = encoder.dequeueInputBuffer(10_000)

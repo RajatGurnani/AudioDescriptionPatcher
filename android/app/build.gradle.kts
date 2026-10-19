@@ -40,6 +40,9 @@ android {
             System.getProperty("parity.dir")?.let {
                 test.systemProperty("parity.dir", it)
             }
+            System.getProperty("vb.out")?.let {
+                test.systemProperty("vb.out", it)
+            }
             test.testLogging { showStandardStreams = true }
         }
     }

@@ -135,6 +135,12 @@ Batch is PC-only (phones get the single-file page).
 3. The screen stays on and the CPU stays awake while it works; progress
    and the sync report appear on screen. A 2-hour movie takes several
    minutes depending on the phone.
+4. Optional **Voice boost** (Off by default): Low / High adds a third
+   audio track, "original audio + voice boost" (clearer dialogue: centre
+   emphasis, presence EQ, background ducked while people speak,
+   compression). The AD and original tracks are unchanged unless you
+   tick **Also boost the AD track**. Pick the track in your player's
+   audio menu (track 3).
 
 ## Output options
 

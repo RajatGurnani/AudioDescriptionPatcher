@@ -20,6 +20,15 @@ program, never link/copy · **Idea**: read for design only, no code ·
 | [ffmpeg-normalize](https://github.com/slhck/ffmpeg-normalize) | MIT (PyPI licence_expression; GitHub API shows NOASSERTION) | Idea | loudness-match option (08) — the 2-pass `loudnorm` recipe is documented ffmpeg usage; no need for the package. |
 | [ffmpeg-python](https://github.com/kkroening/ffmpeg-python) | Apache-2.0 | No | unmaintained since 2024; our command builders are simple lists. |
 
+## Voice boost (Android, [11](11-voice-boost.md))
+
+| Project | Licence | Verdict | What for |
+|---|---|---|---|
+| [RBJ Audio-EQ Cookbook](https://www.w3.org/TR/audio-eq-cookbook/) | W3C note (public formulas) | **Adapt** | biquad coefficients in VoiceBoost.kt |
+| [RNNoise](https://github.com/xiph/rnnoise) | BSD-3-Clause | No (for now) | noise suppressor; trained on noise, not music; needs NDK |
+| [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | MIT / Apache-2.0 | No (for now) | ML speech enhancement via ONNX (+onnxruntime-android, MIT, ~10-15 MB) |
+| [DTLN](https://github.com/breizhn/DTLN) | MIT | No (for now) | TFLite denoiser; same caveat |
+
 ## App / packaging
 
 | Project | Licence | Verdict | What for |

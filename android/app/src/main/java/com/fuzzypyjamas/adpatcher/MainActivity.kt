@@ -119,6 +119,7 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
             startActivity(Intent(this, VaultActivity::class.java))
         }
 
+        setupVoiceBoost()
         restoreInputs()
         offerResumeIfAny()
         UpdateChecker.check(this, manual = false)
@@ -186,6 +187,35 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
                 s == JobRunner.Status.FAILED)
                 stage.announceForAccessibility(stage.text)
         }
+    }
+
+    /** Voice boost card: level + where it applies, saved on every change;
+     *  Patcher reads the saved Options. Default = off (AD untouched). */
+    private fun setupVoiceBoost() {
+        val group = findViewById<com.google.android.material.button
+            .MaterialButtonToggleGroup>(R.id.vbLevel)
+        val track = findViewById<android.widget.CheckBox>(R.id.vbTrack)
+        val ad = findViewById<android.widget.CheckBox>(R.id.vbAd)
+        val ids = mapOf(VoiceBoost.Level.OFF to R.id.vbOff,
+            VoiceBoost.Level.LOW to R.id.vbLow,
+            VoiceBoost.Level.HIGH to R.id.vbHigh)
+        val o = VoiceBoost.Options.load(this)
+        group.check(ids.getValue(o.level))
+        track.isChecked = o.extraTrack
+        ad.isChecked = o.boostAd
+        fun save() {
+            val level = ids.entries.first {
+                it.value == group.checkedButtonId }.key
+            track.isEnabled = level != VoiceBoost.Level.OFF
+            ad.isEnabled = level != VoiceBoost.Level.OFF
+            VoiceBoost.Options(level, track.isChecked, ad.isChecked)
+                .save(this)
+        }
+        save()
+        group.addOnButtonCheckedListener { _, _, checked ->
+            if (checked) save() }
+        track.setOnCheckedChangeListener { _, _ -> save() }
+        ad.setOnCheckedChangeListener { _, _ -> save() }
     }
 
     private fun updateButton() {

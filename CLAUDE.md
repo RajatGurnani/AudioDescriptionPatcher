@@ -132,6 +132,9 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   stretch = linear resample (pitch shifts by drift %, unlike ffmpeg
   atempo). minSdk 26 (multi-track MediaMuxer). Alignment math changes must
   be mirrored in BOTH adpatch.py and Aligner.kt.
+  `VoiceBoost.kt` (Android only): optional extra track = original audio +
+  dialogue-clarity DSP, or applied to the AD via `EncoderSink(fx)`; off by
+  default, prefs `voice_boost`. Measure: `VoiceBoostTest` (docs/plan/11).
 
 See docs/ARCHITECTURE.md for the full alignment rationale and tuned
 thresholds; docs/USAGE.md for the user-facing guide.
