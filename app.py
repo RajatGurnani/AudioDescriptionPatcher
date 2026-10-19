@@ -457,8 +457,12 @@ function showSync(id, res) {
   badge.textContent = {good: '\u2714 In sync', check: '\u26a0 Check it',
     'likely wrong': '\u2716 Likely wrong'}[res.band] +
     '  \u00b7  confidence ' + Math.round(100 * res.confidence) + '%';
-  document.getElementById('align').textContent =
-    'offset ' + res.b.toFixed(3) + ' s, speed \u00d7' + res.a.toFixed(5);
+  const pcs = res.pieces || [];
+  document.getElementById('align').textContent = pcs.length > 1
+    ? 'different edit: ' + pcs.length + ' pieces, offsets ' +
+      pcs.map(p => (p.b >= 0 ? '+' : '') + p.b.toFixed(2) + ' s').join(', ') +
+      ', speed \u00d7' + res.a.toFixed(5)
+    : 'offset ' + res.b.toFixed(3) + ' s, speed \u00d7' + res.a.toFixed(5);
   const warns = document.getElementById('warns');
   warns.replaceChildren(...res.warnings.map(w => {
     const li = document.createElement('li'); li.textContent = w; return li; }));
@@ -490,6 +494,15 @@ function showSync(id, res) {
             y2 = u.valToPos(-50, 'y', true);
       c.fillStyle = 'rgba(76,175,114,.15)';
       c.fillRect(u.bbox.left, y1, u.bbox.width, y2 - y1);
+    }], draw: [u => {   // where each new piece starts (over the grid)
+      const c = u.ctx;
+      c.save(); c.strokeStyle = '#c08a1a'; c.setLineDash([4, 4]);
+      for (const p of pcs.slice(1)) {
+        const x = u.valToPos(p.video_start / 60, 'x', true);
+        c.beginPath(); c.moveTo(x, u.bbox.top);
+        c.lineTo(x, u.bbox.top + u.bbox.height); c.stroke();
+      }
+      c.restore();
     }]},
   }, [xs, used, unused], document.getElementById('drift')));
 

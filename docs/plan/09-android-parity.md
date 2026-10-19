@@ -18,6 +18,12 @@ crosses over per iteration and what deliberately doesn't.
 
 ## Shared test vectors
 
+> **Implemented (iteration 4) differently from below:** a JVM unit test
+> (`android/app/src/test/.../AlignerParityTest.kt`) runs `Aligner` on
+> envelopes exported by `tools/parity_export.py` and compares with
+> Python's results — no device or debug intent needed for the math.
+> Device-only parts (decode, `Patcher`) still need a run on the phone.
+
 To keep the two implementations honest without a cross-language test
 runner:
 - The harness writes, per case, the stage-1 and stage-2 intermediates

@@ -27,7 +27,7 @@ object JobStore {
             .putBoolean("complete", false)
             .apply()
         if (a != null && b != null) saveAlignment(c, a, b)
-        else prefs(c).edit().remove("a").remove("b").apply()
+        else prefs(c).edit().remove("a").remove("b").remove("pieces").apply()
     }
 
     fun saveAlignment(c: Context, a: Double, b: Double) {
@@ -36,6 +36,22 @@ object JobStore {
             .putLong("b", java.lang.Double.doubleToRawLongBits(b))
             .apply()
     }
+
+    /** Pieces of a different-edit alignment, as "adStart,adEnd,b,windows;"
+     *  - saved with the alignment so a resume can skip to muxing. */
+    fun savePieces(c: Context, pieces: List<Aligner.Piece>) {
+        prefs(c).edit().putString("pieces", pieces.joinToString(";") {
+            "${it.adStart},${it.adEnd},${it.b},${it.windows}"
+        }).apply()
+    }
+
+    fun savedPieces(c: Context): List<Aligner.Piece> =
+        prefs(c).getString("pieces", null)?.takeIf { it.isNotEmpty() }
+            ?.split(";")?.map { s ->
+                val f = s.split(",")
+                Aligner.Piece(f[0].toDouble(), f[1].toDouble(),
+                    f[2].toDouble(), f[3].toInt())
+            } ?: emptyList()
 
     fun markComplete(c: Context) {
         prefs(c).edit().putBoolean("complete", true).apply()

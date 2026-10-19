@@ -35,12 +35,15 @@ import adpatch  # noqa: E402
 GEN_SR = 16000
 PAL = 25 / 23.976
 
-# name -> (ffmpeg filter graph on the soundtrack, a_true, b_true,
-#          narration gain (0 = none), expectation)
-# expectation: "align" = must hit the accuracy limits and band "good";
-# "flag" = can't be aligned by a linear map, must NOT be reported "good"
-# (until piecewise alignment, iteration 4); "suspect" = unrelated audio,
-# must be flagged suspect / "likely wrong".
+# name -> (ffmpeg filter, a_true, b_true, narration gain (0 = none),
+#          expectation)
+# The filter is a chain applied to the soundtrack ([0:a]), or - when it
+# starts with "[" - a full graph over [0:a] = soundtrack and [1:a] =
+# unrelated audio that must output [s].
+# b_true is a float, or for different edits a list of (ad_start_sec, b)
+# pieces. expectation: "align" = accuracy limits + band "good";
+# "pieces" = as align, plus the right number of pieces with the right
+# offsets; "suspect" = unrelated audio, must be "likely wrong".
 # Ground truth follows adpatch's model: video_time = a * ad_time + b.
 # Speed changes use asetrate+aresample (sample-exact, pitch shifts - like
 # a real PAL speedup), not atempo, whose WSOLA latency shifts content by
@@ -50,6 +53,9 @@ PAL = 25 / 23.976
 SPEEDUP = f"aresample=23976,asetrate=25000,aresample={GEN_SR}"
 SLOWDOWN = f"aresample=25000,asetrate=23976,aresample={GEN_SR}"
 PAL_TRIM = f"{SPEEDUP},atrim=start=2,asetpts=PTS-STARTPTS"
+CUT = ("[0:a]asplit[p][q];[p]atrim=0:300,asetpts=PTS-STARTPTS[x];"
+       "[q]atrim=start=340,asetpts=PTS-STARTPTS[y];"
+       "[x][y]concat=n=2:v=0:a=1[s]")
 CASES = {
     "offset_pos": ("adelay=4000:all=1", 1.0, -4.0, 0, "align"),
     "offset_neg": ("atrim=start=3.5,asetpts=PTS-STARTPTS", 1.0, 3.5, 0,
@@ -60,10 +66,24 @@ CASES = {
     # remixed release: band-limited soundtrack, loud narration on top
     "hard": (PAL_TRIM + ",highpass=f=250,lowpass=f=3500,volume=0.6",
              PAL, 2 * PAL, 3.0, "align"),
-    # different edit: a 40 s scene missing from the AD at 5:00
-    "cut": ("asplit[p][q];[p]atrim=0:300,asetpts=PTS-STARTPTS[x];"
-            "[q]atrim=start=340,asetpts=PTS-STARTPTS[y];"
-            "[x][y]concat=n=2:v=0:a=1", 1.0, 0.0, 0, "flag"),
+    # different edits (piecewise alignment):
+    # a 40 s scene missing from the AD at 5:00
+    "cut": (CUT, 1.0, [(0, 0.0), (300, 40.0)], 0, "pieces"),
+    # 25 s of foreign audio inserted into the AD at 3:00
+    "insert": ("[0:a]asplit[p][q];[p]atrim=0:180,asetpts=PTS-STARTPTS[x];"
+               "[1:a]atrim=100:125,asetpts=PTS-STARTPTS[f];"
+               "[q]atrim=start=180,asetpts=PTS-STARTPTS[y];"
+               "[x][f][y]concat=n=3:v=0:a=1[s]",
+               1.0, [(0, 0.0), (205, -25.0)], 0, "pieces"),
+    # two 30 s chunks missing (e.g. ad breaks cut differently)
+    "adbreaks": ("[0:a]asplit=3[p][q][r];[p]atrim=0:150,asetpts=PTS-STARTPTS[x];"
+                 "[q]atrim=180:330,asetpts=PTS-STARTPTS[y];"
+                 "[r]atrim=start=360,asetpts=PTS-STARTPTS[z];"
+                 "[x][y][z]concat=n=3:v=0:a=1[s]",
+                 1.0, [(0, 0.0), (150, 30.0), (300, 60.0)], 0, "pieces"),
+    # the cut AND PAL speedup together
+    "cut_pal": (CUT[:-3] + f"[c];[c]{SPEEDUP}[s]", PAL,
+                [(0, 0.0), (300 / PAL, 40.0)], 0, "pieces"),
     "wrong": (None, None, None, 0, "suspect"),   # unrelated soundtrack
 }
 
@@ -172,19 +192,20 @@ def prepare(work, minutes, realistic=False):
             run([adpatch.FFMPEG, "-y", "-v", "error", "-i", other,
                  "-c:a", "libmp3lame", "-b:a", "128k", ad])
             continue
+        graph = filt if filt.startswith("[") else f"[0:a]{filt}[s]"
+        inputs = ["-i", src, "-i", other]
         if narr:
             nar = os.path.join(work, f"narration_{tag}.wav")
             if not os.path.exists(nar):
                 write_wav(nar, narration(1, minutes * 60 * 1.1))
-            run([adpatch.FFMPEG, "-y", "-v", "error", "-i", src, "-i", nar,
-                 "-filter_complex",
-                 f"[0:a]{filt}[s];[1:a]volume={narr}[n];"
-                 "[s][n]amix=inputs=2:duration=first:normalize=0[o]",
-                 "-map", "[o]", "-c:a", "libmp3lame", "-b:a", "128k", ad])
+            inputs += ["-i", nar]
+            graph += (f";[2:a]volume={narr}[n];"
+                      "[s][n]amix=inputs=2:duration=first:normalize=0[o]")
         else:
-            run([adpatch.FFMPEG, "-y", "-v", "error", "-i", src,
-                 "-filter_complex", f"[0:a]{filt}[o]", "-map", "[o]",
-                 "-c:a", "libmp3lame", "-b:a", "128k", ad])
+            graph += ";[s]anull[o]"
+        run([adpatch.FFMPEG, "-y", "-v", "error", *inputs,
+             "-filter_complex", graph, "-map", "[o]",
+             "-c:a", "libmp3lame", "-b:a", "128k", ad])
     return src, video, ads
 
 
@@ -255,18 +276,29 @@ def main():
         if expect == "suspect":
             ok = res["suspect"] and res["band"] == "likely wrong"
             da = db = lag_max = None
-        elif expect == "flag":
-            ok = res["band"] != "good" and bool(res["warnings"])
-            da = db = lag_max = None
         else:
             da = (res["a"] - a_true) * 1e6
-            db = (res["b"] - b_true) * 1000 + delay
+            pieces = res.get("pieces") or [{"ad_start": 0.0, "b": res["b"]}]
+            row["pieces"] = pieces
+            if expect == "pieces":
+                # match each true piece to the found piece nearest in start
+                # time; db = worst offset error over pieces
+                pieces_ok = len(pieces) == len(b_true)
+                db = 0.0
+                for ad0, bt in b_true:
+                    got = min(pieces, key=lambda q: abs(q["ad_start"] - ad0))
+                    pieces_ok &= abs(got["ad_start"] - ad0) < 3.0
+                    err = (got["b"] - bt) * 1000 + delay
+                    db = err if abs(err) > abs(db) else db
+            else:
+                pieces_ok = len(pieces) == 1   # no phantom cuts
+                db = (res["b"] - b_true) * 1000 + delay
             lags = verify_output(out, src_env)
             lag_max = max((abs(x) for x in lags), default=float("inf"))
             row.update(da_ppm=da, db_ms=db, lags_ms=lags)
             ok = (abs(da) < MAX_DA_PPM and abs(db) < MAX_DB_MS
                   and lag_max <= MAX_LAG_MS and len(lags) >= 5
-                  and res["band"] == "good")
+                  and res["band"] == "good" and pieces_ok)
         row["ok"] = ok = bool(ok)
         row["suspect"] = bool(res["suspect"])
         failed |= not ok
@@ -277,7 +309,9 @@ def main():
               f"{fmt(lag_max, '8.1f')} {res['confidence']:4.2f}{res['band'][0]:>5}  "
               f"{t['analyze']:5.1f} ({t['video_env']:4.1f}/{t['ad_env']:<4.1f}) "
               f"{t['align']:6.2f} {t['mux']:6.2f}  "
-              f"{'PASS' if ok else 'FAIL'}")
+              f"{'PASS' if ok else 'FAIL'}"
+              + (f"  ({len(row['pieces'])} pieces)"
+                 if len(row.get("pieces") or []) > 1 else ""))
         os.remove(out)
 
     path = os.path.join(args.workdir, "harness_results.json")

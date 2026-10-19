@@ -1,5 +1,16 @@
 # 05 — Piecewise alignment for different cuts (Iteration 4, v0.7.0)
 
+> **Outcome (2026-10-19):** done; design as below with two changes found
+> while building it: (1) instead of synthetic pass-through candidates,
+> candidates are clustered into offset families and every window is
+> scored at every family; (2) hand-over points prefer the latest tie and
+> the renderer cuts pieces at the next piece's start, which is what
+> makes insertions come out right. Gap fill with original audio on PC;
+> Android leaves gaps silent. Harness cases cut / insert / adbreaks /
+> cut_pal pass; linear cases stay 1 piece. Android parity verified by a
+> JVM unit test on identical envelopes (≤ 0.3 ppm, ≤ 0.1 ms, same
+> pieces); on-device rendering not yet verified.
+
 ## Problem
 
 The model `video_time = a·ad_time + b` assumes one continuous edit. Real

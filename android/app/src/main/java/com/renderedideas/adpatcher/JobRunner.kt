@@ -118,10 +118,12 @@ object JobRunner {
         thread(name = "adpatch-job") {
             try {
                 var verdict: String? = null   // null when resumed (no fit)
+                var pieces: List<Aligner.Piece> = emptyList()
                 val a: Double
                 val b: Double
                 if (resumeA != null && resumeB != null) {
                     a = resumeA; b = resumeB
+                    pieces = JobStore.savedPieces(app)
                     barProgress = 700
                 } else {
                     setStage("analyzing both audio streams…")
@@ -160,6 +162,7 @@ object JobRunner {
                             ::log, phaseProgress(550, 700))
                     }
                     a = result.a; b = result.bSec
+                    pieces = result.pieces
                     log("offset %+.3fs, speed %.6f".format(b, a))
                     for (cp in result.report) {
                         log("  %5.1fm -> %5.1fm  score %.2f  %+dms%s"
@@ -179,12 +182,13 @@ object JobRunner {
                         (result.confidence * 100).toInt())
                     // checkpoint: from here a resume can skip to muxing
                     JobStore.saveAlignment(app, a, b)
+                    JobStore.savePieces(app, pieces)
                 }
 
                 setStage("writing output…")
                 timed("writing output") {
                     Patcher.mux(app, videoUri, adUri, outUri, a, b,
-                        ::log, phaseProgress(700, 1000))
+                        ::log, phaseProgress(700, 1000), pieces)
                 }
 
                 barProgress = 1000

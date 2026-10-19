@@ -36,6 +36,14 @@ truth, checks the output file itself, exit 1 on failure):
 .venv\Scripts\python tools\harness.py [--minutes 10] [--cases pal,ntsc] [--container mp4]
 ```
 
+Kotlin parity (Aligner.kt vs fit_alignment on identical envelopes, JVM
+unit test, skipped without the export):
+
+```
+.venv\Scripts\python tools\parity_export.py
+cd android && gradle testReleaseUnitTest -Dparity.dir=%TEMP%dpatch-parity
+```
+
 Never build truth with `atempo` (adds 5-20 ms WSOLA latency) or
 non-integer `asetrate` (rounds) — the harness uses 23976<->25000 Hz
 relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end web-app test = POST two files to /api/patch, poll
@@ -59,6 +67,11 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   CLI `--report` writes .sync.json + .sync.svg; web UI draws drift +
   waveform-match charts with vendored uPlot (static/vendor/uplot, MIT)
   from `result["plot"]` via /api/jobs/<id>/envelopes.
+  3. different edits: if linear coverage < 0.9, `_fit_piecewise()`
+     (window lattice → offset families → Viterbi → vetted pieces →
+     hand-over points → joint slope + per-piece intercepts). Returns
+     `pieces`; `plan_pieces()` turns them into render segments + gaps;
+     `_piecewise_graph()` splices in ffmpeg (gaps = original audio).
 - `patch(..., log, progress)` — `progress(phase, frac)` with phases
   analyze/align/mux. Video + AD envelopes run in parallel threads via
   `cached_envelope()` (content-keyed .npy cache in

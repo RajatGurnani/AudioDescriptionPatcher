@@ -64,5 +64,8 @@ codec allows.
   same-length mixes and work fine.
 - The Android app time-stretch changes pitch by the drift amount (max a
   few %); the PC version uses ffmpeg `atempo`, which preserves pitch.
-- If the sync report shows mostly weak matches, don't trust the output —
-  the AD file is probably for a different cut of the movie.
+- **Different edits are handled** (scenes cut or added, differently cut
+  ad breaks): the AD is spliced piece by piece. On PC, video stretches
+  the AD doesn't cover get the original audio; on Android they're
+  silent. If the verdict still says "likely wrong", the AD file is
+  probably for another movie or an extended-description version.

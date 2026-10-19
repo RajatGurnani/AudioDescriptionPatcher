@@ -87,6 +87,13 @@ def probe_has_video(path):
                for line in proc.stderr.splitlines())
 
 
+def probe_has_audio(path):
+    """True if ffmpeg sees an audio stream."""
+    proc = subprocess.run([FFMPEG, "-hide_banner", "-i", path],
+                          capture_output=True, text=True, errors="replace")
+    return any("Audio:" in line for line in proc.stderr.splitlines())
+
+
 def probe_duration(path):
     """Container duration in seconds from `ffmpeg -i` (no ffprobe in the
     pip-bundled ffmpeg), or None if unknown."""
@@ -320,18 +327,25 @@ def _speed_scan(ad_env, vid_env, factors, scores=None):
     return best[1], best[2], best[0]
 
 
-def _peak_ratio(ad_env, vid_env, factor, exclude):
+def _peak_ratio(ad_env, vid_env, factor, exclude, lags=()):
     """Uniqueness of the global correlation peak at `factor`: best peak /
-    best peak more than `exclude` frames away. ~1 means another offset
-    fits about as well (repetitive audio, e.g. a looping score)."""
+    best peak more than `exclude` frames away from it (and from every
+    lag in `lags` - the offsets of the pieces of a different edit, which
+    are all genuine). ~1 means another offset fits about as well
+    (repetitive audio, e.g. a looping score)."""
     stretched = _stretch(ad_env, factor)
     n = 1 << int(np.ceil(np.log2(len(stretched) + len(vid_env))))
     cc = np.fft.irfft(np.fft.rfft(vid_env, n) *
                       np.conj(np.fft.rfft(stretched, n)), n)
     k = int(np.argmax(cc))
     idx = np.arange(n)
-    dist = np.minimum(np.abs(idx - k), n - np.abs(idx - k))   # circular
-    second = cc[dist > exclude].max()
+    keep = np.ones(n, dtype=bool)
+    for c in (k, *[int(round(x)) % n for x in lags]):
+        dist = np.minimum(np.abs(idx - c), n - np.abs(idx - c))  # circular
+        keep &= dist > exclude
+    if not keep.any():
+        return 10.0
+    second = cc[keep].max()
     return float(min(10.0, cc[k] / second)) if second > 0 else 10.0
 
 
@@ -476,7 +490,312 @@ def fit_alignment(ad_env, vid_env, log=print):
         if resid_used else 1000.0,
         "dur_ratio": float(len(vid_env) / max(1.0, a * len(ad_env))),
     }
-    return float(a), float(b / FPS), report, signals
+
+    # Different edit? A linear map that leaves a good part of the runtime
+    # unmatched (while the files clearly share a soundtrack) is the
+    # signature of scenes added/removed. Try piecewise offsets; it only
+    # wins if it explains clearly more of the movie (no phantom cuts).
+    pieces = None
+    if signals["coverage"] < 0.9 and signals["peak"] >= 0.04:
+        pw = _fit_piecewise(stretched, vid_env, ad20, vid20, a0, pool,
+                            signals, log)
+        if pw is not None:
+            a, b, report, signals, pieces = pw
+    return float(a), float(b / FPS), report, signals, pieces
+
+
+# --------------------------------------------------------------------------
+# Piecewise alignment (different edits)
+# --------------------------------------------------------------------------
+# Model: video_time = a * ad_time + b_k for AD time in piece k - one speed
+# (it's a property of the source frame rate) and an offset per piece.
+# Approach adapted from ADSync (MIT, see docs/plan/THIRD_PARTY.md): a
+# lattice of offset candidates per analysis window, decoded with Viterbi
+# under a constant jump penalty, then vetted into pieces. Re-implemented
+# for onset envelopes with a twist: candidates are first clustered into
+# "offset families" seen in >= PW_MIN_RUN windows, and every window is
+# then scored at every family offset - so each lattice cell carries real
+# evidence instead of synthetic pass-through candidates.
+
+PW_WIN = int(20 * FPS)      # analysis window
+PW_HOP = int(10 * FPS)      # window step
+PW_MIN_RUN = 3              # windows a piece needs (~30-40 s of AD)
+PW_MAX_PIECES = 64          # beyond this the files are probably unrelated
+PW_FAMILY_TOL = 0.3 * FPS   # offsets closer than this are one family
+
+
+def _window_candidates(st, vid_env, starts, pool, k=3):
+    """Global search: for each AD window (start frame in the stretched AD
+    envelope) the top-k video offsets (frames) with their normalized
+    correlation, computed at 20 Hz against the whole video envelope."""
+    st20, v20 = _pool(st, pool), _pool(vid_env, pool)
+    L = PW_WIN // pool
+    valid = len(v20) - L + 1
+    if valid <= 0:
+        return [[] for _ in starts]
+    n = 1 << int(np.ceil(np.log2(len(v20) + L)))
+    V = np.fft.rfft(v20, n)
+    csum = np.concatenate(([0.0], np.cumsum(v20.astype(np.float64) ** 2)))
+    vnorm = np.sqrt(np.maximum(csum[L:L + valid] - csum[:valid], 0.0))
+    nms = int(1 * FPS / pool)
+    out = []
+    for u in starts:
+        seg = st20[u // pool:u // pool + L]
+        sn = np.linalg.norm(seg)
+        if len(seg) < L or sn == 0:
+            out.append([])
+            continue
+        cc = np.fft.irfft(V * np.conj(np.fft.rfft(seg, n)), n)[:valid]
+        sc = cc / (sn * vnorm + 1e-9)
+        cands = []
+        for _ in range(k):
+            j = int(np.argmax(sc))
+            if sc[j] <= 0:
+                break
+            cands.append((j * pool - u, float(sc[j])))
+            sc[max(0, j - nms):j + nms + 1] = -1.0
+        out.append(cands)
+    return out
+
+
+def _offset_families(cands, base_offset):
+    """Cluster candidate offsets; keep those seen in >= PW_MIN_RUN windows.
+    The linear fit's offset is always a family (so the linear answer is
+    one of the paths Viterbi can take)."""
+    best = [c[0][1] for c in cands if c]
+    if not best:
+        return [base_offset]
+    thr = max(0.12, 0.5 * float(np.median(best)))
+    pts = sorted((off, w) for w, cs in enumerate(cands)
+                 for off, sc in cs if sc >= thr)
+    groups, cur = [], []
+    for off, w in pts:
+        if cur and off - cur[-1][0] > PW_FAMILY_TOL:
+            groups.append(cur)
+            cur = []
+        cur.append((off, w))
+    if cur:
+        groups.append(cur)
+    fams = [float(np.median([o for o, _ in g])) for g in groups
+            if len({w for _, w in g}) >= PW_MIN_RUN]
+    if all(abs(f - base_offset) > PW_FAMILY_TOL for f in fams):
+        fams.append(float(base_offset))
+    return sorted(fams)
+
+
+def _viterbi(scores, jump):
+    """Max-sum path through windows x families; switching family costs
+    `jump`. Returns one family index per window."""
+    n_win, n_fam = scores.shape
+    dp = scores[0].copy()
+    back = np.zeros((n_win, n_fam), dtype=int)
+    for i in range(1, n_win):
+        g = int(np.argmax(dp))
+        switch = dp[g] - jump
+        take = switch > dp
+        back[i] = np.where(take, g, np.arange(n_fam))
+        dp = np.where(take, switch, dp) + scores[i]
+    path = [int(np.argmax(dp))]
+    for i in range(n_win - 1, 0, -1):
+        path.append(int(back[i][path[-1]]))
+    return path[::-1]
+
+
+def _runs(path):
+    """[(family, first_window, last_window), ...] of consecutive runs."""
+    runs, start = [], 0
+    for i in range(1, len(path) + 1):
+        if i == len(path) or path[i] != path[start]:
+            runs.append((path[start], start, i - 1))
+            start = i
+    return runs
+
+
+def _vet_runs(path, scores):
+    """Merge runs shorter than PW_MIN_RUN windows into the neighbour whose
+    offset explains them better (ADSync's segment vetting idea)."""
+    path = list(path)
+    while True:
+        runs = _runs(path)
+        short = [r for r in runs if r[2] - r[1] + 1 < PW_MIN_RUN]
+        if len(runs) == 1 or not short:
+            return path
+        fam, i0, i1 = min(short, key=lambda r: r[2] - r[1])
+        idx = runs.index((fam, i0, i1))
+        options = [runs[j][0] for j in (idx - 1, idx + 1)
+                   if 0 <= j < len(runs)]
+        best = max(options, key=lambda f: scores[i0:i1 + 1, f].sum())
+        path[i0:i1 + 1] = [best] * (i1 - i0 + 1)
+
+
+def _sim(st, vid_env, p, length, off):
+    """Cosine similarity of AD frames [p, p+length) against the video at a
+    fixed offset (0 if out of range)."""
+    v0 = p + int(round(off))
+    if p < 0 or p + length > len(st) or v0 < 0 or \
+            v0 + length > len(vid_env):
+        return 0.0
+    a, v = st[p:p + length], vid_env[v0:v0 + length]
+    return float(a @ v / (np.linalg.norm(a) * np.linalg.norm(v) + 1e-9))
+
+
+def _split_point(st, vid_env, lo, hi, off_a, off_b, probe, step,
+                 thr=None):
+    """Where (stretched AD frame) piece A hands over to piece B within
+    [lo, hi): maximize A-evidence before + B-evidence after. Ties go to
+    the LATEST point: AD content that matches neither offset (an
+    insertion) then stays with A and gets dropped later by the overlap
+    rule, instead of being placed into the video by B. Returns
+    (frame, strength threshold used) - pass the threshold back in for a
+    finer pass, whose short probes would otherwise mistake chance
+    correlations for evidence."""
+    ps = np.arange(lo, max(lo + 1, hi - probe), step)
+    sa = np.array([_sim(st, vid_env, p, probe, off_a) for p in ps])
+    sb = np.array([_sim(st, vid_env, p, probe, off_b) for p in ps])
+    # probes matching neither offset well (inserted material) carry no
+    # evidence: zero them so they form an exact tie, resolved latest
+    if thr is None:
+        thr = 0.4 * float(np.percentile(np.maximum(sa, sb), 90))
+    d = np.where(np.maximum(sa, sb) >= thr, sa - sb, 0.0)
+    # score(t) = sum(d[:t]) - sum(d[t:])  ->  2*cumsum - total
+    c = np.concatenate(([0.0], np.cumsum(d)))
+    gain = 2 * c - c[-1]
+    t = int(np.flatnonzero(gain >= gain.max() - 1e-9)[-1])
+    if t >= len(ps):
+        return int(ps[-1] + probe), thr
+    return (int(ps[t] + probe // 2) if t > 0 else int(ps[0])), thr
+
+
+def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log):
+    """Piecewise fit on the stretched AD envelope `st`. Returns
+    (a, b_frames_of_longest_piece, report, signals, pieces) or None when
+    one offset explains the movie as well."""
+    usable = len(st) - PW_WIN
+    if usable < PW_HOP * PW_MIN_RUN:
+        return None
+    starts = list(range(0, usable + 1, PW_HOP))
+    cands = _window_candidates(st, vid_env, starts, pool)
+    base = cands and max((c[0] for c in cands if c), key=lambda x: x[1],
+                         default=(0, 0))[0]
+    fams = _offset_families(cands, base)
+    if len(fams) < 2:
+        return None
+
+    # score every window at every family offset (small local search
+    # absorbs the residual wobble)
+    n_w, n_f = len(starts), len(fams)
+    scores = np.zeros((n_w, n_f))
+    pos = np.full((n_w, n_f), np.nan)
+    search = int(0.5 * FPS)
+    for i, u in enumerate(starts):
+        for f, off in enumerate(fams):
+            m = segment_match(st, vid_env, u, PW_WIN, u + off, search)
+            if m is not None:
+                pos[i, f], scores[i, f] = m[0], max(0.0, m[1])
+
+    best_single = (scores > MIN_SEGMENT_SCORE).sum(axis=0).max() / n_w
+    jump = max(0.2, 1.5 * float(np.median(scores.max(axis=1))))
+    path = _vet_runs(_viterbi(scores, jump), scores)
+    runs = _runs(path)
+    covered = sum(scores[i, f] > MIN_SEGMENT_SCORE
+                  for i, f in enumerate(path)) / n_w
+    if len(runs) < 2 or len(runs) > PW_MAX_PIECES or \
+            covered < max(best_single, lin_signals["coverage"]) + 0.1:
+        return None
+
+    # hand-over points between consecutive pieces: coarse (4 s probes),
+    # then fine (1 s probes, 50 ms steps) around the coarse answer
+    bounds = [0]
+    for (fa, _, ia1), (fb, ib0, _) in zip(runs, runs[1:]):
+        # one extra window either side: Viterbi may hand a window of
+        # unmatched (inserted) material to either piece
+        lo = max(bounds[-1], starts[ia1] - PW_HOP)
+        hi = min(len(st), starts[ib0] + PW_WIN + PW_HOP)
+        x, thr = _split_point(st, vid_env, lo, hi, fams[fa], fams[fb],
+                              int(4 * FPS), int(0.25 * FPS))
+        x, _ = _split_point(st, vid_env, max(0, x - int(2.5 * FPS)),
+                            x + int(2.5 * FPS), fams[fa], fams[fb],
+                            int(1 * FPS), int(0.05 * FPS), thr)
+        bounds.append(max(bounds[-1] + 1, x))
+    bounds.append(len(st))
+
+    # joint weighted fit: one slope a2, one intercept per piece, using
+    # windows that lie fully inside their piece
+    pts = []
+    for k, (f, i0, i1) in enumerate(runs):
+        for i in range(i0, i1 + 1):
+            u = starts[i]
+            if scores[i, f] > MIN_SEGMENT_SCORE and \
+                    bounds[k] <= u and u + PW_WIN <= bounds[k + 1]:
+                pts.append((u, pos[i, f], scores[i, f], k))
+    n_p = len(runs)
+    a2, c = 1.0, np.array(fams)[[r[0] for r in runs]]
+    used = list(pts)
+    for _ in range(2):
+        if len(used) < 2:
+            break
+        X = np.zeros((len(used), 1 + n_p))
+        X[:, 0] = [q[0] for q in used]
+        for j, q in enumerate(used):
+            X[j, 1 + q[3]] = 1.0
+        y = np.array([q[1] for q in used])
+        w = np.sqrt([q[2] for q in used])
+        present = X[:, 1:].any(axis=0)
+        cols = np.concatenate(([True], present))
+        sol, *_ = np.linalg.lstsq(X[:, cols] * w[:, None], y * w,
+                                  rcond=None)
+        a2 = sol[0]
+        c = c.copy()
+        c[present] = sol[1:]
+        resid = np.abs(y - (X[:, cols] @ sol))
+        keep = resid < max(3 * np.median(resid) + 1e-9, 0.05 * FPS)
+        if keep.all() or keep.sum() < 2:
+            break
+        used = [q for q, kk in zip(used, keep) if kk]
+
+    a = a0 * a2
+    pieces = []
+    for k in range(n_p):
+        ad0, ad1 = bounds[k] / a0 / FPS, bounds[k + 1] / a0 / FPS
+        b_k = c[k] / FPS
+        n_in = sum(1 for q in pts if q[3] == k)
+        pieces.append({"ad_start": float(ad0), "ad_end": float(ad1),
+                       "b": float(b_k),
+                       "video_start": float(a * ad0 + b_k),
+                       "video_end": float(a * ad1 + b_k),
+                       "windows": n_in})
+    longest = max(range(n_p), key=lambda k: bounds[k + 1] - bounds[k])
+
+    used_set = {(q[0], q[3]) for q in used}
+    report = []
+    for k, (f, i0, i1) in enumerate(runs):
+        for i in range(i0, i1 + 1):
+            u = starts[i]
+            if np.isnan(pos[i, f]):
+                continue
+            resid_ms = (pos[i, f] - (a2 * u + c[k])) / FPS * 1000
+            center_ad = (u + PW_WIN // 2) / a0
+            report.append((center_ad / FPS,
+                           (a * center_ad + c[k]) / FPS, scores[i, f],
+                           resid_ms, (u, k) in used_set))
+
+    resid_used = [abs(r[3]) for r in report if r[4]]
+    signals = dict(lin_signals)
+    signals.update({
+        "peak_ratio": _peak_ratio(ad20, vid20, a0, exclude=2 * FPS / pool,
+                                  lags=[f / pool for f in fams]),
+        "coverage": float(covered),
+        "inlier_frac": len(used) / max(1, len(pts)),
+        "resid_p95_ms": float(np.percentile(resid_used, 95))
+        if resid_used else 1000.0,
+        # the length difference is what the pieces explain
+        "dur_ratio": 1.0,
+        "pieces": n_p,
+    })
+    log(f"  different edit: {n_p} pieces " + ", ".join(
+        f"{q['ad_start'] / 60:.1f}-{q['ad_end'] / 60:.1f}m "
+        f"({q['b']:+.2f}s)" for q in pieces))
+    return a, float(c[longest]), report, signals, pieces
 
 
 def _clamp01(x):
@@ -545,8 +864,90 @@ def ad_encoder():
     return _ad_encoder
 
 
+def plan_pieces(a, pieces, priming_s=0.0):
+    """Turn fitted pieces into render instructions on the video timeline.
+
+    Each piece's AD range [ad_start, ad_end) lands at video time
+    a*t + b. Where a piece runs into the next one's start (the AD has
+    material the video lacks - an insertion), it is cut there: the later
+    piece wins. Where pieces leave a hole (the video has material the AD
+    lacks), a gap is returned. `priming_s` (encoder delay that the
+    container won't trim) is subtracted from every placement.
+
+    Returns (segments, gaps): segments = [(ad_from, ad_to, delay_s)],
+    gaps = [(video_from, video_to, delay_s)] - delay_s already
+    priming-corrected and >= 0.
+    """
+    placed = []
+    for i, q in enumerate(pieces):
+        t0 = a * q["ad_start"] + q["b"]
+        t1 = a * q["ad_end"] + q["b"]
+        if i + 1 < len(pieces):
+            nxt = pieces[i + 1]
+            t1 = min(t1, a * nxt["ad_start"] + nxt["b"])
+        if placed:
+            t0 = max(t0, placed[-1][3])
+        if t1 - t0 < 0.05:
+            continue   # fully covered by its neighbours
+        placed.append(((t0 - q["b"]) / a, (t1 - q["b"]) / a, t0, t1))
+
+    segments, gaps = [], []
+    for i, (s0, s1, t0, t1) in enumerate(placed):
+        d0 = t0 - priming_s
+        if d0 < 0:   # starts before the video: drop the overhang
+            s0 += -d0 / a
+            d0 = 0.0
+        if s1 - s0 > 0.01:
+            segments.append((s0, s1, d0))
+        if i + 1 < len(placed) and placed[i + 1][2] - t1 > 0.05:
+            g0, g1 = t1, placed[i + 1][2]
+            gaps.append((g0, g1, max(0.0, g0 - priming_s)))
+    return segments, gaps
+
+
+def _piecewise_graph(a, pieces, priming_s, fill_gaps):
+    """filter_complex for a multi-piece AD: each piece trimmed, tempo-
+    corrected, faded (10 ms - no clicks at splices) and delayed to its
+    video position, plus optional original-audio fill for gaps; all
+    summed (they don't overlap) into [ad]."""
+    segments, gaps = plan_pieces(a, pieces, priming_s)
+    if not fill_gaps:
+        gaps = []
+    tempo = (f",atempo={1.0 / a:.8f}"
+             if abs(a - 1.0) > NEGLIGIBLE_DRIFT else "")
+    # mixing needs one layout; the original may be 5.1 -> stereo for all
+    fmt = ",aformat=channel_layouts=stereo" if gaps else ""
+
+    def tail(dur, delay):
+        fade = (f",afade=t=in:d=0.01,afade=t=out:st={max(0, dur - 0.01):.4f}"
+                ":d=0.01" if dur > 0.05 else "")
+        return f"{fade},adelay=delays={round(delay * AD_RATE)}S:all=1"
+
+    parts, labels = [], []
+    parts.append(f"[1:a:0]asplit={len(segments)}" +
+                 "".join(f"[s{i}]" for i in range(len(segments))))
+    for i, (s0, s1, d0) in enumerate(segments):
+        parts.append(f"[s{i}]atrim=start={s0:.4f}:end={s1:.4f},"
+                     f"asetpts=PTS-STARTPTS,aresample={AD_RATE}{tempo}{fmt}"
+                     f"{tail((s1 - s0) * a, d0)}[p{i}]")
+        labels.append(f"[p{i}]")
+    if gaps:
+        parts.append(f"[0:a:0]asplit={len(gaps)}" +
+                     "".join(f"[o{i}]" for i in range(len(gaps))))
+        for i, (g0, g1, d0) in enumerate(gaps):
+            parts.append(f"[o{i}]atrim=start={g0:.4f}:end={g1:.4f},"
+                         f"asetpts=PTS-STARTPTS,aresample={AD_RATE}{fmt}"
+                         f"{tail(g1 - g0, d0)}[g{i}]")
+            labels.append(f"[g{i}]")
+    # fresh sample-count timestamps: amix can emit a timestamp-less frame
+    # at the end, which the mp4 muxer rejects with ffmpeg's aac
+    parts.append("".join(labels) + f"amix=inputs={len(labels)}:"
+                 "normalize=0:duration=longest,asetpts=N/SR/TB[ad]")
+    return ";".join(parts)
+
+
 def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
-                  encoder=None):
+                  encoder=None, pieces=None, fill_gaps=True):
     """Assemble the ffmpeg command that applies the alignment and muxes.
 
     The AD audio gets: atempo (speed correction, skipped when negligible),
@@ -554,8 +955,12 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
     stream is copied bit-for-bit. The corrected AD track becomes the
     default audio; the original audio is copied as track 2 unless
     `replace`. `encoder` is an AD_ENCODERS entry (default: ad_encoder()).
+    With 2+ `pieces` (a different edit) the AD is spliced per piece and,
+    if `fill_gaps`, holes are filled with the original audio.
     """
     enc_name, priming = encoder or ad_encoder()
+    priming_s = (priming / AD_RATE
+                 if os.path.splitext(output)[1].lower() == ".mkv" else 0.0)
     # Fixed output rate: keeps the encoder priming delay known (see below).
     filters = [f"aresample={AD_RATE}"]
     if abs(a - 1.0) > NEGLIGIBLE_DRIFT:
@@ -574,10 +979,13 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
         filters.append(f"atrim=start={-b_sec:.4f}")
         filters.append("asetpts=PTS-STARTPTS")
     chain = ",".join(filters) if filters else "anull"
+    graph = f"[1:a:0]{chain}[ad]"
+    if pieces and len(pieces) > 1:
+        graph = _piecewise_graph(a, pieces, priming_s, fill_gaps)
 
     cmd = [FFMPEG, "-y", "-v", "error",
            "-i", video, "-i", ad_audio,
-           "-filter_complex", f"[1:a:0]{chain}[ad]",
+           "-filter_complex", graph,
            "-map", "0:v", "-c:v", "copy",
            "-map", "[ad]", "-c:a:0", enc_name, "-b:a:0", "192k",
            "-metadata:s:a:0", "title=Audio Description",
@@ -600,12 +1008,18 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
 PLOT_HZ = 10   # envelope overview resolution sent to the UI / drawn in SVG
 
 
-def plot_data(vid_env, ad_env, a, b_sec, hz=PLOT_HZ):
+def plot_data(vid_env, ad_env, a, b_sec, hz=PLOT_HZ, pieces=None):
     """Video envelope and the *aligned* AD envelope on the video timeline,
     max-pooled to `hz` and clipped at 0 (onsets only) - for eyeballing
     that peaks line up. Returns two float32 arrays of equal length."""
     t = np.arange(len(vid_env)) / FPS
-    ad_pos = (t - b_sec) / a * FPS          # AD frame for each video frame
+    if pieces and len(pieces) > 1:
+        ad_pos = np.full(len(t), -1.0)   # -1 = no AD here (gap)
+        for s0, s1, d0 in plan_pieces(a, pieces)[0]:
+            m = (t >= d0) & (t < d0 + (s1 - s0) * a)
+            ad_pos[m] = (s0 + (t[m] - d0) / a) * FPS
+    else:
+        ad_pos = (t - b_sec) / a * FPS      # AD frame for each video frame
     ad_on_video = np.interp(ad_pos, np.arange(len(ad_env)), ad_env,
                             left=0.0, right=0.0)
     f = int(FPS // hz)
@@ -620,7 +1034,7 @@ def plot_data(vid_env, ad_env, a, b_sec, hz=PLOT_HZ):
 def report_json(result):
     """The JSON-serialisable part of a patch() result."""
     keys = ("output", "a", "b", "confidence", "band", "warnings",
-            "signals", "segments", "weak", "suspect", "timings")
+            "signals", "segments", "pieces", "weak", "suspect", "timings")
     return {k: result[k] for k in keys}
 
 
@@ -636,7 +1050,10 @@ def write_report_svg(path, result, plot):
            '<rect width="100%" height="100%" fill="#fff"/>',
            f'<text x="{PAD}" y="22" font-size="15">Sync report - '
            f'confidence {result["confidence"]:.2f} ({result["band"]}), '
-           f'speed {result["a"]:.6f}, offset {result["b"]:+.3f} s</text>']
+           f'speed {result["a"]:.6f}, ' + (
+               f'{len(result["pieces"])} pieces (different edit)'
+               if len(result["pieces"]) > 1 else
+               f'offset {result["b"]:+.3f} s') + '</text>']
     # drift panel: y = residual ms, clamped to +-500
     top, h = 40, 160
     y = lambda ms: top + h / 2 - h / 2 * max(-500, min(500, ms)) / 500  # noqa: E731,E501
@@ -657,6 +1074,10 @@ def write_report_svg(path, result, plot):
                    f'fill="{color}"><title>{seg["video"] / 60:.1f} min: '
                    f'{seg["residual_ms"]:+.0f} ms, score '
                    f'{seg["score"]:.2f}</title></circle>')
+    for q in result["pieces"][1:]:   # where each new piece starts
+        px = x(q["video_start"] / 60)
+        out.append(f'<line x1="{px:.1f}" x2="{px:.1f}" y1="{top}" '
+                   f'y2="{top + h}" stroke="#c08a1a" stroke-dasharray="4"/>')
     # overlay panel: video up, aligned AD mirrored down
     mid, half = 330, 90
     cols = min(len(vid), W - 2 * PAD)
@@ -765,7 +1186,8 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     log("aligning...")
     if progress:
         progress("align", 0.0)
-    a, b_sec, rows, signals = fit_alignment(ad_env, vid_env, log=log)
+    a, b_sec, rows, signals, pieces = fit_alignment(ad_env, vid_env,
+                                                    log=log)
     if progress:
         progress("align", 1.0)
     lap("align")
@@ -800,9 +1222,21 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     log("muxing (video stream copied, AD audio encoded)...")
     duration = len(vid_env) / FPS
 
+    # gaps between pieces get the original audio - only if there is one
+    fill = bool(pieces) and probe_has_audio(video)
+    if pieces:
+        segs, gaps = plan_pieces(a, pieces)
+        gap_s = sum(g1 - g0 for g0, g1, _ in gaps)
+        drop_s = len(ad_env) / FPS - sum(s1 - s0 for s0, s1, _ in segs)
+        log(f"  {gap_s:.0f}s of video has no AD "
+            f"({'original audio used' if fill else 'silent'}); "
+            f"{max(0.0, drop_s):.0f}s of AD has no matching video "
+            "(dropped)")
+
     def mux(with_subs, encoder):
         return run_ffmpeg(build_mux_cmd(video, ad_audio, output, a, b_sec,
-                                        replace, with_subs, encoder),
+                                        replace, with_subs, encoder,
+                                        pieces, fill),
                           duration, report("mux"))
 
     encoder = ad_encoder()
@@ -836,9 +1270,10 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         "signals": signals,
         "segments": [{"ad": r[0], "video": r[1], "score": r[2],
                       "residual_ms": r[3], "used": r[4]} for r in rows],
+        "pieces": pieces or [],
         "report": rows, "weak": weak, "suspect": suspect,
         "timings": timings,
-        "plot": plot_data(vid_env, ad_env, a, b_sec),
+        "plot": plot_data(vid_env, ad_env, a, b_sec, pieces=pieces),
     }
     if save_report:
         stem = os.path.splitext(output)[0]

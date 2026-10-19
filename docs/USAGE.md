@@ -89,8 +89,16 @@ warnings when something's off:
 | **check** (0.45–0.75) | probably mostly right — spot-check the warned part |
 | **likely wrong** (< 0.45) | don't trust the output |
 
+**Different edits** (the AD comes from a cut with scenes added or
+removed, or ad breaks cut differently) are fixed automatically: the AD
+is split into pieces, each placed at its own offset — the report says
+e.g. `different edit: 3 pieces`, and dashed lines on the drift chart
+mark where each piece starts. Parts of the video the AD doesn't have
+play the original audio (PC) or silence (Android); AD material the video
+doesn't have is dropped.
+
 Warnings name the cause: files that don't share a soundtrack (wrong AD
-file), a different edit of the movie (scenes added/removed), extended
+file), a different edit that couldn't be fully matched, extended
 audio description (pauses the video — can't be fixed by shifting),
 repetitive audio (offset could be off by a loop), or sync wobble.
 The output is always written; the verdict tells you whether to keep it.

@@ -55,7 +55,8 @@ object Patcher {
     fun mux(
         context: Context, videoUri: Uri, adUri: Uri, outUri: Uri,
         a: Double, bSec: Double,
-        log: (String) -> Unit, onProgress: (Float) -> Unit
+        log: (String) -> Unit, onProgress: (Float) -> Unit,
+        pieces: List<Aligner.Piece> = emptyList()
     ) {
         val t0 = android.os.SystemClock.elapsedRealtime()
         fun logT(msg: String) = android.util.Log.d(TAG,
@@ -144,7 +145,8 @@ object Patcher {
                     var adError: Throwable? = null
                     try {
                         writeAdTrack(context, adUri, muxer, muxerLock,
-                            adTrackOut, a, bSec, outRate, onProgress)
+                            adTrackOut, a, bSec, outRate, onProgress,
+                            pieces)
                     } catch (t: Throwable) { adError = t }
                     copyThread.join()
                     logT("AD encode + mux done")
@@ -192,8 +194,24 @@ object Patcher {
     private fun writeAdTrack(
         context: Context, adUri: Uri, muxer: MediaMuxer, muxerLock: Any,
         track: Int, a: Double, bSec: Double, outRate: Int,
-        onProgress: (Float) -> Unit
+        onProgress: (Float) -> Unit,
+        pieces: List<Aligner.Piece> = emptyList()
     ) {
+        // Different edit: AD is placed piece by piece (output frame ranges
+        // [startJ, endJ) read AD from adFrom on), silence in gaps, 10 ms
+        // fades at splices. One piece = the plain linear path below.
+        val placed = if (pieces.size > 1) Aligner.planPieces(a, pieces)
+        else emptyList()
+        val segStart = LongArray(placed.size) {
+            Math.ceil(placed[it].at * outRate).toLong()
+        }
+        val segEnd = LongArray(placed.size) {
+            ((placed[it].at + (placed[it].adTo - placed[it].adFrom) * a) *
+                outRate).toLong()
+        }
+        var seg = 0
+        var finishedEarly = false
+        val fadeN = outRate / 100
         val encoder = MediaCodec.createEncoderByType(
             MediaFormat.MIMETYPE_AUDIO_AAC)
         val fmt = MediaFormat.createAudioFormat(
@@ -241,10 +259,36 @@ object Patcher {
         val frame = ShortArray(1024 * OUT_CHANNELS)
 
         fun pump() {
-            if (inRate == 0) return
+            if (inRate == 0 || finishedEarly) return
             while (true) {
                 var produced = 0
                 while (produced < 1024) {
+                    var gain = 1f
+                    if (placed.isNotEmpty()) {
+                        while (seg < placed.size && outFrame >= segEnd[seg])
+                            seg++
+                        if (seg >= placed.size) {   // past the last piece
+                            if (produced > 0) sink.feed(frame, produced,
+                                outFrame - produced)
+                            sink.finish()
+                            finishedEarly = true
+                            return
+                        }
+                        if (outFrame == segStart[seg] ||
+                            (outFrame > segStart[seg] && p < 0)) {
+                            // entering a piece: jump to its AD position
+                            p = (placed[seg].adFrom +
+                                (outFrame.toDouble() / outRate -
+                                    placed[seg].at) / a) * inRate
+                        }
+                        if (outFrame < segStart[seg]) {
+                            p = -1.0   // gap: silence until the piece
+                        } else {
+                            gain = minOf(1f,
+                                (outFrame - segStart[seg] + 1).toFloat() / fadeN,
+                                (segEnd[seg] - outFrame).toFloat() / fadeN)
+                        }
+                    }
                     if (p < 0) {
                         frame[produced * 2] = 0
                         frame[produced * 2 + 1] = 0
@@ -268,12 +312,15 @@ object Patcher {
                         for (c in 0 until OUT_CHANNELS) {
                             val s0 = window[local + c]
                             val s1 = window[local + OUT_CHANNELS + c]
-                            val v = (s0 + (s1 - s0) * f) * 32767f
+                            val v = (s0 + (s1 - s0) * f) * 32767f * gain
                             frame[produced * OUT_CHANNELS + c] =
                                 v.coerceIn(-32768f, 32767f).toInt().toShort()
                         }
                     }
-                    produced++; outFrame++; p += step
+                    produced++; outFrame++
+                    // linear: a negative p counts up through the leading
+                    // silence; piecewise gaps hold p at -1 instead
+                    if (placed.isEmpty() || p >= 0) p += step
                 }
                 sink.feed(frame, produced, outFrame - produced)
                 // drop consumed window data (keep 4 frames of guard)
@@ -295,10 +342,11 @@ object Patcher {
             }
             val chunk = queue.take()
             if (chunk === sentinel) break
+            if (finishedEarly) continue   // AD past the last piece
             if (inRate == 0) {
                 inRate = chunk.sampleRate
                 step = inRate / (outRate * a)
-                p = (-bSec / a) * inRate
+                p = if (placed.isEmpty()) (-bSec / a) * inRate else -1.0
             }
             val frames = chunk.samples.size / chunk.channels
             // input wholly before the first needed position (large trim):

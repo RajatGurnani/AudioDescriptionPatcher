@@ -11,8 +11,8 @@ android {
         applicationId = "com.renderedideas.adpatcher"
         minSdk = 26        // MediaMuxer multi-track needs API 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "0.3.1"
+        versionCode = 6
+        versionName = "0.4.0"
     }
 
     buildTypes {
@@ -32,6 +32,17 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    // JVM unit tests (AlignerParityTest): android.* calls (Log,
+    // SystemClock) return defaults instead of throwing
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+        unitTests.all { test ->
+            System.getProperty("parity.dir")?.let {
+                test.systemProperty("parity.dir", it)
+            }
+            test.testLogging { showStandardStreams = true }
+        }
+    }
 }
 
 dependencies {
@@ -40,4 +51,5 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     // FFT for the alignment cross-correlation
     implementation("com.github.wendykierp:JTransforms:3.1")
+    testImplementation("junit:junit:4.13.2")
 }

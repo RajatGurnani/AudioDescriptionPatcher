@@ -104,6 +104,41 @@ breakpoints once real pairs have been measured.
   AAC-encoded. Resampling shifts pitch by |a−1| (≤ a few %); acceptable
   on mobile, and exactly zero in the common no-drift case. Output MP4.
 
+### 6. Different edits: piecewise alignment
+
+When the linear fit leaves ≥ 10 % of its segments unmatched while the
+files clearly share a soundtrack, `_fit_piecewise()` (mirrored in
+`Aligner.fitPiecewise`) tries `video = a·ad + b_k` per piece — one
+speed, one offset per piece. Adapted from ADSync's lattice + Viterbi
+(MIT, THIRD_PARTY_NOTICES.txt):
+
+1. 20 s windows every 10 s; each gets its top-3 video offsets from a
+   global 20 Hz normalized cross-correlation.
+2. Offsets seen in ≥ 3 windows (± 0.3 s) become **families**; every
+   window is then scored at every family (±0.5 s local search) — real
+   evidence in every lattice cell.
+3. Viterbi picks one family per window; switching costs 1.5× the median
+   window score, so a cut needs ~3 windows of better evidence. Runs
+   shorter than 3 windows merge into a neighbour. Accepted only if it
+   explains ≥ 10 % more windows than any single offset — linear files
+   stay linear (harness: no phantom cuts).
+4. Hand-over points: coarse (4 s probes) then fine (1 s probes, 50 ms
+   steps) "evidence before vs after" maximisation. Probes matching
+   neither offset count as zero and ties go to the latest point, so
+   inserted material stays with the earlier piece…
+5. …and rendering cuts each piece where the next one starts in the
+   video (`plan_pieces()`), dropping it. Holes get the original audio
+   (PC). One slope + per-piece intercepts are fitted jointly.
+
+ffmpeg renders it as one graph: per piece `atrim → atempo → 10 ms
+fades → adelay`, original-audio gap fills, `amix normalize=0` (pieces
+never overlap) and `asetpts=N/SR/TB` (mp4 rejects amix's timestamp-less
+last frame with ffmpeg's aac). Android's resampler jumps to each piece's
+AD position and outputs silence in gaps.
+
+Harness: cut / insert / adbreaks / cut+PAL all within 0.3 s on the
+hand-over and ≤ 20 ms on every 5 s window of the output.
+
 ## Known limitation: extended audio description
 
 Some AD productions (common in short-form/educational content, e.g.
