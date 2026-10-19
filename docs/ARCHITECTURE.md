@@ -71,9 +71,11 @@ files are detected.
 
 - **PC (ffmpeg):** `atempo=1/a` (pitch-preserving) unless |a−1| < 5e-5;
   `adelay` for b>0 or `atrim` for b<0; `-c:v copy`; AD resampled to
-  48 kHz and encoded AAC 192k as default track (mkv only: started
-  1024/48000 s early to cancel the AAC priming delay that mkv, unlike
-  mp4's edit list, doesn't trim); original audio copied as track 2; subtitles copied
+  48 kHz and encoded AAC 192k as default track — Windows' `aac_mf`
+  (≈5× faster than ffmpeg's `aac`, zero priming) with ffmpeg `aac` as
+  fallback; for that one, mkv outputs start the AD 1024/48000 s early
+  to cancel the priming delay that mkv, unlike mp4's edit list, doesn't
+  trim; original audio copied as track 2; subtitles copied
   when the container allows (with automatic retry without them). Output
   MKV.
 - **Android (MediaCodec/MediaMuxer):** video samples copied; original

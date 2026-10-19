@@ -117,24 +117,39 @@ def narration(seed, seconds):
     return x
 
 
-def prepare(work, minutes):
-    """Generate (or reuse) source wav, video, and every AD variant."""
+def prepare(work, minutes, realistic=False):
+    """Generate (or reuse) source wav, video, and every AD variant.
+
+    `realistic` swaps the tiny test video for one with movie-like I/O and
+    decode cost: raw 320x180 video (~2 MB/s, a typical movie bitrate) and
+    a 5.1 E-AC-3 640k soundtrack."""
     os.makedirs(work, exist_ok=True)
     tag = f"{minutes:g}m"
     src = os.path.join(work, f"src_{tag}.wav")
     other = os.path.join(work, f"other_{tag}.wav")
-    # PCM audio: an AAC track would carry ~64 ms of encoder priming at
-    # 16 kHz that mkv does not trim, shifting the ground truth
-    video = os.path.join(work, f"video_pcm_{tag}.mkv")
     if not os.path.exists(src):
         write_wav(src, soundtrack(1, minutes))
     if not os.path.exists(other):
         write_wav(other, soundtrack(2, minutes))
-    if not os.path.exists(video):
-        run([adpatch.FFMPEG, "-y", "-v", "error",
-             "-f", "lavfi", "-i", "color=c=black:s=160x90:r=24",
-             "-i", src, "-shortest", "-c:v", "libx264", "-preset",
-             "ultrafast", "-c:a", "pcm_s16le", video])
+    if realistic:
+        video = os.path.join(work, f"video_real_{tag}.mkv")
+        if not os.path.exists(video):
+            run([adpatch.FFMPEG, "-y", "-v", "error",
+                 "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24",
+                 "-i", src, "-shortest",
+                 "-c:v", "rawvideo", "-pix_fmt", "yuv420p",
+                 "-af", "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0,"
+                        "aresample=48000",
+                 "-c:a", "eac3", "-b:a", "640k", video])
+    else:
+        # PCM audio: a lossy track's encoder delay would shift the truth
+        # (the harness measures and corrects for it anyway - see main)
+        video = os.path.join(work, f"video_pcm_{tag}.mkv")
+        if not os.path.exists(video):
+            run([adpatch.FFMPEG, "-y", "-v", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=160x90:r=24",
+                 "-i", src, "-shortest", "-c:v", "libx264", "-preset",
+                 "ultrafast", "-c:a", "pcm_s16le", video])
     ads = {}
     for name, (filt, _, _, narr) in CASES.items():
         ad = os.path.join(work, f"ad3_{name}_{tag}.mp3")
@@ -160,7 +175,7 @@ def prepare(work, minutes):
 
 
 def verify_output(output, src_env):
-    """Lag (ms) of the output's AD track vs the source soundtrack in
+    """Lag (ms) of the output's AD track vs the video's own audio in
     windows across the runtime - independent of adpatch's own report."""
     out_env = adpatch.onset_envelope(output)   # 0:a:0 = the AD track
     seg = int(30 * adpatch.FPS)
@@ -186,17 +201,30 @@ def main():
     p.add_argument("--container", choices=("mkv", "mp4"), default="mkv",
                    help="output container (mp4 drops the PCM original "
                         "track, which mp4 can't hold)")
+    p.add_argument("--realistic", action="store_true",
+                   help="movie-like video (~2 MB/s raw video, 5.1 E-AC-3) "
+                        "for meaningful timings")
+    p.add_argument("--cache", action="store_true",
+                   help="allow adpatch's envelope cache (off by default so "
+                        "timings measure real decoding)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="print adpatch's own log")
     args = p.parse_args()
 
+    if not args.cache:
+        os.environ["ADPATCH_NO_CACHE"] = "1"
     print(f"generating media in {args.workdir} ...")
-    src, video, ads = prepare(args.workdir, args.minutes)
-    src_env = adpatch.onset_envelope(src)
+    src, video, ads = prepare(args.workdir, args.minutes, args.realistic)
+    # Reference = what a viewer hears: the video's decoded audio. Its codec
+    # delay (if any) shifts the ground-truth offset; measure and apply it.
+    src_env = adpatch.onset_envelope(video)
+    delay = np.median(verify_output(video, adpatch.onset_envelope(src)))
+    if abs(delay) > 0.5:
+        print(f"video audio codec delay: {delay:+.1f} ms (applied to truth)")
 
     results, failed = [], False
     print(f"\n{'case':<11} {'da ppm':>8} {'db ms':>8} {'lag max':>8} "
-          f"{'conf/susp':>9}  {'env v/a':>11} {'align':>6} {'mux':>6}  ok")
+          f"{'conf/susp':>9}  {'analyze (v/a)':>17} {'align':>6} {'mux':>6}  ok")
     for name in args.cases.split(","):
         _, a_true, b_true, _ = CASES[name]
         out = os.path.join(args.workdir, f"out_{name}.{args.container}")
@@ -213,7 +241,7 @@ def main():
             da = db = lag_max = None
         else:
             da = (res["a"] - a_true) * 1e6
-            db = (res["b"] - b_true) * 1000
+            db = (res["b"] - b_true) * 1000 + delay
             lags = verify_output(out, src_env)
             lag_max = max((abs(x) for x in lags), default=float("inf"))
             row.update(da_ppm=da, db_ms=db, lags_ms=lags)
@@ -227,7 +255,7 @@ def main():
         fmt = lambda v, f: "-" if v is None else format(v, f)  # noqa: E731
         print(f"{name:<11} {fmt(da, '+8.1f')} {fmt(db, '+8.1f')} "
               f"{fmt(lag_max, '8.1f')} {str(res['suspect']):>9}  "
-              f"{t['video_env']:5.1f}/{t['ad_env']:<5.1f} "
+              f"{t['analyze']:5.1f} ({t['video_env']:4.1f}/{t['ad_env']:<4.1f}) "
               f"{t['align']:6.2f} {t['mux']:6.2f}  "
               f"{'PASS' if ok else 'FAIL'}")
         os.remove(out)

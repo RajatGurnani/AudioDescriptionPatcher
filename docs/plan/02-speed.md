@@ -1,5 +1,12 @@
 # 02 — Speed (Iteration 2, v0.5.0)
 
+> **Outcome (2026-10-19):** done — 2.1 parallel envelopes, 2.3 cache,
+> 2.4 `-vn -sn -dn`, plus an unplanned win found by profiling: the AD
+> AAC encode was ~95 % of the mux; switched to Windows `aac_mf` (5×).
+> 2.2 chunk-parallel decode deliberately skipped (decode isn't the
+> bottleneck — numbers in BENCHMARKS.md). Mux progress (2.5) shipped
+> earlier with the progress bars.
+
 Prerequisite: baseline timings from [00](00-baseline-and-harness.md).
 Every change below is measured against it and must keep alignment
 within Δa < 20 ppm, Δb < 10 ms of the baseline on the harness.

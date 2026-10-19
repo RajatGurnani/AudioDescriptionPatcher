@@ -332,10 +332,9 @@ document.addEventListener('drop', e => {
 });
 
 // ---- run + progress ----
-const PHASES = {video: ['1/4', 'Analyzing video audio'],
-                ad: ['2/4', 'Analyzing AD audio'],
-                align: ['3/4', 'Aligning'],
-                mux: ['4/4', 'Writing output']};
+const PHASES = {analyze: ['1/3', 'Analyzing video + AD audio'],
+                align: ['2/3', 'Aligning'],
+                mux: ['3/3', 'Writing output']};
 const bar = document.getElementById('bar');
 const stage = document.getElementById('stage');
 const pct = document.getElementById('pct');

@@ -55,13 +55,18 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
      windows across the runtime → weighted linear fit with outlier
      rejection → final a, b + per-segment sync report.
 - `patch(..., log, progress)` — `progress(phase, frac)` with phases
-  video/ad/align/mux; decode % from bytes vs `probe_duration()`, mux %
+  analyze/align/mux. Video + AD envelopes run in parallel threads via
+  `cached_envelope()` (content-keyed .npy cache in
+  %LOCALAPPDATA%\ADPatcher\cache; `ADPATCH_NO_CACHE=1` bypasses, the
+  harness sets it unless `--cache`). Decode % from bytes vs `probe_duration()`, mux %
   from ffmpeg `-progress pipe:1` (`run_ffmpeg()`). All ffmpeg stderr is
   drained on a thread (`_drain`) — reading it after stdout deadlocks on
   Windows. CLI draws `ConsoleProgress` when stderr is a TTY.
 - `build_mux_cmd()` — ffmpeg mux: `atempo=1/a` (skipped if |a-1|<5e-5),
-  `adelay` (b≥0) or `atrim` (b<0); video `-c:v copy`; AD encoded AAC as
-  default track a:0, original audio copied as a:1 unless `--replace`;
+  `adelay` (b≥0) or `atrim` (b<0); video `-c:v copy`; AD resampled to
+  48 kHz, encoded with `ad_encoder()` (Windows `aac_mf`, 5x faster, no
+  priming; fallback ffmpeg `aac`, whose 1024-sample priming is
+  compensated in mkv only) as default track a:0, original audio copied as a:1 unless `--replace`;
   retries without subtitles if subtitle copy fails (e.g., mov_text→mkv).
 - ffmpeg comes from `imageio_ffmpeg.get_ffmpeg_exe()` (pip-bundled binary,
   no ffprobe available — stream detection parses `ffmpeg -i` stderr).

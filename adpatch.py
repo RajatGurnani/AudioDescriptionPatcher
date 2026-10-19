@@ -33,12 +33,14 @@ the video itself. Such files are detected and reported as weak matches.
 """
 
 import argparse
+import hashlib
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import imageio_ffmpeg
@@ -57,7 +59,13 @@ NEGLIGIBLE_DRIFT = 5e-5    # |a-1| below this: skip atempo (~0.4s over 2h)
 WEAK_SCORE = 0.12          # per-segment "weak match" flag in the report
 
 AD_RATE = 48000            # sample rate of the encoded AD track
-AAC_PRIMING = 1024         # encoder delay of ffmpeg's aac, in samples
+
+# AD encoders in order of preference, with their priming delay (samples)
+# that mkv does NOT trim (mp4's edit list does). Windows' Media Foundation
+# AAC encoder is ~4x faster than ffmpeg's and adds no delay; ffmpeg's
+# own aac is the fallback (e.g. Windows "N" editions without MF).
+AD_ENCODERS = (("aac_mf", 0), ("aac", 1024))
+_ad_encoder = None
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv",
               ".flv", ".ts", ".mpg", ".mpeg", ".vob", ".3gp"}
@@ -161,8 +169,9 @@ def onset_envelope(path, progress=None):
     if progress:
         dur = probe_duration(path)
         total = dur * SR * 4 if dur else None
-    cmd = [FFMPEG, "-v", "error", "-i", path, "-map", "0:a:0",
-           "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
+    # -vn/-sn/-dn: don't set up decoders for streams we never read
+    cmd = [FFMPEG, "-v", "error", "-i", path, "-vn", "-sn", "-dn",
+           "-map", "0:a:0", "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
     err = _drain(proc.stderr)
@@ -196,6 +205,64 @@ def onset_envelope(path, progress=None):
     if std > 0:
         onset /= std
     return onset.astype(np.float32)
+
+
+# Bump whenever SR, HOP or the onset formula change: invalidates the cache.
+ENVELOPE_VERSION = 1
+CACHE_DIR = os.environ.get("ADPATCH_CACHE_DIR") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "ADPatcher", "cache", "envelopes")
+CACHE_LIMIT = 500e6   # bytes; oldest entries pruned beyond this
+
+
+def _cache_key(path):
+    """Content-based key (size + first/last MB), so re-uploads and renamed
+    copies of the same file still hit."""
+    size = os.path.getsize(path)
+    h = hashlib.sha1(f"v{ENVELOPE_VERSION}:{SR}:{HOP}:{size}".encode())
+    with open(path, "rb") as f:
+        h.update(f.read(1 << 20))
+        if size > 2 << 20:
+            f.seek(-(1 << 20), os.SEEK_END)
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def cached_envelope(path, progress=None):
+    """onset_envelope() with an on-disk cache (~3 MB per 2 h of audio).
+    Set ADPATCH_NO_CACHE=1 to bypass (e.g. for timing measurements)."""
+    if os.environ.get("ADPATCH_NO_CACHE"):
+        return onset_envelope(path, progress)
+    try:
+        cache = os.path.join(CACHE_DIR, _cache_key(path) + ".npy")
+        if os.path.exists(cache):
+            env = np.load(cache)
+            os.utime(cache)   # mark recently used for pruning
+            if progress:
+                progress(1.0)
+            return env
+    except (OSError, ValueError):
+        cache = None
+    env = onset_envelope(path, progress)
+    if cache:
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            np.save(cache, env)
+            _prune_cache()
+        except OSError:
+            pass   # cache is best-effort
+    return env
+
+
+def _prune_cache():
+    entries = sorted((e.stat().st_mtime, e.stat().st_size, e.path)
+                     for e in os.scandir(CACHE_DIR) if e.name.endswith(".npy"))
+    total = sum(size for _, size, _ in entries)
+    for _, size, path in entries:
+        if total <= CACHE_LIMIT:
+            break
+        os.remove(path)
+        total -= size
 
 
 # --------------------------------------------------------------------------
@@ -375,25 +442,45 @@ def fit_alignment(ad_env, vid_env, log=print):
 # Muxing
 # --------------------------------------------------------------------------
 
-def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs):
+def ad_encoder():
+    """(name, priming_samples) of the first AD encoder that works here;
+    probed once with a 0.1 s silent encode."""
+    global _ad_encoder
+    if _ad_encoder is None:
+        _ad_encoder = AD_ENCODERS[-1]
+        for name, delay in AD_ENCODERS:
+            r = subprocess.run(
+                [FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+                 f"anullsrc=r={AD_RATE}:cl=stereo", "-t", "0.1",
+                 "-c:a", name, "-b:a", "192k", "-f", "null", "-"],
+                capture_output=True)
+            if r.returncode == 0:
+                _ad_encoder = (name, delay)
+                break
+    return _ad_encoder
+
+
+def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
+                  encoder=None):
     """Assemble the ffmpeg command that applies the alignment and muxes.
 
     The AD audio gets: atempo (speed correction, skipped when negligible),
     then adelay (positive offset) or atrim (negative offset). The video
     stream is copied bit-for-bit. The corrected AD track becomes the
     default audio; the original audio is copied as track 2 unless
-    `replace`.
+    `replace`. `encoder` is an AD_ENCODERS entry (default: ad_encoder()).
     """
-    # Fixed output rate: keeps the AAC priming delay known (see below).
+    enc_name, priming = encoder or ad_encoder()
+    # Fixed output rate: keeps the encoder priming delay known (see below).
     filters = [f"aresample={AD_RATE}"]
     if abs(a - 1.0) > NEGLIGIBLE_DRIFT:
         # content at ad_time t must land at a*t, so play at rate 1/a
         filters.append(f"atempo={1.0 / a:.8f}")
     if os.path.splitext(output)[1].lower() == ".mkv":
-        # The AAC encoder prepends 1024 priming samples; mp4 trims them
-        # via an edit list, mkv doesn't - so the track would play ~21 ms
-        # late. Start the AD that much earlier to cancel it.
-        b_sec -= AAC_PRIMING / AD_RATE
+        # Encoders may prepend priming samples (ffmpeg aac: 1024); mp4
+        # trims them via an edit list, mkv doesn't - so the track would
+        # play ~21 ms late. Start the AD that much earlier to cancel it.
+        b_sec -= priming / AD_RATE
     if b_sec >= 0:
         delay_ms = int(round(b_sec * 1000))
         if delay_ms:
@@ -407,7 +494,7 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs):
            "-i", video, "-i", ad_audio,
            "-filter_complex", f"[1:a:0]{chain}[ad]",
            "-map", "0:v", "-c:v", "copy",
-           "-map", "[ad]", "-c:a:0", "aac", "-b:a:0", "192k",
+           "-map", "[ad]", "-c:a:0", enc_name, "-b:a:0", "192k",
            "-metadata:s:a:0", "title=Audio Description",
            "-metadata:s:a:0", "language=eng",
            "-disposition:a:0", "default"]
@@ -436,10 +523,11 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         weak        number of report rows below the weak-match threshold
         suspect     True if most segments matched poorly (probably a
                     different cut / extended audio description)
-        timings     {phase: seconds} for video_env, ad_env, align, mux,
+        timings     {phase: seconds} for analyze (wall time; video_env
+                    and ad_env run in parallel inside it), align, mux,
                     total
     `progress(phase, fraction)`, if given, is called as work advances;
-    phases in order: "video", "ad", "align", "mux".
+    phases in order: "analyze", "align", "mux".
 
     Raises ValueError / RuntimeError with a user-readable message on
     failure.
@@ -467,14 +555,30 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     log(f"video: {os.path.basename(video)}")
     log(f"AD audio: {os.path.basename(ad_audio)}")
 
-    log("analyzing video audio...")
-    vid_env = onset_envelope(video, progress=report("video"))
-    log(f"  {len(vid_env) / FPS / 60:.1f} min")
-    lap("video_env")
-    log("analyzing AD audio...")
-    ad_env = onset_envelope(ad_audio, progress=report("ad"))
-    log(f"  {len(ad_env) / FPS / 60:.1f} min")
-    lap("ad_env")
+    # Both envelopes decode in parallel: the work is in the ffmpeg child
+    # processes and numpy, so threads overlap fine despite the GIL. The
+    # phase finishes with the slower one, so that one drives progress.
+    log("analyzing video and AD audio...")
+    fracs = {"video": 0.0, "ad": 0.0}
+
+    def analyze(which, path):
+        t0 = time.perf_counter()
+
+        def prog(f):
+            fracs[which] = f
+            if progress:
+                progress("analyze", min(fracs.values()))
+        env = cached_envelope(path, prog)
+        timings[f"{which}_env"] = time.perf_counter() - t0
+        log(f"  {which}: {len(env) / FPS / 60:.1f} min "
+            f"({timings[which + '_env']:.1f}s)")
+        return env
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_v = pool.submit(analyze, "video", video)
+        fut_a = pool.submit(analyze, "ad", ad_audio)
+        vid_env, ad_env = fut_v.result(), fut_a.result()
+    lap("analyze")
 
     log("aligning...")
     if progress:
@@ -509,15 +613,23 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
     log("muxing (video stream copied, AD audio encoded)...")
     duration = len(vid_env) / FPS
-    rc, err = run_ffmpeg(build_mux_cmd(video, ad_audio, output, a, b_sec,
-                                       replace, with_subs=True),
-                         duration, report("mux"))
+
+    def mux(with_subs, encoder):
+        return run_ffmpeg(build_mux_cmd(video, ad_audio, output, a, b_sec,
+                                        replace, with_subs, encoder),
+                          duration, report("mux"))
+
+    encoder = ad_encoder()
+    rc, err = mux(True, encoder)
     if rc != 0 and "Subtitle" in err:
         # some subtitle codecs (e.g. mp4 mov_text) can't be copied into
         # mkv - retry without subtitles rather than failing the whole job
-        rc, err = run_ffmpeg(build_mux_cmd(video, ad_audio, output, a,
-                                           b_sec, replace, with_subs=False),
-                             duration, report("mux"))
+        rc, err = mux(False, encoder)
+    if rc != 0 and encoder != AD_ENCODERS[-1]:
+        # the fast encoder can reject odd inputs (channel layouts etc.)
+        log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
+        encoder = AD_ENCODERS[-1]
+        rc, err = mux(False, encoder)
     if rc != 0:
         raise RuntimeError(f"muxing failed:\n{err}")
     lap("mux")
@@ -525,9 +637,10 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
     log(f"done: {output} ({os.path.getsize(output) / 1e6:.0f} MB)")
     mb = os.path.getsize(video) / 1e6
-    log(f"timings: video-env {timings['video_env']:.1f}s "
-        f"({mb / max(timings['video_env'], 1e-9):.0f} MB/s) | "
-        f"ad-env {timings['ad_env']:.1f}s | align {timings['align']:.1f}s | "
+    log(f"timings: analyze {timings['analyze']:.1f}s (video "
+        f"{timings['video_env']:.1f}s, "
+        f"{mb / max(timings['video_env'], 1e-9):.0f} MB/s; AD "
+        f"{timings['ad_env']:.1f}s) | align {timings['align']:.1f}s | "
         f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s")
     log("AD track is the default audio; original audio kept as track 2."
         if not replace else "original audio replaced with AD track.")
@@ -558,10 +671,9 @@ def main():
         sys.exit(f"error: {e}")
 
 
-PHASE_LABELS = {"video": "1/4 analyzing video audio",
-                "ad": "2/4 analyzing AD audio",
-                "align": "3/4 aligning",
-                "mux": "4/4 writing output"}
+PHASE_LABELS = {"analyze": "1/3 analyzing video + AD audio",
+                "align": "2/3 aligning",
+                "mux": "3/3 writing output"}
 
 
 class ConsoleProgress:

@@ -81,3 +81,32 @@ Bugs the harness found and fixed in this iteration:
 Residual 9–13 ms on drift cases is `atempo`'s own WSOLA latency in the
 mux (measured 5–20 ms depending on rate) — within AD tolerance, left as
 is.
+
+## Iteration 2 — speed (v0.5.0, 2026-10-19)
+
+Same machine. "realistic" = `tools/harness.py --realistic --minutes 20`:
+2.5 GB mkv (raw 320x180 video ≈ 2 MB/s, 5.1 E-AC-3 640k audio), AD =
+mono MP3 with PAL drift.
+
+| | before | after | change |
+|---|---|---|---|
+| mux, 10-min harness | 17.0 s | 3.0–3.8 s | **5×** — AD encoder `aac` → `aac_mf` |
+| mux, 20-min realistic | 36–58 s | 10–27 s | encoder + I/O (range = warm vs cold OS file cache) |
+| analyze, 20-min realistic | 2.3+0.7 s sequential | 1.9–5.6 s wall (parallel) | ≈ max(video, AD) instead of sum |
+| analyze, repeat run (cache hit) | same as first | 0.01 s | envelope cache |
+
+Where the time went (profiled on the 10-min harness mux): AAC encoding
+was ~95 % of the mux. ffmpeg's native `aac` runs ~36× realtime on this
+CPU; Windows' Media Foundation `aac_mf` ~180×, `ac3` ~500×. `aac_mf`
+also adds **no** priming delay (native `aac` adds 1024 samples that mkv
+doesn't trim), so the mkv compensation is now per-encoder. Native `aac`
+remains the automatic fallback (verified in sync, ~18 s mux).
+
+Not done, by measurement: chunk-parallel decode of one file (plan 02
+§2.2). Decoding 20 min of 5.1 E-AC-3 takes 2–6 s, so for a 2 h film
+analysis is ~15–35 s against a mux that has to read and write the whole
+file anyway. Revisit for lossless tracks (TrueHD / DTS-HD MA) if real
+files show a decode-bound analysis.
+
+Accuracy after the changes: all harness cases unchanged (Δa ≤ 3.5 ppm,
+Δb ≤ 0.7 ms, output lag ≤ 13.4 ms; realistic ≤ 16.1 ms).
