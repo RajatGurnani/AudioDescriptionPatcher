@@ -63,6 +63,13 @@ working-tree changes + hook).
 3. `gradle assembleRelease`; check `adb -s 00116646S015275 shell getprop
    ro.product.model` = A015; `adb -s 00116646S015275 install -r
    app/build/outputs/apk/release/app-release.apk` (MSYS_NO_PATHCONV=1).
+   Device driving (sync session's method): scratchpad `ui.py` (uiautomator
+   dump + adb input tap, pinned to the serial) + `run.sh <AD name in
+   Download/ADPatcherTest> <out.mp4>` in
+   `%TEMP%\claude\D--PERSONAL-AudioDescriptionPatcher\cde144db-be47-4a22-8f9d-1bcef4959cd5\scratchpad`
+   (may be cleaned up; it taps pickAd → file → goButton → save name →
+   button1, waits for "writing output:" in logcat). Set the voice boost
+   card first (vbHigh, vbTrack).
 4. On the phone: Voice boost = High, extra track on; patch
    `/sdcard/Download/BigBuckBunny.mp4` + `BigBuckBunny_AD.mp3`. Expect log
    line `voice boost: high (extra track)` and `voice-boost track done`.
