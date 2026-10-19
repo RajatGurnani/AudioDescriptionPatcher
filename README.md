@@ -11,6 +11,7 @@ Three ways to use it:
 
 | Interface | Where | Best for |
 |---|---|---|
+| **Desktop app** (`desktop.py` / `ADPatcher.exe`) | its own window on the PC | everyday PC use: native file dialogs, drag-drop, no upload copy, AudioVault window, batch |
 | `patch.bat` / `adpatch.py` | Windows CLI / drag-drop | quick one-offs on the PC |
 | `start_app.bat` (web app) | browser on PC **or phone** (same Wi-Fi) | phone files, no install; **batch**: whole folders, auto-paired by audio (PC) |
 | Android app (`android/`) | on the phone itself, offline | fully standalone mobile |

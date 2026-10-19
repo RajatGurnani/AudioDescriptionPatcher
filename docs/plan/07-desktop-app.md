@@ -1,5 +1,18 @@
 # 07 — Shutdown button + desktop app (Iterations 1 & 6)
 
+> **Outcome (2026-10-19):** 7.1 shipped in iteration 1; 7.2–7.4 done in
+> iteration 6. pywebview 6.2 on Python 3.14 + pythonnet 3.2 works, so no
+> separate 3.13 venv was needed (7.5). Drag-drop paths come from a
+> Python-side DOM drop handler; AudioVault downloads go through
+> WebView2's Save dialog (Downloads) and a folder watcher fills the AD
+> slot. "Share to phone" toggle not done — start_app.bat covers phones.
+> Build: one-folder, 144 MB, icon rendered from the Android artwork
+> (tools/make_icon.py), all bundled licences collected into
+> `_internal/licenses`. Verified headless: tools/desktop_smoke.py (hidden
+> window, scripted drop → job → verdict → close) and the built exe over
+> HTTP with a hidden window. Not verified by hand: native dialogs, real
+> OS drag-drop, the AudioVault window.
+
 ## 7.1 Stop-server button (Iteration 1, web app)
 
 - `POST /api/shutdown`:

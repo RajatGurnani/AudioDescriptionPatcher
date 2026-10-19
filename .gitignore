@@ -17,3 +17,7 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+
+# PyInstaller (desktop build) - local only
+build/
+dist/

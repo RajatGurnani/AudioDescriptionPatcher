@@ -1,0 +1,17 @@
+ffmpeg (bundled)
+================
+
+The desktop build of AD Patcher ships an unmodified ffmpeg executable
+(imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe, from the
+imageio-ffmpeg 0.6.0 wheel). AD Patcher runs it as a separate program;
+it is not linked into AD Patcher.
+
+  Version:  ffmpeg 7.1 "essentials" build by gyan.dev
+            (configured with --enable-gpl --enable-version3)
+  Licence:  GNU General Public License version 3 - see GPL-3.0.txt
+  Source:   https://ffmpeg.org/download.html#get-sources (FFmpeg 7.1)
+            build scripts/configuration: https://www.gyan.dev/ffmpeg/builds/
+            imageio-ffmpeg: https://github.com/imageio/imageio-ffmpeg
+
+AD Patcher itself is MIT-licensed (see LICENSE); other bundled
+third-party components are listed in THIRD_PARTY_NOTICES.txt.

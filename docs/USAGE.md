@@ -18,6 +18,39 @@ skip installation unless `requirements.txt` changed. If
 [uv](https://github.com/astral-sh/uv) is on PATH it's used instead of
 pip, and can even fetch Python itself when none is installed.
 
+## Option 0 — desktop app (PC, recommended)
+
+`.venv\Scripts\python desktop.py` — or `ADPatcher.exe` from a local build
+(below). The same page as the web app, in its own window:
+
+- **Choose video / Choose AD file** open Windows' file dialog, which
+  remembers the last folder separately for videos and for AD files.
+- **Drop** files anywhere on the window (both at once is fine).
+- Files are patched **in place** — no upload copy of a multi-GB video;
+  the output (`<video>.AD.mkv`) lands next to the video. **Show in
+  folder** opens it in Explorer.
+- **AudioVault** opens audiovault.net in a second window with your own
+  login. Save an audio file to your **Downloads** folder there and it
+  is picked up as the AD file automatically.
+- Batch mode has **Add folder…** / **Choose output folder…** buttons.
+- Closing the window quits; if jobs are still running it asks first.
+
+Phones keep using `start_app.bat` (the web app serves the Wi-Fi).
+
+**Building the exe (local only):**
+
+```
+.venv\Scripts\pip install -r requirements-desktop.txt
+.venv\Scripts\pyinstaller desktop.spec --noconfirm
+```
+
+→ `dist\ADPatcher\ADPatcher.exe` (one folder, ~145 MB, ~60 MB zipped). Copy the
+whole `dist\ADPatcher` folder to another Windows 10/11 PC — no Python
+needed (the Edge WebView2 runtime ships with Windows). The folder
+includes the licences of everything bundled (`_internal\licenses`,
+including ffmpeg's GPLv3 notice). The exe is unsigned, so SmartScreen
+may ask once ("More info → Run anyway").
+
 ## Option 1 — PC, drag and drop
 
 1. Select the video and the AD file in Explorer (both at once) and drag

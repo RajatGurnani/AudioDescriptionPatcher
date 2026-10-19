@@ -21,6 +21,15 @@ A tool that "patches" a regular video file with its audio-described (AD) version
 # POST /api/shutdown: localhost only; 409 if jobs run, ?force=true kills tree
 .venv\Scripts\python app.py
 
+# desktop app (pywebview window over app.py's FastAPI, 127.0.0.1 only)
+.venv\Scripts\python desktop.py
+# headless smoke test (hidden window, never shown) - test GUI this way
+.venv\Scripts\python tools\desktop_smoke.py
+# local exe build -> dist\ADPatcher\ADPatcher.exe (never upload/release)
+.venv\Scripts\pip install -r requirements-desktop.txt
+.venv\Scripts\pyinstaller desktop.spec --noconfirm
+# exe headless check: ADPATCH_DESKTOP_HIDDEN=1 ADPATCH_DESKTOP_PORT=8799
+
 # Android APK (needs Gradle 8.9 on PATH or a downloaded dist;
 # JDK 17 from Android Studio: set JAVA_HOME to
 # "C:\Program Files\Android\Android Studio\jbr")
@@ -98,6 +107,12 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   only break ties) → `Queue` persisted atomically to
   %LOCALAPPDATA%\ADPatcher\queue.json, sequential, resumable. Test:
   `tools\batch_test.py`.
+- `desktop.py` — pywebview shell: `?desktop=1` page mode, js_api `Api`
+  (native dialogs with per-slot remembered folders in
+  %LOCALAPPDATA%\ADPatcher\desktop.json, reveal, AudioVault window + Downloads
+  watcher), Python-side drop handler → `adpDropPaths()` with real paths,
+  jobs via POST /api/patch_local (localhost, in place, no upload). Keep
+  Api attributes `_private` (pywebview walks public ones → COM spam).
 - `app.py` — FastAPI wrapper around `adpatch.patch()`: multipart upload →
   background thread → poll `/api/jobs/<id>` → download. Inline single-page
   UI (mobile-first). Jobs live in `jobs/<id>/`; uploads deleted after run.

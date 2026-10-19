@@ -155,6 +155,10 @@ normally standard (same-runtime) description and align fine.
 adpatch.py       PC engine + CLI (envelope / fit_alignment / patch)
 app.py           FastAPI web UI wrapping adpatch.patch (PC + phone)
 batch.py         folder mode: discover -> content pairing -> resumable queue
+desktop.py       desktop shell: pywebview window over the same FastAPI app
+desktop.spec     PyInstaller one-folder build (dist/ and build/ are local)
+static/          uPlot (vendored), app icon (tools/make_icon.py)
+licenses/        GPLv3 text + ffmpeg notice shipped with the exe
 patch.bat        drag-and-drop wrapper
 start_app.bat    web app launcher
 android/         Kotlin app: AudioEngine (decode+envelope),

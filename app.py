@@ -38,7 +38,8 @@ except ImportError as e:
              "requirements.txt)")
 
 PORT = 8756
-JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
+JOBS_DIR = os.environ.get("ADPATCH_JOBS_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "jobs")
 
 app = FastAPI(title="AudioDescriptionPatcher")
 app.mount("/static", StaticFiles(directory=os.path.join(
@@ -57,7 +58,8 @@ def is_local(request):
             and request.client.host in ("127.0.0.1", "::1"))
 
 
-def run_job(job_id, video_path, ad_path, output_path, replace):
+def run_job(job_id, video_path, ad_path, output_path, replace,
+            cleanup=True):
     job = jobs[job_id]
     job["status"] = "running"
     job["started"] = time.time()
@@ -78,8 +80,9 @@ def run_job(job_id, video_path, ad_path, output_path, replace):
         job["error"] = str(e)
         job["status"] = "error"
     finally:
-        # uploads are no longer needed once the job has finished
-        for p in (video_path, ad_path):
+        # uploads are no longer needed once the job has finished (local
+        # jobs work on the user's own files: never delete those)
+        for p in (video_path, ad_path) if cleanup else ():
             try:
                 os.remove(p)
             except OSError:
@@ -116,6 +119,37 @@ async def start_patch(video: UploadFile = File(...),
     return {"job": job_id}
 
 
+@app.post("/api/patch_local")
+def start_patch_local(request: Request, payload: dict = Body(...)):
+    """Desktop / same-PC mode: patch files in place by path - no upload
+    copy of a multi-GB video. Output goes next to the video (or to
+    `outdir`), like the CLI. Localhost only."""
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    video, ad = payload.get("video"), payload.get("ad")
+    for f in (video, ad):
+        if not f or not os.path.isfile(f):
+            return JSONResponse({"error": f"file not found: {f}"},
+                                status_code=400)
+    try:
+        video, ad = adpatch.classify_inputs(video, ad)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    stem = os.path.splitext(os.path.basename(video))[0]
+    output = os.path.join(payload.get("outdir") or os.path.dirname(video),
+                          stem + ".AD.mkv")
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {"status": "queued", "log": [], "output": None,
+                    "error": None, "name": stem + ".AD.mkv",
+                    "phase": None, "frac": 0.0}
+    threading.Thread(target=run_job,
+                     args=(job_id, video, ad, output,
+                           bool(payload.get("replace"))),
+                     kwargs={"cleanup": False}, daemon=True).start()
+    return {"job": job_id}
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
     job = jobs.get(job_id)
@@ -126,7 +160,8 @@ def job_status(job_id: str):
     return {"status": job["status"], "log": job["log"],
             "error": job["error"], "name": job["name"],
             "phase": job["phase"], "frac": job["frac"],
-            "elapsed": elapsed, "result": job.get("result")}
+            "elapsed": elapsed, "result": job.get("result"),
+            "output": job.get("output")}
 
 
 @app.get("/api/jobs/{job_id}/envelopes")
@@ -301,6 +336,7 @@ INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AD Patcher</title>
+<link rel="icon" href="static/icon.png">
 <link rel="stylesheet" href="static/vendor/uplot/uPlot.min.css">
 <script src="static/vendor/uplot/uPlot.iife.min.js"></script>
 <style>
@@ -358,8 +394,13 @@ INDEX_HTML = """<!doctype html>
 <main>
   <header>
     <h1>&#127909; Audio Description Patcher</h1>
-    <button class="stop" id="stop" hidden
-            title="Stop the server on this PC and close">&#9211; Stop</button>
+    <div>
+      <button class="stop" id="vault" hidden
+              title="Browse AudioVault with your own login; audio you save
+to Downloads is picked up as the AD file">&#127911; AudioVault</button>
+      <button class="stop" id="stop" hidden
+              title="Stop the server on this PC and close">&#9211; Stop</button>
+    </div>
   </header>
   <div class="card" id="pick">
     <label class="file" id="lv" data-slot="video">&#128249; Choose video
@@ -385,6 +426,7 @@ INDEX_HTML = """<!doctype html>
     <details id="logbox"><summary class="hint">log</summary>
       <pre id="log"></pre></details>
     <a class="dl" id="dl" hidden>&#11015;&#65039; Download patched video</a>
+    <button id="reveal" hidden>&#128194; Show in folder</button>
   </div>
   <div class="card" id="sync" hidden>
     <div><span class="badge" id="badge"></span>
@@ -404,8 +446,12 @@ INDEX_HTML = """<!doctype html>
       their audio). Check the pairs, then patch them all.</div>
     <textarea id="bfolders" rows="3" style="width:100%;box-sizing:border-box"
       placeholder="one folder per line, e.g. D:/Movies"></textarea>
+    <button class="stop" id="baddf" hidden style="margin-top:.3rem">
+      + Add folder&hellip;</button>
     <input id="boutdir" style="width:100%;box-sizing:border-box;margin:.4rem 0"
       placeholder="output folder (optional - default: next to each video)">
+    <button class="stop" id="bout" hidden style="margin-bottom:.4rem">
+      Choose output folder&hellip;</button>
     <label class="hint" style="display:block;margin-bottom:.6rem">
       <input type="checkbox" id="brec" checked> include subfolders</label>
     <button id="bscan">Find pairs</button>
@@ -428,8 +474,17 @@ INDEX_HTML = """<!doctype html>
 </main>
 <script>
 const stopBtn = document.getElementById('stop');
+// Desktop app (desktop.py): native dialogs + real file paths, jobs run on
+// the files in place; closing the window quits, so no Stop button.
+const DESKTOP = new URLSearchParams(location.search).has('desktop');
+const api = () => window.pywebview && window.pywebview.api;
 fetch('api/info').then(r => r.json())
-  .then(j => { stopBtn.hidden = !j.can_shutdown; }).catch(() => {});
+  .then(j => { stopBtn.hidden = DESKTOP || !j.can_shutdown; }).catch(() => {});
+if (DESKTOP) {
+  const v = document.getElementById('vault');
+  v.hidden = false;
+  v.onclick = () => api() && api().open_audiovault();
+}
 stopBtn.onclick = async () => {
   if (!confirm('Stop the AD Patcher server?')) return;
   let r = await fetch('api/shutdown', {method: 'POST'});
@@ -457,7 +512,7 @@ const ui = {video: ['lv', 'hv', 'fv'], ad: ['la', 'ha', 'fa']};
 function ext(name) { const i = name.lastIndexOf('.');
   return i < 0 ? '' : name.slice(i).toLowerCase(); }
 function isVideo(f) { return VIDEO_EXTS.includes(ext(f.name)) ||
-  (f.type.startsWith('video/') && !AUDIO_EXTS.includes(ext(f.name))); }
+  ((f.type || '').startsWith('video/') && !AUDIO_EXTS.includes(ext(f.name))); }
 
 function setFile(slot, f) {
   files[slot] = f;
@@ -480,6 +535,12 @@ for (const slot of ['video', 'ad']) {
   const input = document.getElementById(inp);
   input.onchange = () => { if (input.files.length) setFile(slot, input.files[0]); };
   document.getElementById(lab).addEventListener('click', async e => {
+    if (DESKTOP && api()) {      // native dialog, remembers the folder
+      e.preventDefault();
+      const f = await api().pick_file(slot);
+      if (f) setFile(slot, f);
+      return;
+    }
     if (!window.showOpenFilePicker) return;      // default: opens <input>
     e.preventDefault();
     try {
@@ -503,6 +564,7 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => {
   e.preventDefault(); dragDepth = 0;
   document.body.classList.remove('dragging');
+  if (DESKTOP) return;   // desktop.py sends real paths: adpDropPaths()
   if (!document.getElementById('prog').hidden &&
       document.getElementById('dl').hidden) return;   // job in progress
   const dropped = [...e.dataTransfer.files];
@@ -516,6 +578,19 @@ document.addEventListener('drop', e => {
   }
 });
 
+// Called by desktop.py with full paths (window drops, AudioVault saves).
+async function adpDropPaths(paths, source) {
+  if (busy) return;
+  const infos = (await Promise.all(paths.map(p => api().file_info(p))))
+    .filter(Boolean);
+  const vids = infos.filter(isVideo);
+  for (const f of infos) {
+    if (isVideo(f) && !(files.video && vids.length > 1)) setFile('video', f);
+    else if (!isVideo(f)) setFile('ad', f);
+  }
+  if (source) document.getElementById('ha').textContent += '  - from ' + source;
+}
+
 // ---- run + progress ----
 const PHASES = {analyze: ['1/3', 'Analyzing video + AD audio'],
                 align: ['2/3', 'Aligning'],
@@ -524,7 +599,25 @@ const bar = document.getElementById('bar');
 const stage = document.getElementById('stage');
 const pct = document.getElementById('pct');
 
-go.onclick = () => {
+let busy = false;   // a job is running (ignore drops meanwhile)
+go.onclick = async () => {
+  if (files.video.path) {   // desktop: patch in place, no upload
+    document.getElementById('prog').hidden = false;
+    document.getElementById('dl').hidden = true;
+    document.getElementById('reveal').hidden = true;
+    document.getElementById('sync').hidden = true;
+    go.disabled = true; busy = true;
+    stage.textContent = 'Starting\u2026'; bar.value = 0; pct.textContent = '';
+    const r = await fetch('api/patch_local', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({video: files.video.path, ad: files.ad.path,
+                            replace: document.getElementById('rep').checked})});
+    const j = await r.json();
+    if (!r.ok) { fail(j.error); return; }
+    poll(j.job);
+    return;
+  }
+  busy = true;
   const fd = new FormData();
   fd.append('video', files.video);
   fd.append('ad', files.ad);
@@ -558,6 +651,7 @@ function fail(msg) {
   stage.innerHTML = '<span class="warn">&#9888;&#65039; </span>';
   stage.firstChild.append(msg);
   go.disabled = !(files.video && files.ad);
+  busy = false;
 }
 
 function poll(id) {
@@ -580,8 +674,15 @@ function poll(id) {
       clearInterval(t);
       stage.textContent = 'Done \\u2705'; bar.value = 100;
       pct.textContent = 'took ' + fmtTime(j.elapsed);
-      const a = document.getElementById('dl');
-      a.href = 'api/jobs/' + id + '/download'; a.hidden = false;
+      busy = false;
+      if (DESKTOP) {   // already saved next to the video
+        pct.textContent += '  \u00b7  saved ' + j.output;
+        const rv = document.getElementById('reveal');
+        rv.hidden = false; rv.onclick = () => api().reveal(j.output);
+      } else {
+        const a = document.getElementById('dl');
+        a.href = 'api/jobs/' + id + '/download'; a.hidden = false;
+      }
       go.disabled = !(files.video && files.ad);
       if (j.result) showSync(id, j.result);
     } else if (j.status === 'error') {
@@ -690,6 +791,20 @@ let scanRows = [];
 for (const [id, key] of [['bfolders', 'adp-bfolders'], ['boutdir', 'adp-boutdir']]) {
   try { $(id).value = localStorage.getItem(key) || ''; } catch {}
   $(id).oninput = () => { try { localStorage.setItem(key, $(id).value); } catch {} };
+}
+if (DESKTOP) {
+  $('baddf').hidden = $('bout').hidden = false;
+  $('baddf').onclick = async () => {
+    const d = await api().pick_folder('last_dir_batch');
+    if (!d) return;
+    const v = $('bfolders').value.trim();
+    $('bfolders').value = (v ? v + '\\n' : '') + d;
+    $('bfolders').oninput();
+  };
+  $('bout').onclick = async () => {
+    const d = await api().pick_folder('last_dir_out');
+    if (d) { $('boutdir').value = d; $('boutdir').oninput(); }
+  };
 }
 const SCAN_PHASES = {probe: 'Reading file info', analyze: 'Analyzing audio',
                      pair: 'Matching movies to AD files'};
