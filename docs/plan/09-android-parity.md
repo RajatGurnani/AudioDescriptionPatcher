@@ -24,12 +24,14 @@ Driven over adb with the harness cut+PAL pair (10 min):
   starts later than its timestamps say; such gaps are now silence.
 - Works: 2 pieces found (offsets −0.04 s / +40.00 s; truth 0 / +40),
   confidence 1.00, gap left silent as designed.
-- **Open:** in the phone's output piece 1 is ~−8 ms but piece 2 is
-  ~−53 ms — a ~45 ms step at the splice that the PC render doesn't have
-  and the phone's own fit doesn't predict (its residuals are ~0). Making
-  `Patcher` follow decoder timestamps was tried and reverted (it shifted
-  both pieces ~35 ms further). Next: isolated phone runs (cut-only,
-  PAL-only) to separate analysis-side from render-side causes.
+- **Fixed (splice step):** piece 1 −8 ms / piece 2 −53 ms became ≈0 / −5 ms
+  (cut only ≤0.6 ms, PAL only ≤2.7 ms). Causes: MP3 pts on Android run
+  75 ms ahead of the content (57–395 ms after a seek), so the envelope now
+  places samples by count. Ranged decodes stopped on pts and came up 4
+  frames short; they now stop by count, and each later range is placed by a
+  PCM probe matched in the previous range. The AAC encoder's 2048-frame
+  priming (no edit list) is measured by loopback and compensated in
+  `Patcher`. Details: docs/handoff/android-splice-sync.md.
 
 ## Shared test vectors
 

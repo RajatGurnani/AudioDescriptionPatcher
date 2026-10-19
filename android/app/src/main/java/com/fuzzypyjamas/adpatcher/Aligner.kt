@@ -52,7 +52,7 @@ object Aligner {
 
     // ---------------------------------------------------------------- FFT
 
-    private fun nextPow2(n: Int): Int {
+    fun nextPow2(n: Int): Int {
         var p = 1
         while (p < n) p = p shl 1
         return p
@@ -70,7 +70,7 @@ object Aligner {
      * Returns the real part per lag (length n). [xFft] may pass a
      * precomputed FFT of x to amortize across calls.
      */
-    private fun crossCorrelate(
+    fun crossCorrelate(
         x: FloatArray?, y: FloatArray, n: Int, xFft: FloatArray? = null
     ): FloatArray {
         val fft = FloatFFT_1D(n.toLong())

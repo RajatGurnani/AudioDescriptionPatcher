@@ -186,6 +186,156 @@ object Patcher {
         extractor.unselectTrack(trackIn)
     }
 
+    private fun encoderFormat(outRate: Int): MediaFormat =
+        MediaFormat.createAudioFormat(
+            MediaFormat.MIMETYPE_AUDIO_AAC, outRate, OUT_CHANNELS).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, AD_BITRATE)
+            setInteger(MediaFormat.KEY_AAC_PROFILE,
+                MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 16)
+        }
+
+    // FDK's AAC-LC delay; used only if the loopback below fails
+    private const val FALLBACK_ENC_DELAY = 2048
+    private val delayCache = HashMap<Int, Int>()
+
+    /**
+     * Total delay (frames) between the AAC encoder's input and what a
+     * decoder plays back. MediaMuxer writes no edit list, so players and
+     * ffmpeg play the encoder's priming as content: on the CMF Phone 1
+     * c2.android.aac.encoder put the whole AD track ~46 ms late. Measured
+     * once per rate by a loopback - encode a noise burst, decode it, find
+     * it - so it holds for whatever encoder the phone picks.
+     */
+    private fun encoderDelay(outRate: Int): Int = synchronized(delayCache) {
+        delayCache.getOrPut(outRate) {
+            try {
+                measureEncoderDelay(outRate).also {
+                    android.util.Log.i(TAG, "AAC encoder delay: $it frames")
+                }
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "encoder delay loopback failed " +
+                    "($t) - assuming $FALLBACK_ENC_DELAY frames")
+                FALLBACK_ENC_DELAY
+            }
+        }
+    }
+
+    private fun measureEncoderDelay(outRate: Int): Int {
+        val lead = 8192
+        val burst = 8192
+        val total = lead + burst + 8192
+        val noise = FloatArray(burst)
+        var seed = 12345
+        for (i in 0 until burst) {
+            seed = seed * 1103515245 + 12345
+            noise[i] = ((seed ushr 16) and 0x7fff) / 16384f - 1f
+        }
+        val order = java.nio.ByteOrder.nativeOrder()
+        val inputs = ArrayList<Pair<ByteArray, Long>>()
+        for (f0 in 0 until total step 1024) {
+            val bb = ByteBuffer.allocate(1024 * 2 * OUT_CHANNELS).order(order)
+            for (i in f0 until f0 + 1024) {
+                val v = if (i - lead in 0 until burst)
+                    (noise[i - lead] * 8000).toInt().toShort() else 0
+                repeat(OUT_CHANNELS) { bb.putShort(v) }
+            }
+            inputs += bb.array() to f0 * 1_000_000L / outRate
+        }
+        val packets = ArrayList<Pair<ByteArray, Long>>()
+        var csd: ByteArray? = null
+        val enc = MediaCodec.createEncoderByType(
+            MediaFormat.MIMETYPE_AUDIO_AAC)
+        try {
+            enc.configure(encoderFormat(outRate), null, null,
+                MediaCodec.CONFIGURE_FLAG_ENCODE)
+            enc.start()
+            runCodec(enc, inputs) { b, info ->
+                if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0)
+                    csd = b
+                else packets += b to info.presentationTimeUs
+            }
+        } finally { enc.release() }
+        val df = MediaFormat.createAudioFormat(
+            MediaFormat.MIMETYPE_AUDIO_AAC, outRate, OUT_CHANNELS)
+        df.setByteBuffer("csd-0", ByteBuffer.wrap(csd ?: aacCsd(outRate)))
+        val pcm = java.io.ByteArrayOutputStream()
+        var ch = OUT_CHANNELS
+        val dec = MediaCodec.createDecoderByType(
+            MediaFormat.MIMETYPE_AUDIO_AAC)
+        try {
+            dec.configure(df, null, null, 0)
+            dec.start()
+            runCodec(dec, packets) { b, _ -> pcm.write(b) }
+            ch = dec.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        } finally { dec.release() }
+        val sb = ByteBuffer.wrap(pcm.toByteArray()).order(order)
+            .asShortBuffer()
+        val frames = sb.remaining() / ch
+        if (frames < lead + burst) throw RuntimeException("short loopback")
+        val out = FloatArray(frames) { sb.get(it * ch) / 8000f }
+        val cc = Aligner.crossCorrelate(out, noise,
+            Aligner.nextPow2(frames + burst))
+        val pre = DoubleArray(frames + 1)
+        for (i in 0 until frames)
+            pre[i + 1] = pre[i] + out[i].toDouble() * out[i]
+        var nn = 0.0
+        for (v in noise) nn += v.toDouble() * v
+        var best = -1
+        var bestScore = 0.0
+        for (k in lead..frames - burst) {
+            val sc = cc[k] / (Math.sqrt(nn * (pre[k + burst] - pre[k])) + 1e-9)
+            if (sc > bestScore) { bestScore = sc; best = k }
+        }
+        if (best < 0 || bestScore < 0.5)
+            throw RuntimeException("no loopback match (%.2f)".format(
+                bestScore))
+        return best - lead
+    }
+
+    /** Push [inputs] through a started codec, then EOS; collect output. */
+    private fun runCodec(
+        codec: MediaCodec, inputs: List<Pair<ByteArray, Long>>,
+        onOut: (ByteArray, MediaCodec.BufferInfo) -> Unit
+    ) {
+        val info = MediaCodec.BufferInfo()
+        var next = 0
+        var eosSent = false
+        repeat(20_000) {
+            if (!eosSent) {
+                val idx = codec.dequeueInputBuffer(5_000)
+                if (idx >= 0) {
+                    if (next < inputs.size) {
+                        val (data, pts) = inputs[next++]
+                        codec.getInputBuffer(idx)!!.apply { clear(); put(data) }
+                        codec.queueInputBuffer(idx, 0, data.size, pts, 0)
+                    } else {
+                        codec.queueInputBuffer(idx, 0, 0, 0,
+                            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        eosSent = true
+                    }
+                }
+            }
+            while (true) {
+                val o = codec.dequeueOutputBuffer(info,
+                    if (eosSent) 5_000 else 0)
+                if (o == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                if (o < 0) continue
+                if (info.size > 0) {
+                    val b = ByteArray(info.size)
+                    codec.getOutputBuffer(o)!!.apply {
+                        position(info.offset); get(b)
+                    }
+                    onOut(b, info)
+                }
+                codec.releaseOutputBuffer(o, false)
+                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
+                    return
+            }
+        }
+        throw RuntimeException("codec loopback timed out")
+    }
+
     /**
      * Decode the AD file on a feeder thread, resample/shift on this
      * thread with an incremental position accumulator, AAC-encode, and
@@ -212,18 +362,16 @@ object Patcher {
         var seg = 0
         var finishedEarly = false
         val fadeN = outRate / 100
+        // the encoder's priming plays as content (no edit list): render
+        // from that many frames in, so the decoded audio lands on time
+        val delay = encoderDelay(outRate)
         val encoder = MediaCodec.createEncoderByType(
             MediaFormat.MIMETYPE_AUDIO_AAC)
-        val fmt = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC, outRate, OUT_CHANNELS)
-        fmt.setInteger(MediaFormat.KEY_BIT_RATE, AD_BITRATE)
-        fmt.setInteger(MediaFormat.KEY_AAC_PROFILE,
-            MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-        fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 16)
-        encoder.configure(fmt, null, null,
+        encoder.configure(encoderFormat(outRate), null, null,
             MediaCodec.CONFIGURE_FLAG_ENCODE)
         encoder.start()
-        val sink = EncoderSink(encoder, muxer, muxerLock, track, outRate)
+        val sink = EncoderSink(encoder, muxer, muxerLock, track, outRate,
+            delay)
 
         // feeder: decoder runs concurrently, pushing into a bounded queue
         val sentinel = AudioEngine.PcmChunk(ShortArray(0), 0, 0, -1)
@@ -248,7 +396,7 @@ object Patcher {
         var winStart = 0L
         var winCount = 0
         var inRate = 0
-        var outFrame = 0L
+        var outFrame = delay.toLong()
         var totalIn = 0L
         var inputDone = false
         // incremental resampler state: p = input-frame position of the
@@ -346,7 +494,9 @@ object Patcher {
             if (inRate == 0) {
                 inRate = chunk.sampleRate
                 step = inRate / (outRate * a)
-                p = if (placed.isEmpty()) (-bSec / a) * inRate else -1.0
+                p = if (placed.isEmpty())
+                    ((outFrame.toDouble() / outRate - bSec) / a) * inRate
+                else -1.0
             }
             val frames = chunk.samples.size / chunk.channels
             // input wholly before the first needed position (large trim):
@@ -394,7 +544,8 @@ object Patcher {
         private val muxer: MediaMuxer,
         private val muxerLock: Any,
         private val track: Int,
-        private val outRate: Int
+        private val outRate: Int,
+        private val delay: Int        // frames rendered ahead of pts 0
     ) {
         private val info = MediaCodec.BufferInfo()
         private var finished = false
@@ -411,7 +562,8 @@ object Patcher {
                 buf.clear()
                 buf.asShortBuffer().put(frames, offset * OUT_CHANNELS,
                     n * OUT_CHANNELS)
-                val ptsUs = (firstFrame + offset) * 1_000_000L / outRate
+                val ptsUs = (firstFrame + offset - delay) * 1_000_000L /
+                    outRate
                 encoder.queueInputBuffer(idx, 0, n * 2 * OUT_CHANNELS,
                     ptsUs, 0)
                 offset += n

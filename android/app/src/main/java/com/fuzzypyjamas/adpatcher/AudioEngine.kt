@@ -96,7 +96,9 @@ object AudioEngine {
             }
             if (trackIndex < 0) throw RuntimeException("no audio track found")
             extractor.selectTrack(trackIndex)
-            if (rangeUs != null)
+            // no seek for a range from 0: even seekTo(0) makes the AAC
+            // decoder drop its first frame
+            if (rangeUs != null && rangeUs.first > 0)
                 extractor.seekTo(rangeUs.first,
                     MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             val durationUs =
@@ -203,37 +205,73 @@ object AudioEngine {
     /**
      * Incremental mono-downmix + linear-resample + energy accumulation.
      * One instance per decode stream; feed() consumes PCM chunks and
-     * appends 100 Hz energy values to an internal growth array.
+     * appends 100 Hz energy values to an internal growth array whose
+     * index 0 is global grid frame [firstOutFrame].
      *
-     * [firstOutFrame] anchors the output on the global 100 Hz grid, which
-     * lets parallel range-decodes produce seamlessly mergeable segments:
-     * the input position of output sample s is s * (inRate/SR), aligned
-     * via each chunk's pts rather than a running sample count.
+     * Decoded samples are placed by COUNT from an anchor, not by each
+     * buffer's pts. Measured on a CMF Phone 1 (Android 16) against ffmpeg:
+     * AAC-in-MP4 pts are exact, but the MP3 decoder's first buffer is
+     * short yet stamped as a whole frame, so its pts run 75 ms ahead of
+     * the content (57 ms after a seek), while sample counts match ffmpeg
+     * to the sample. Following pts put ~20 ms of phantom silence into the
+     * AD envelope that Patcher (which counts samples) never reproduced.
+     * The anchor is 0 for a decode from the file start - ffmpeg's timeline
+     * and what Patcher reads - or the first buffer's pts after a seek,
+     * which [onsetEnvelopeParallel] then corrects by matching PCM probes
+     * (kept in [head] / [tail]) and stores as [shift].
      */
-    private class EnvelopeAccumulator(val firstOutFrame: Long) {
+    private class EnvelopeAccumulator(
+        val firstOutFrame: Long,          // grid frame of energies[0]
+        val slotFirst: Long,              // first grid frame this one owns
+        private val anchorOnPts: Boolean,
+        private val headUs: LongRange? = null,  // by count from 1st sample
+        private val tailUs: LongRange? = null   // on the provisional timeline
+    ) {
         var energies = FloatArray(1 shl 16)
         var count = 0
+        var sampleRate = 0
+        var head: FloatArray? = null; var headAt = 0L   // input index of [0]
+        var tail: FloatArray? = null; var tailAt = 0L
+        var shift = 0.0                   // grid frames, set after matching
         private var acc = 0f
         private var accCount = 0
         private var step = 0.0        // input samples per output sample
         private var nextPos = -1.0    // global input-sample position
-        private var globalIn = -1L    // input index of current chunk start
+        private var anchor = 0L       // global input index of first sample
+        private var consumed = 0L
         private var prevLast = 0f
-        private var gapLogged = false
+
+        val inPerFrame get() = step * HOP
+
+        private fun record(dst: FloatArray?, at: Long, mono: FloatArray,
+                           start: Long) {
+            if (dst == null) return
+            val from = max(at, start)
+            val to = minOf(at + dst.size, start + mono.size)
+            for (g in from until to)
+                dst[(g - at).toInt()] = mono[(g - start).toInt()]
+        }
 
         fun feed(chunk: PcmChunk) {
             val n = chunk.samples.size / chunk.channels
             if (n == 0) return
-            if (nextPos < 0) {   // first chunk: anchor on pts
+            if (nextPos < 0) {   // first chunk: fix the timeline
+                sampleRate = chunk.sampleRate
                 step = chunk.sampleRate.toDouble() / SR
-                globalIn = (chunk.ptsUs * chunk.sampleRate / 1e6)
-                    .roundToLong()
-                nextPos = max(firstOutFrame * HOP * step,
-                    globalIn.toDouble())
-            } else {
-                globalIn = (chunk.ptsUs * chunk.sampleRate / 1e6)
-                    .roundToLong()
+                val r = sampleRate / 1e6
+                anchor = if (anchorOnPts)
+                    (chunk.ptsUs * r).roundToLong() else 0L
+                nextPos = firstOutFrame * HOP * step
+                headUs?.let {
+                    headAt = anchor + (it.first * r).roundToLong()
+                    head = FloatArray(((it.last - it.first) * r).toInt())
+                }
+                tailUs?.let {
+                    tailAt = (it.first * r).roundToLong()
+                    tail = FloatArray(((it.last - it.first) * r).toInt())
+                }
             }
+            val globalIn = anchor + consumed
             val ch = chunk.channels
             val scale = 1.0f / (ch * 32768.0f)
             val mono = FloatArray(n)
@@ -243,20 +281,15 @@ object AudioEngine {
                 for (c in 0 until ch) sum += chunk.samples[s++]
                 mono[i] = sum * scale
             }
+            record(head, headAt, mono, globalIn)
+            record(tail, tailAt, mono, globalIn)
             var pos = nextPos
             val limit = globalIn + n - 1
             while (pos < limit) {
                 val i = pos.toLong()
                 val local = (i - globalIn).toInt()
-                // local < -1: this chunk starts later than expected (a
-                // pts gap, e.g. right after a ranged seek) - the missing
-                // stretch is silence; the grid stays pts-anchored
-                if (local < -1 && !gapLogged) {
-                    gapLogged = true
-                    android.util.Log.i(TAG, "envelope: pts gap of " +
-                        "${-local - 1} samples at ${"%.2f".format(
-                            i / chunk.sampleRate.toDouble())}s - silence")
-                }
+                // local < -1 only before the first sample (the grid starts
+                // ahead of where a seek landed): silence
                 val v = if (local < -1) 0f else {
                     val s0 = if (local < 0) prevLast else mono[local]
                     val s1 = mono[local + 1]
@@ -273,7 +306,20 @@ object AudioEngine {
             }
             nextPos = pos
             prevLast = mono[n - 1]
+            consumed += n
         }
+
+        /** Energy at global grid frame [g] after [shift] (linear interp). */
+        fun value(g: Long): Float {
+            val x = (g - firstOutFrame) - shift
+            val i = Math.floor(x).toLong()
+            val f = (x - i).toFloat()
+            fun e(k: Long) = energies[k.coerceIn(0L, count - 1L).toInt()]
+            return e(i) + (e(i + 1) - e(i)) * f
+        }
+
+        /** End (exclusive) of the grid frames this stream can supply. */
+        val end get() = firstOutFrame + count + Math.floor(shift).toLong()
     }
 
     /** Serial envelope of the full stream (fallback / small files). */
@@ -281,7 +327,7 @@ object AudioEngine {
         context: Context, uri: Uri, onProgress: (Float) -> Unit
     ): FloatArray {
         val t0 = android.os.SystemClock.elapsedRealtime()
-        val acc = EnvelopeAccumulator(firstOutFrame = 0)
+        val acc = EnvelopeAccumulator(0, 0, anchorOnPts = false)
         decodeAudio(context, uri, onProgress = onProgress) { acc.feed(it) }
         val env = finishEnvelope(arrayOf(acc))
         android.util.Log.d(TAG, "envelope done: ${env.size} frames " +
@@ -290,11 +336,56 @@ object AudioEngine {
         return env
     }
 
+    // seam matching for ranged decodes (see onsetEnvelopeParallel)
+    private const val PRE_US = 2_000_000L        // decode this much early
+    private val HEAD_US = 250_000L..750_000L     // probe, after warm-up
+    private const val SEARCH_US = 500_000L       // +- seek error tolerated
+    private const val MARGIN = 50                // grid frames kept for shift
+    private const val MIN_PROBE_SCORE = 0.9
+
+    /**
+     * Where does [b]'s head probe sit in [a]'s tail? Returns [b]'s
+     * timeline correction in samples (true minus provisional), given [a]'s
+     * own correction [aDelta], or null if the probe doesn't match (e.g.
+     * digital silence at the seam). Decoders are deterministic after a few
+     * frames, so a real match scores ~1.0 and the lag is sample-exact.
+     */
+    private fun seamDelta(a: EnvelopeAccumulator, b: EnvelopeAccumulator,
+                          aDelta: Long): Long? {
+        val tail = a.tail ?: return null
+        val head = b.head ?: return null
+        if (head.size < 16 || tail.size <= head.size) return null
+        var hh = 0.0
+        for (v in head) hh += v.toDouble() * v
+        if (hh < 1e-8 * head.size) return null
+        val n = Aligner.nextPow2(tail.size + head.size)
+        val cc = Aligner.crossCorrelate(tail, head, n)
+        val pre = DoubleArray(tail.size + 1)
+        for (i in tail.indices)
+            pre[i + 1] = pre[i] + tail[i].toDouble() * tail[i]
+        var best = -1
+        var bestScore = -1.0
+        for (k in 0..tail.size - head.size) {
+            val tt = pre[k + head.size] - pre[k]
+            val sc = cc[k] / (sqrt(hh * tt) + 1e-12)
+            if (sc > bestScore) { bestScore = sc; best = k }
+        }
+        android.util.Log.d(TAG, "seam probe score %.3f".format(bestScore))
+        if (bestScore < MIN_PROBE_SCORE) return null
+        return a.tailAt + best + aDelta - b.headAt
+    }
+
     /**
      * Chunk-parallel envelope: the timeline is split into [workers]
      * ranges, each decoded with its own extractor + codec, and the energy
-     * segments are concatenated on the global 100 Hz grid. Seam cost is at
-     * most one 10 ms frame per boundary - irrelevant to alignment.
+     * segments are concatenated on the global 100 Hz grid.
+     *
+     * A seek can't be trusted to the sample (MP3 pts after a seek were
+     * 57 ms off on the CMF Phone 1), so every range after the first is
+     * decoded from [PRE_US] early, a short PCM probe from its start is
+     * located in the previous range's decoded audio, and the range's
+     * energies are shifted by the difference. The first range never
+     * seeks, so the whole envelope sits on the serial-decode timeline.
      */
     fun onsetEnvelopeParallel(
         context: Context, uri: Uri, workers: Int,
@@ -314,24 +405,38 @@ object AudioEngine {
                     val startUs = durationUs * w / workers
                     val endUs = if (w == workers - 1) Long.MAX_VALUE
                     else durationUs * (w + 1) / workers
-                    val firstFrame =
-                        ceil(startUs * FPS / 1e6).toLong()
-                    val lastFrame = if (endUs == Long.MAX_VALUE)
+                    val slotFirst = ceil(startUs * FPS / 1e6).toLong()
+                    val slotLast = if (endUs == Long.MAX_VALUE)
                         Long.MAX_VALUE
                     else ceil(endUs * FPS / 1e6).toLong()
-                    val acc = EnvelopeAccumulator(firstFrame)
+                    val fromUs = if (w == 0) 0L else max(0L, startUs - PRE_US)
+                    // the next range's head probe, on this range's timeline
+                    val nextFrom = endUs - PRE_US
+                    val acc = EnvelopeAccumulator(
+                        firstOutFrame = if (w == 0) 0L
+                        else max(0L, slotFirst - MARGIN),
+                        slotFirst = slotFirst,
+                        anchorOnPts = w > 0,
+                        headUs = if (w > 0) HEAD_US else null,
+                        tailUs = if (w == workers - 1) null
+                        else (nextFrom + HEAD_US.first - SEARCH_US)..
+                            (nextFrom + HEAD_US.last + SEARCH_US))
                     accs[w] = acc
+                    val stopAt = if (slotLast == Long.MAX_VALUE)
+                        Long.MAX_VALUE
+                    else slotLast - acc.firstOutFrame + MARGIN
+                    // open-ended range: stop by sample count (StopDecode
+                    // below), never by pts - MP3 pts run ahead of the
+                    // content, which ended this range 40 ms short and
+                    // slid every later range early by as much
                     decodeAudio(context, uri,
-                        rangeUs = startUs..(if (endUs == Long.MAX_VALUE)
-                            Long.MAX_VALUE - 1 else endUs)) { chunk ->
+                        rangeUs = fromUs..(Long.MAX_VALUE - 1)) { chunk ->
                         acc.feed(chunk)
                         fractions[w] = if (endUs == Long.MAX_VALUE) 0f
-                        else ((chunk.ptsUs - startUs).toFloat() /
-                                (endUs - startUs)).coerceIn(0f, 1f)
+                        else ((chunk.ptsUs - fromUs).toFloat() /
+                                (endUs - fromUs)).coerceIn(0f, 1f)
                         onProgress(fractions.sum() / workers)
-                        if (lastFrame != Long.MAX_VALUE &&
-                            acc.count >= lastFrame - firstFrame)
-                            throw StopDecode()
+                        if (acc.count >= stopAt) throw StopDecode()
                     }
                     fractions[w] = 1f
                     onProgress(fractions.sum() / workers)
@@ -343,9 +448,19 @@ object AudioEngine {
         threads.forEach { it.join() }
         errors.filterNotNull().firstOrNull()?.let { throw it }
 
-        // trim each segment to its grid slot and concatenate
-        val segs = accs.filterNotNull()
-        val env = finishEnvelope(segs.toTypedArray(), trimToNext = true)
+        val segs = accs.filterNotNull().toTypedArray()
+        var delta = 0L
+        for (w in 1 until segs.size) {
+            delta = seamDelta(segs[w - 1], segs[w], delta) ?: run {
+                android.util.Log.i(TAG, "seam $w: probe didn't match - " +
+                    "trusting the seek's timestamps")
+                0L
+            }
+            segs[w].shift = delta / segs[w].inPerFrame
+            android.util.Log.i(TAG, "seam $w: %+.2f ms".format(
+                delta * 1000.0 / segs[w].sampleRate))
+        }
+        val env = finishEnvelope(segs)
         android.util.Log.d(TAG,
             "parallel envelope ($workers workers): ${env.size} frames in " +
             "${(android.os.SystemClock.elapsedRealtime() - t0) / 1000}s")
@@ -353,26 +468,21 @@ object AudioEngine {
     }
 
     /** Concatenate accumulator segments, then log-diff + z-normalize. */
-    private fun finishEnvelope(
-        accs: Array<EnvelopeAccumulator>, trimToNext: Boolean = false
-    ): FloatArray {
-        var total = 0
-        val takes = IntArray(accs.size)
-        for (i in accs.indices) {
-            takes[i] = if (trimToNext && i < accs.size - 1) {
-                val span = (accs[i + 1].firstOutFrame -
-                        accs[i].firstOutFrame).toInt()
-                minOf(accs[i].count, span)
-            } else accs[i].count
-            total += takes[i]
+    private fun finishEnvelope(accs: Array<EnvelopeAccumulator>): FloatArray {
+        // every range fills its slot exactly (value() holds the edge if a
+        // decode came up short), so later ranges keep their grid place
+        val ends = LongArray(accs.size) { i ->
+            if (i < accs.size - 1) accs[i + 1].slotFirst
+            else max(accs[i].slotFirst, accs[i].end)
         }
+        var total = 0
+        for (i in accs.indices) total += (ends[i] - accs[i].slotFirst).toInt()
         if (total < 2) throw RuntimeException("audio too short")
         val energy = FloatArray(total)
         var off = 0
-        for (i in accs.indices) {
-            System.arraycopy(accs[i].energies, 0, energy, off, takes[i])
-            off += takes[i]
-        }
+        for (i in accs.indices)
+            for (g in accs[i].slotFirst until ends[i])
+                energy[off++] = accs[i].value(g)
 
         val logE = FloatArray(total) {
             log10(energy[it].toDouble() + 1e-9).toFloat()
