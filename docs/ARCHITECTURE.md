@@ -70,8 +70,10 @@ files are detected.
 ### 4. Mux
 
 - **PC (ffmpeg):** `atempo=1/a` (pitch-preserving) unless |a−1| < 5e-5;
-  `adelay` for b>0 or `atrim` for b<0; `-c:v copy`; AD encoded AAC 192k
-  as default track; original audio copied as track 2; subtitles copied
+  `adelay` for b>0 or `atrim` for b<0; `-c:v copy`; AD resampled to
+  48 kHz and encoded AAC 192k as default track (mkv only: started
+  1024/48000 s early to cancel the AAC priming delay that mkv, unlike
+  mp4's edit list, doesn't trim); original audio copied as track 2; subtitles copied
   when the container allows (with automatic retry without them). Output
   MKV.
 - **Android (MediaCodec/MediaMuxer):** video samples copied; original
@@ -101,7 +103,8 @@ start_app.bat    web app launcher
 android/         Kotlin app: AudioEngine (decode+envelope),
                  Aligner (port of fit_alignment), Patcher (MediaMuxer),
                  MainActivity (UI, wake lock, progress)
-docs/            this file + usage guide
+tools/harness.py synthetic accuracy + timing harness (ground truth known)
+docs/            this file + usage guide; docs/plan/ = roadmap
 ```
 
 ## Numbers that matter

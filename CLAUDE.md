@@ -26,11 +26,16 @@ cd android && gradle assembleRelease
 adb install -r app-release.apk
 ```
 
-No test suite. To verify changes, generate synthetic media with a known
-offset/speed (gated-noise wav → video via ffmpeg lavfi color; AD via
-atempo/adelay filters, optionally TTS narration mixed in) and check the
-reported alignment matches ground truth and sync-report residuals are
-~0 ms. An end-to-end web-app test = POST two files to /api/patch, poll
+No unit tests. Verify changes with the synthetic harness (exact ground
+truth, checks the output file itself, exit 1 on failure):
+
+```
+.venv\Scripts\python tools\harness.py [--minutes 10] [--cases pal,ntsc] [--container mp4]
+```
+
+Never build truth with `atempo` (adds 5-20 ms WSOLA latency) or
+non-integer `asetrate` (rounds) — the harness uses 23976<->25000 Hz
+relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end web-app test = POST two files to /api/patch, poll
 /api/jobs/<id>, GET download.
 
 ## Architecture (adpatch.py, single file)

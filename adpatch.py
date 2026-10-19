@@ -36,6 +36,8 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import numpy as np
 import imageio_ffmpeg
@@ -52,6 +54,9 @@ FPS = SR / HOP         # envelope frame rate: 100 Hz
 MIN_SEGMENT_SCORE = 0.15   # normalized correlation below this = no match
 NEGLIGIBLE_DRIFT = 5e-5    # |a-1| below this: skip atempo (~0.4s over 2h)
 WEAK_SCORE = 0.12          # per-segment "weak match" flag in the report
+
+AD_RATE = 48000            # sample rate of the encoded AD track
+AAC_PRIMING = 1024         # encoder delay of ffmpeg's aac, in samples
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv",
               ".flv", ".ts", ".mpg", ".mpeg", ".vob", ".3gp"}
@@ -108,6 +113,13 @@ def onset_envelope(path):
            "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
+    # Drain stderr concurrently: if ffmpeg writes more warnings than the
+    # pipe buffer holds (~4 KB on Windows) while we block on stdout, both
+    # processes wait on each other forever.
+    err_chunks = []
+    err_thread = threading.Thread(
+        target=lambda: err_chunks.append(proc.stderr.read()), daemon=True)
+    err_thread.start()
     energies = []
     leftover = b""
     bytes_per_read = 4 * SR * 60
@@ -121,7 +133,8 @@ def onset_envelope(path):
             x = np.frombuffer(buf[:usable], dtype=np.float32)
             energies.append((x.reshape(-1, HOP) ** 2).sum(axis=1))
         leftover = buf[usable:]
-    err = proc.stderr.read().decode(errors="replace")
+    err_thread.join()
+    err = b"".join(err_chunks).decode(errors="replace")
     if proc.wait() != 0:
         raise RuntimeError(f"ffmpeg failed decoding {path}:\n{err}")
     if not energies:
@@ -322,10 +335,16 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs):
     default audio; the original audio is copied as track 2 unless
     `replace`.
     """
-    filters = []
+    # Fixed output rate: keeps the AAC priming delay known (see below).
+    filters = [f"aresample={AD_RATE}"]
     if abs(a - 1.0) > NEGLIGIBLE_DRIFT:
         # content at ad_time t must land at a*t, so play at rate 1/a
         filters.append(f"atempo={1.0 / a:.8f}")
+    if os.path.splitext(output)[1].lower() == ".mkv":
+        # The AAC encoder prepends 1024 priming samples; mp4 trims them
+        # via an edit list, mkv doesn't - so the track would play ~21 ms
+        # late. Start the AD that much earlier to cancel it.
+        b_sec -= AAC_PRIMING / AD_RATE
     if b_sec >= 0:
         delay_ms = int(round(b_sec * 1000))
         if delay_ms:
@@ -367,6 +386,8 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
         weak        number of report rows below the weak-match threshold
         suspect     True if most segments matched poorly (probably a
                     different cut / extended audio description)
+        timings     {phase: seconds} for video_env, ad_env, align, mux,
+                    total
     Raises ValueError / RuntimeError with a user-readable message on
     failure.
     """
@@ -378,18 +399,30 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
     if os.path.splitext(output)[1].lower() not in (".mkv", ".mp4", ".m4v"):
         output += ".mkv"
 
+    timings = {}
+    t_start = clock = time.perf_counter()
+
+    def lap(phase):
+        nonlocal clock
+        now = time.perf_counter()
+        timings[phase] = now - clock
+        clock = now
+
     log(f"video: {os.path.basename(video)}")
     log(f"AD audio: {os.path.basename(ad_audio)}")
 
     log("analyzing video audio...")
     vid_env = onset_envelope(video)
     log(f"  {len(vid_env) / FPS / 60:.1f} min")
+    lap("video_env")
     log("analyzing AD audio...")
     ad_env = onset_envelope(ad_audio)
     log(f"  {len(ad_env) / FPS / 60:.1f} min")
+    lap("ad_env")
 
     log("aligning...")
     a, b_sec, report = fit_alignment(ad_env, vid_env, log=log)
+    lap("align")
 
     drift_ppm = (a - 1.0) * 1e6
     log(f"  offset: {b_sec:+.3f}s   speed factor: {a:.6f} "
@@ -426,12 +459,19 @@ def patch(input_a, input_b, output=None, replace=False, log=print):
                            capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         raise RuntimeError(f"muxing failed:\n{r.stderr}")
+    lap("mux")
+    timings["total"] = time.perf_counter() - t_start
 
     log(f"done: {output} ({os.path.getsize(output) / 1e6:.0f} MB)")
+    mb = os.path.getsize(video) / 1e6
+    log(f"timings: video-env {timings['video_env']:.1f}s "
+        f"({mb / max(timings['video_env'], 1e-9):.0f} MB/s) | "
+        f"ad-env {timings['ad_env']:.1f}s | align {timings['align']:.1f}s | "
+        f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s")
     log("AD track is the default audio; original audio kept as track 2."
         if not replace else "original audio replaced with AD track.")
     return {"output": output, "a": a, "b": b_sec, "report": report,
-            "weak": weak, "suspect": suspect}
+            "weak": weak, "suspect": suspect, "timings": timings}
 
 
 def main():
