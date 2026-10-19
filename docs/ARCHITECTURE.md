@@ -67,7 +67,26 @@ to the user: it is direct evidence the alignment holds across the whole
 movie, and its failure mode (most segments weak) is how wrong-cut AD
 files are detected.
 
-### 4. Mux
+### 4. Confidence
+
+`confidence()` (mirrored in `Aligner.confidence()`) folds the fit's
+evidence into one 0..1 score — a weighted *product*, so one bad factor
+sinks it:
+
+| signal | from | factor → 1 at | weight |
+|---|---|---|---|
+| `peak` | stage-1 best normalized correlation | ≥ 0.18 | 0.25 |
+| `peak_ratio` | best peak ÷ best peak ≥ 2 s away | ≥ 1.65 | 0.15 |
+| `coverage` | share of segments scoring > 0.15 | 1.0 | 0.3 |
+| `resid_p95_ms` | 95th pct. \|residual\| of fitted segments | ≤ 40 ms (0 at 200) | 0.2 |
+| `dur_ratio` | video length ÷ (a × AD length) | within ±3 % | 0.1 |
+
+Bands: good ≥ 0.75, check ≥ 0.45, else likely wrong. Calibrated on the
+synthetic harness (correct pairs 0.97–1.0, a 40 s scene cut 0.67,
+unrelated audio 0.0) — **not yet on real movies**; revisit the
+breakpoints once real pairs have been measured.
+
+### 5. Mux
 
 - **PC (ffmpeg):** `atempo=1/a` (pitch-preserving) unless |a−1| < 5e-5;
   `adelay` for b>0 or `atrim` for b<0; `-c:v copy`; AD resampled to

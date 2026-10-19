@@ -117,6 +117,7 @@ object JobRunner {
 
         thread(name = "adpatch-job") {
             try {
+                var verdict: String? = null   // null when resumed (no fit)
                 val a: Double
                 val b: Double
                 if (resumeA != null && resumeB != null) {
@@ -167,9 +168,15 @@ object JobRunner {
                                 if (cp.score <= Aligner.WEAK_SCORE)
                                     "  (weak)" else ""))
                     }
-                    if (result.suspect)
+                    if (result.suspect && result.warnings.isEmpty())
                         log("⚠ most segments matched poorly - the AD " +
                             "file may be for a different cut!")
+                    verdict = when (result.band) {
+                        "good" -> "in sync ✔"
+                        "check" -> "check sync ⚠"
+                        else -> "likely out of sync ✖"
+                    } + " (confidence %d%%)".format(
+                        (result.confidence * 100).toInt())
                     // checkpoint: from here a resume can skip to muxing
                     JobStore.saveAlignment(app, a, b)
                 }
@@ -181,7 +188,8 @@ object JobRunner {
                 }
 
                 barProgress = 1000
-                stageBase = "done ✅ saved as new file"
+                stageBase = "done ✅ saved as new file" +
+                    (verdict?.let { " - $it" } ?: "")
                 stageDetail = ""
                 status = Status.DONE
                 JobStore.markComplete(app)

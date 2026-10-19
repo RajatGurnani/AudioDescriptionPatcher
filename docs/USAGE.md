@@ -78,11 +78,31 @@ Every run prints one line per checked segment:
 - residual (`+1 ms`) — how far that segment is from the fitted alignment.
   Single-digit milliseconds = tight sync.
 
-One or two weak rows (usually the credits) are harmless. If **most** rows
-are weak, the tool says so — the AD file likely belongs to a different
-cut (director's cut, different regional release, or an "extended audio
-description" that pauses the video). The output will still be written,
-but listen before keeping it.
+One or two weak rows (usually the credits) are harmless.
+
+Above the rows sits one verdict — `confidence 0.93 (good)` — plus plain
+warnings when something's off:
+
+| Verdict | Meaning |
+|---|---|
+| **good** (≥ 0.75) | in sync across the movie; just watch it |
+| **check** (0.45–0.75) | probably mostly right — spot-check the warned part |
+| **likely wrong** (< 0.45) | don't trust the output |
+
+Warnings name the cause: files that don't share a soundtrack (wrong AD
+file), a different edit of the movie (scenes added/removed), extended
+audio description (pauses the video — can't be fixed by shifting),
+repetitive audio (offset could be off by a loop), or sync wobble.
+The output is always written; the verdict tells you whether to keep it.
+
+**Seeing it:** the web app shows the verdict as a coloured badge with a
+*drift chart* (one dot per 30 s segment; dots inside the green ±50 ms
+band are in sync — a step means a cut, a slope means drift) and, under
+"Show waveform match", the video's audio onsets above the aligned AD's
+below: peaks should line up (drag to zoom). On the CLI, `--report` writes
+`<output>.sync.svg` (the same two charts, opens in any browser) and
+`<output>.sync.json` (all numbers). The Android app shows the verdict in
+the final status line and the full report in Logs.
 
 ## Troubleshooting
 

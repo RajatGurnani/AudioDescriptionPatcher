@@ -1,5 +1,13 @@
 # 03 — Confidence score + structured sync report (Iteration 3, v0.6.0)
 
+> **Outcome (2026-10-19):** done as planned, with breakpoints re-tuned
+> on the harness (peak → 1 at 0.18, uniqueness at 1.65, duration band
+> ±3 %; see ARCHITECTURE.md §4). `speed_margin` and `inlier_frac` are
+> reported but not scored. Harness gained `hard` (remixed + loud
+> narration → good) and `cut` (40 s scene cut → check + "different
+> edit" warning) cases. Android ported (compiles; not yet run on the
+> phone). Report files are opt-in (`--report`).
+
 ## Today
 
 `fit_alignment()` returns `report = [(ad_sec, video_sec, score,

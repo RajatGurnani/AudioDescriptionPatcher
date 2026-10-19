@@ -35,7 +35,12 @@ import adpatch  # noqa: E402
 GEN_SR = 16000
 PAL = 25 / 23.976
 
-# name -> (ffmpeg filter on the soundtrack, a_true, b_true, narration)
+# name -> (ffmpeg filter graph on the soundtrack, a_true, b_true,
+#          narration gain (0 = none), expectation)
+# expectation: "align" = must hit the accuracy limits and band "good";
+# "flag" = can't be aligned by a linear map, must NOT be reported "good"
+# (until piecewise alignment, iteration 4); "suspect" = unrelated audio,
+# must be flagged suspect / "likely wrong".
 # Ground truth follows adpatch's model: video_time = a * ad_time + b.
 # Speed changes use asetrate+aresample (sample-exact, pitch shifts - like
 # a real PAL speedup), not atempo, whose WSOLA latency shifts content by
@@ -44,15 +49,22 @@ PAL = 25 / 23.976
 # relabel as 25000 Hz: an exact 25/23.976 ratio.
 SPEEDUP = f"aresample=23976,asetrate=25000,aresample={GEN_SR}"
 SLOWDOWN = f"aresample=25000,asetrate=23976,aresample={GEN_SR}"
+PAL_TRIM = f"{SPEEDUP},atrim=start=2,asetpts=PTS-STARTPTS"
 CASES = {
-    "offset_pos": ("adelay=4000:all=1", 1.0, -4.0, False),
-    "offset_neg": ("atrim=start=3.5,asetpts=PTS-STARTPTS", 1.0, 3.5, False),
-    "pal": (f"{SPEEDUP},atrim=start=2,asetpts=PTS-STARTPTS",
-            PAL, 2 * PAL, False),
-    "ntsc": (SLOWDOWN, 1 / PAL, 0.0, False),
-    "narration": (f"{SPEEDUP},atrim=start=2,asetpts=PTS-STARTPTS",
-                  PAL, 2 * PAL, True),
-    "wrong": (None, None, None, False),   # unrelated soundtrack
+    "offset_pos": ("adelay=4000:all=1", 1.0, -4.0, 0, "align"),
+    "offset_neg": ("atrim=start=3.5,asetpts=PTS-STARTPTS", 1.0, 3.5, 0,
+                   "align"),
+    "pal": (PAL_TRIM, PAL, 2 * PAL, 0, "align"),
+    "ntsc": (SLOWDOWN, 1 / PAL, 0.0, 0, "align"),
+    "narration": (PAL_TRIM, PAL, 2 * PAL, 1.0, "align"),
+    # remixed release: band-limited soundtrack, loud narration on top
+    "hard": (PAL_TRIM + ",highpass=f=250,lowpass=f=3500,volume=0.6",
+             PAL, 2 * PAL, 3.0, "align"),
+    # different edit: a 40 s scene missing from the AD at 5:00
+    "cut": ("asplit[p][q];[p]atrim=0:300,asetpts=PTS-STARTPTS[x];"
+            "[q]atrim=start=340,asetpts=PTS-STARTPTS[y];"
+            "[x][y]concat=n=2:v=0:a=1", 1.0, 0.0, 0, "flag"),
+    "wrong": (None, None, None, 0, "suspect"),   # unrelated soundtrack
 }
 
 MAX_DA_PPM = 20
@@ -151,8 +163,8 @@ def prepare(work, minutes, realistic=False):
                  "-i", src, "-shortest", "-c:v", "libx264", "-preset",
                  "ultrafast", "-c:a", "pcm_s16le", video])
     ads = {}
-    for name, (filt, _, _, narr) in CASES.items():
-        ad = os.path.join(work, f"ad3_{name}_{tag}.mp3")
+    for name, (filt, _, _, narr, _) in CASES.items():
+        ad = os.path.join(work, f"ad4_{name}_{tag}.mp3")
         ads[name] = ad
         if os.path.exists(ad):
             continue
@@ -162,15 +174,17 @@ def prepare(work, minutes, realistic=False):
             continue
         if narr:
             nar = os.path.join(work, f"narration_{tag}.wav")
-            write_wav(nar, narration(1, minutes * 60 * 1.1))
+            if not os.path.exists(nar):
+                write_wav(nar, narration(1, minutes * 60 * 1.1))
             run([adpatch.FFMPEG, "-y", "-v", "error", "-i", src, "-i", nar,
                  "-filter_complex",
-                 f"[0:a]{filt}[s];[s][1:a]amix=inputs=2:duration=first:"
-                 "normalize=0",
-                 "-c:a", "libmp3lame", "-b:a", "128k", ad])
+                 f"[0:a]{filt}[s];[1:a]volume={narr}[n];"
+                 "[s][n]amix=inputs=2:duration=first:normalize=0[o]",
+                 "-map", "[o]", "-c:a", "libmp3lame", "-b:a", "128k", ad])
         else:
             run([adpatch.FFMPEG, "-y", "-v", "error", "-i", src,
-                 "-af", filt, "-c:a", "libmp3lame", "-b:a", "128k", ad])
+                 "-filter_complex", f"[0:a]{filt}[o]", "-map", "[o]",
+                 "-c:a", "libmp3lame", "-b:a", "128k", ad])
     return src, video, ads
 
 
@@ -224,9 +238,9 @@ def main():
 
     results, failed = [], False
     print(f"\n{'case':<11} {'da ppm':>8} {'db ms':>8} {'lag max':>8} "
-          f"{'conf/susp':>9}  {'analyze (v/a)':>17} {'align':>6} {'mux':>6}  ok")
+          f"{'conf band':>10}  {'analyze (v/a)':>17} {'align':>6} {'mux':>6}  ok")
     for name in args.cases.split(","):
-        _, a_true, b_true, _ = CASES[name]
+        _, a_true, b_true, _, expect = CASES[name]
         out = os.path.join(args.workdir, f"out_{name}.{args.container}")
         log = []
         res = adpatch.patch(video, ads[name], output=out,
@@ -236,8 +250,13 @@ def main():
         row = {"case": name, "a": res["a"], "b": res["b"],
                "suspect": res["suspect"], "weak": res["weak"],
                "timings": t}
-        if a_true is None:
-            ok = res["suspect"]
+        row.update(confidence=res["confidence"], band=res["band"],
+                   warnings=res["warnings"], signals=res["signals"])
+        if expect == "suspect":
+            ok = res["suspect"] and res["band"] == "likely wrong"
+            da = db = lag_max = None
+        elif expect == "flag":
+            ok = res["band"] != "good" and bool(res["warnings"])
             da = db = lag_max = None
         else:
             da = (res["a"] - a_true) * 1e6
@@ -246,7 +265,8 @@ def main():
             lag_max = max((abs(x) for x in lags), default=float("inf"))
             row.update(da_ppm=da, db_ms=db, lags_ms=lags)
             ok = (abs(da) < MAX_DA_PPM and abs(db) < MAX_DB_MS
-                  and lag_max <= MAX_LAG_MS and len(lags) >= 5)
+                  and lag_max <= MAX_LAG_MS and len(lags) >= 5
+                  and res["band"] == "good")
         row["ok"] = ok = bool(ok)
         row["suspect"] = bool(res["suspect"])
         failed |= not ok
@@ -254,7 +274,7 @@ def main():
 
         fmt = lambda v, f: "-" if v is None else format(v, f)  # noqa: E731
         print(f"{name:<11} {fmt(da, '+8.1f')} {fmt(db, '+8.1f')} "
-              f"{fmt(lag_max, '8.1f')} {str(res['suspect']):>9}  "
+              f"{fmt(lag_max, '8.1f')} {res['confidence']:4.2f}{res['band'][0]:>5}  "
               f"{t['analyze']:5.1f} ({t['video_env']:4.1f}/{t['ad_env']:<4.1f}) "
               f"{t['align']:6.2f} {t['mux']:6.2f}  "
               f"{'PASS' if ok else 'FAIL'}")

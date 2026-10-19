@@ -1,6 +1,6 @@
 # Roadmap: v0.4 → v1.0 (PC engine + web/desktop app)
 
-Status: iterations **0, 1, 2 done** (2026-10-19); 3+ pending. Results
+Status: iterations **0–3 done** (2026-10-19); 4+ pending. Results
 per iteration in [BENCHMARKS.md](../BENCHMARKS.md). Written
 2026-10-19 after a review of the feature wishlist (GPU, desktop app,
 track editing, size limits, torrents, AudioVault, waveforms, speed).

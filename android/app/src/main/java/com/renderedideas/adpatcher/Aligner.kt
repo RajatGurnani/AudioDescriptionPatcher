@@ -35,9 +35,18 @@ object Aligner {
         val score: Float, val residualMs: Double
     )
 
+    /** Evidence behind the confidence score - same fields and meaning
+     *  as adpatch.py's fit_alignment() `signals`. */
+    data class Signals(
+        val peak: Double, val peakRatio: Double, val coverage: Double,
+        val residP95Ms: Double, val durRatio: Double
+    )
+
     data class Result(
         val a: Double, val bSec: Double,
-        val report: List<CheckPoint>, val suspect: Boolean
+        val report: List<CheckPoint>, val suspect: Boolean,
+        val confidence: Double, val band: String,
+        val warnings: List<String>, val signals: Signals
     )
 
     // ---------------------------------------------------------------- FFT
@@ -123,6 +132,7 @@ object Aligner {
      */
     private fun speedScan(
         ad: FloatArray, vid: FloatArray, factors: DoubleArray,
+        scores: MutableList<Pair<Double, Float>>? = null,
         onProgress: (Float) -> Unit
     ): ScanResult {
         val maxLen = ceil(ad.size * factors.max()).toInt()
@@ -160,7 +170,65 @@ object Aligner {
         threads.forEach { it.join() }
         if (AudioEngine.cancelRequested)
             throw RuntimeException("cancelled")
+        results.filterNotNull().forEach { scores?.add(it.factor to it.score) }
         return results.filterNotNull().maxByOrNull { it.score }!!
+    }
+
+    /** Uniqueness of the global peak at [factor]: best peak / best peak
+     *  more than [exclude] frames away (adpatch.py `_peak_ratio`). */
+    private fun peakRatio(ad: FloatArray, vid: FloatArray, factor: Double,
+                          exclude: Int): Double {
+        val stretched = stretch(ad, factor)
+        val n = nextPow2(vid.size + stretched.size)
+        val cc = crossCorrelate(null, stretched, n, fftOf(vid, n))
+        var k = 0
+        for (j in cc.indices) if (cc[j] > cc[k]) k = j
+        var second = Float.NEGATIVE_INFINITY
+        for (j in cc.indices) {
+            val d = minOf(abs(j - k), n - abs(j - k))   // circular
+            if (d > exclude && cc[j] > second) second = cc[j]
+        }
+        return if (second > 0) minOf(10.0, (cc[k] / second).toDouble())
+        else 10.0
+    }
+
+    private fun clamp01(x: Double) = x.coerceIn(0.0, 1.0)
+
+    /** Overall confidence + band + warnings - verbatim port of
+     *  adpatch.py confidence(); keep the two in sync. */
+    fun confidence(s: Signals): Triple<Double, String, List<String>> {
+        val cPeak = clamp01((s.peak - 0.03) / 0.15)
+        val cUnique = clamp01((s.peakRatio - 1.05) / 0.6)
+        val cCover = s.coverage
+        val cResid = clamp01(1 - (s.residP95Ms - 40) / 160)
+        val cDur = clamp01(1 - (abs(s.durRatio - 1) - 0.03) / 0.12)
+        val score = Math.pow(cPeak, 0.25) * Math.pow(cUnique, 0.15) *
+            Math.pow(cCover, 0.3) * Math.pow(cResid, 0.2) *
+            Math.pow(cDur, 0.1)
+        val band = when {
+            score >= 0.75 -> "good"
+            score >= 0.45 -> "check"
+            else -> "likely wrong"
+        }
+        val w = ArrayList<String>()
+        if (s.peak < 0.04 || s.coverage < 0.15)
+            w.add("These files don't seem to share a soundtrack - is " +
+                "this the AD file for this video?")
+        else if (s.coverage < 0.3 && s.durRatio < 0.95)
+            w.add("The AD file is much longer than the video and matches " +
+                "poorly: probably extended audio description (pauses " +
+                "the video), which a time shift can't fix.")
+        else if (abs(s.durRatio - 1) > 0.03 && s.coverage < 0.7)
+            w.add("The AD file looks like a different edit of the movie " +
+                "(lengths differ and parts don't match). Some scenes may " +
+                "be out of sync.")
+        if (s.peakRatio < 1.2 && s.coverage >= 0.3)
+            w.add("Repetitive audio: the offset could be wrong by a whole " +
+                "repeat - spot-check the start.")
+        if (s.residP95Ms > 120 && s.coverage >= 0.3)
+            w.add("Sync wobbles by up to %.0f ms in places."
+                .format(s.residP95Ms))
+        return Triple(Math.round(score * 1000) / 1000.0, band, w)
     }
 
     // ------------------------------------------------------------ stage 2
@@ -241,10 +309,12 @@ object Aligner {
         val ad20 = pool(adEnv, poolF)
         val vid20 = pool(vidEnv, poolF)
         val coarse = DoubleArray(51) { 0.95 + it * 0.002 }
-        var a = speedScan(ad20, vid20, coarse) { onProgress(it * 0.6f) }
-            .factor
+        val coarseScores = ArrayList<Pair<Double, Float>>()
+        var a = speedScan(ad20, vid20, coarse, coarseScores) {
+            onProgress(it * 0.6f)
+        }.factor
         val fine = DoubleArray(21) { a - 0.002 + it * 0.0002 }
-        var scan = speedScan(ad20, vid20, fine) {
+        var scan = speedScan(ad20, vid20, fine, null) {
             onProgress(0.6f + it * 0.3f)
         }
         a = scan.factor
@@ -257,7 +327,8 @@ object Aligner {
             25.0 / 24, 24.0 / 25, 23.976 / 24, 24 / 23.976)
         for (special in specials) {
             if (abs(special - a) < 0.003 && abs(special - a) > 1e-9) {
-                val s = speedScan(ad20, vid20, doubleArrayOf(special)) {}
+                val s = speedScan(ad20, vid20, doubleArrayOf(special),
+                    null) {}
                 if (s.score >= 0.98f * scan.score) {
                     log("snapped speed %.6f -> %.6f".format(a, special))
                     scan = s; a = s.factor
@@ -319,6 +390,7 @@ object Aligner {
             "a2=$a2 b2=$b2")
         val finalA = a0 * a2
         val finalB = b2
+        val used = confident.map { it.u }.toSet()
         var weak = 0
         val report = matches.map { m ->
             val residMs = (m.vpos - (a2 * m.u + b2)) / fps * 1000
@@ -327,7 +399,27 @@ object Aligner {
             CheckPoint(centerAd / fps,
                 (finalA * centerAd + finalB) / fps, m.score, residMs)
         }
+        val nConfident = matches.count { it.score > MIN_SEGMENT_SCORE }
+        val residUsed = matches.filter { it.u in used }
+            .map { abs((it.vpos - (a2 * it.u + b2)) / fps * 1000) }.sorted()
+        val signals = Signals(
+            peak = scan.score.toDouble(),
+            peakRatio = peakRatio(ad20, vid20, a0, (2 * fps / poolF).toInt()),
+            coverage = nConfident.toDouble() / max(1, matches.size),
+            // numpy percentile(95) uses linear interpolation; match it
+            residP95Ms = if (residUsed.isEmpty()) 1000.0 else {
+                val pos = 0.95 * (residUsed.size - 1)
+                val lo = floor(pos).toInt()
+                val hi = min(lo + 1, residUsed.size - 1)
+                residUsed[lo] + (residUsed[hi] - residUsed[lo]) * (pos - lo)
+            },
+            durRatio = vidEnv.size / max(1.0, finalA * adEnv.size))
+        val (conf, band, warnings) = confidence(signals)
+        log("confidence %.2f (%s)".format(conf, band))
+        warnings.forEach { log("⚠ $it") }
         return Result(finalA, finalB / fps, report,
-            suspect = weak > matches.size / 2)
+            suspect = weak > matches.size / 2 || band == "likely wrong",
+            confidence = conf, band = band, warnings = warnings,
+            signals = signals)
     }
 }

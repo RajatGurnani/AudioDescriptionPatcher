@@ -34,6 +34,7 @@ the video itself. Such files are detected and reported as weak matches.
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -293,13 +294,14 @@ def _stretch(env, factor):
                      np.arange(len(env)), env).astype(np.float32)
 
 
-def _speed_scan(ad_env, vid_env, factors):
+def _speed_scan(ad_env, vid_env, factors, scores=None):
     """Try each candidate speed factor: stretch the AD envelope, FFT
     cross-correlate against the video envelope, and score the peak.
 
     The correct factor lines up onsets across the WHOLE runtime, producing
     a far sharper global peak than any wrong factor. Returns
-    (best_factor, best_lag_frames, best_score).
+    (best_factor, best_lag_frames, best_score); every (factor, score) is
+    appended to `scores` if given.
     """
     vid_norm = np.linalg.norm(vid_env)
     best = (-1.0, 1.0, 0)
@@ -311,9 +313,26 @@ def _speed_scan(ad_env, vid_env, factors):
         k = int(np.argmax(cc))
         score = cc[k] / (vid_norm * np.linalg.norm(stretched) + 1e-9)
         lag = k - n if k > n // 2 else k   # wrap negative lags
+        if scores is not None:
+            scores.append((f, score))
         if score > best[0]:
             best = (score, f, lag)
     return best[1], best[2], best[0]
+
+
+def _peak_ratio(ad_env, vid_env, factor, exclude):
+    """Uniqueness of the global correlation peak at `factor`: best peak /
+    best peak more than `exclude` frames away. ~1 means another offset
+    fits about as well (repetitive audio, e.g. a looping score)."""
+    stretched = _stretch(ad_env, factor)
+    n = 1 << int(np.ceil(np.log2(len(stretched) + len(vid_env))))
+    cc = np.fft.irfft(np.fft.rfft(vid_env, n) *
+                      np.conj(np.fft.rfft(stretched, n)), n)
+    k = int(np.argmax(cc))
+    idx = np.arange(n)
+    dist = np.minimum(np.abs(idx - k), n - np.abs(idx - k))   # circular
+    second = cc[dist > exclude].max()
+    return float(min(10.0, cc[k] / second)) if second > 0 else 10.0
 
 
 def segment_match(ad_env, vid_env, seg_start, seg_len, expected_vpos,
@@ -359,14 +378,16 @@ def fit_alignment(ad_env, vid_env, log=print):
     matched position), dropping outliers. This tightens a and b to
     millisecond-level residuals.
 
-    Returns (a, b_seconds, report) where report rows are
-    (ad_seconds, video_seconds, score, residual_ms) per checked segment.
+    Returns (a, b_seconds, report, signals): report rows are
+    (ad_seconds, video_seconds, score, residual_ms, used) per checked
+    segment (`used` = kept in the final fit); signals feed confidence().
     """
     # Stage 1: coarse-to-fine speed scan on pooled (20 Hz) envelopes.
     pool = 5
     ad20, vid20 = _pool(ad_env, pool), _pool(vid_env, pool)
     coarse_grid = np.arange(0.95, 1.0501, 0.002)
-    a, _, _ = _speed_scan(ad20, vid20, coarse_grid)
+    coarse_scores = []
+    a, _, _ = _speed_scan(ad20, vid20, coarse_grid, coarse_scores)
     fine_grid = np.arange(a - 0.002, a + 0.00201, 0.0002)
     a, lag20, peak = _speed_scan(ad20, vid20, fine_grid)
 
@@ -429,13 +450,77 @@ def fit_alignment(ad_env, vid_env, log=print):
             "coarse global alignment")
 
     a, b = a0 * a2, b2
+    used = {g[0] for g in confident}
     report = []
     for u, y, score in matches:
         residual_ms = (y - (a2 * u + b2)) / FPS * 1000
         center_ad = (u + seg_len // 2) / a0
         report.append((center_ad / FPS, (a * center_ad + b) / FPS,
-                       score, residual_ms))
-    return float(a), float(b / FPS), report
+                       score, residual_ms, u in used))
+
+    # Evidence for confidence(): how decisive, unique and consistent the
+    # fit is (all from numbers computed above, plus one extra FFT).
+    best_coarse = max(sc for _, sc in coarse_scores)
+    far = [sc for f, sc in coarse_scores if abs(f - a0) >= 0.004]
+    resid_used = [abs(r[3]) for r in report if r[4]]
+    signals = {
+        "peak": float(peak),
+        "peak_ratio": _peak_ratio(ad20, vid20, a0, exclude=2 * FPS / pool),
+        "speed_margin": float((best_coarse - max(far)) / best_coarse)
+        if far and best_coarse > 0 else 0.0,
+        "coverage": len([m for m in matches if m[2] > MIN_SEGMENT_SCORE])
+        / max(1, len(matches)),
+        "inlier_frac": len(used) / max(1, len(
+            [m for m in matches if m[2] > MIN_SEGMENT_SCORE])),
+        "resid_p95_ms": float(np.percentile(resid_used, 95))
+        if resid_used else 1000.0,
+        "dur_ratio": float(len(vid_env) / max(1.0, a * len(ad_env))),
+    }
+    return float(a), float(b / FPS), report, signals
+
+
+def _clamp01(x):
+    return float(min(1.0, max(0.0, x)))
+
+
+def confidence(sig):
+    """Overall confidence 0..1 + band + human-readable warnings.
+
+    Weighted product, so one catastrophic factor sinks the score. Factor
+    list inspired by ADSync's align/confidence.py (MIT; see
+    docs/plan/THIRD_PARTY.md); breakpoints tuned on tools/harness.py -
+    see docs/plan/03-confidence-report.md.
+    """
+    c_peak = _clamp01((sig["peak"] - 0.03) / 0.15)
+    c_unique = _clamp01((sig["peak_ratio"] - 1.05) / 0.6)
+    c_cover = sig["coverage"]
+    c_resid = _clamp01(1 - (sig["resid_p95_ms"] - 40) / 160)
+    c_dur = _clamp01(1 - (abs(sig["dur_ratio"] - 1) - 0.03) / 0.12)
+    score = (c_peak ** 0.25 * c_unique ** 0.15 * c_cover ** 0.3 *
+             c_resid ** 0.2 * c_dur ** 0.1)
+    band = ("good" if score >= 0.75 else
+            "check" if score >= 0.45 else "likely wrong")
+
+    warnings = []
+    if sig["peak"] < 0.04 or sig["coverage"] < 0.15:
+        warnings.append("These files don't seem to share a soundtrack - "
+                        "is this the AD file for this video?")
+    elif sig["coverage"] < 0.3 and sig["dur_ratio"] < 0.95:
+        warnings.append("The AD file is much longer than the video and "
+                        "matches poorly: probably extended audio "
+                        "description (pauses the video), which a time "
+                        "shift can't fix.")
+    elif abs(sig["dur_ratio"] - 1) > 0.03 and sig["coverage"] < 0.7:
+        warnings.append("The AD file looks like a different edit of the "
+                        "movie (lengths differ and parts don't match). "
+                        "Some scenes may be out of sync.")
+    if sig["peak_ratio"] < 1.2 and sig["coverage"] >= 0.3:
+        warnings.append("Repetitive audio: the offset could be wrong by a "
+                        "whole repeat - spot-check the start.")
+    if sig["resid_p95_ms"] > 120 and sig["coverage"] >= 0.3:
+        warnings.append(f"Sync wobbles by up to "
+                        f"{sig['resid_p95_ms']:.0f} ms in places.")
+    return round(score, 3), band, warnings
 
 
 # --------------------------------------------------------------------------
@@ -509,25 +594,122 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, replace, with_subs,
 
 
 # --------------------------------------------------------------------------
+# Sync report: data for plots, JSON + standalone SVG
+# --------------------------------------------------------------------------
+
+PLOT_HZ = 10   # envelope overview resolution sent to the UI / drawn in SVG
+
+
+def plot_data(vid_env, ad_env, a, b_sec, hz=PLOT_HZ):
+    """Video envelope and the *aligned* AD envelope on the video timeline,
+    max-pooled to `hz` and clipped at 0 (onsets only) - for eyeballing
+    that peaks line up. Returns two float32 arrays of equal length."""
+    t = np.arange(len(vid_env)) / FPS
+    ad_pos = (t - b_sec) / a * FPS          # AD frame for each video frame
+    ad_on_video = np.interp(ad_pos, np.arange(len(ad_env)), ad_env,
+                            left=0.0, right=0.0)
+    f = int(FPS // hz)
+    n = len(vid_env) // f * f
+
+    def pool_max(x):
+        return np.maximum(x[:n], 0).reshape(-1, f).max(axis=1) \
+            .astype(np.float32)
+    return pool_max(vid_env), pool_max(ad_on_video)
+
+
+def report_json(result):
+    """The JSON-serialisable part of a patch() result."""
+    keys = ("output", "a", "b", "confidence", "band", "warnings",
+            "signals", "segments", "weak", "suspect", "timings")
+    return {k: result[k] for k in keys}
+
+
+def write_report_svg(path, result, plot):
+    """Standalone SVG: drift (residual per segment) + envelope overlay.
+    No dependencies; opens in any browser."""
+    W, PAD = 900, 50
+    vid, ad = plot
+    dur_min = len(vid) / PLOT_HZ / 60 or 1
+    x = lambda minutes: PAD + (W - 2 * PAD) * minutes / dur_min  # noqa: E731
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
+           f'height="460" font-family="sans-serif" font-size="12">',
+           '<rect width="100%" height="100%" fill="#fff"/>',
+           f'<text x="{PAD}" y="22" font-size="15">Sync report - '
+           f'confidence {result["confidence"]:.2f} ({result["band"]}), '
+           f'speed {result["a"]:.6f}, offset {result["b"]:+.3f} s</text>']
+    # drift panel: y = residual ms, clamped to +-500
+    top, h = 40, 160
+    y = lambda ms: top + h / 2 - h / 2 * max(-500, min(500, ms)) / 500  # noqa: E731,E501
+    out.append(f'<rect x="{PAD}" y="{y(50)}" width="{W - 2 * PAD}" '
+               f'height="{y(-50) - y(50)}" fill="#dff3e4"/>')
+    out.append(f'<line x1="{PAD}" x2="{W - PAD}" y1="{y(0)}" y2="{y(0)}" '
+               'stroke="#999"/>')
+    for ms in (500, 50, -50, -500):
+        out.append(f'<text x="{PAD - 6}" y="{y(ms) + 4}" text-anchor="end" '
+                   f'fill="#666">{ms:+d}</text>')
+    out.append(f'<text x="{PAD}" y="{top - 4}" fill="#333">residual '
+               '(ms) per 30 s segment - green band = in sync (&#177;50 ms)'
+               '</text>')
+    for seg in result["segments"]:
+        color = "#2a7d46" if seg["used"] else "#aaa"
+        out.append(f'<circle cx="{x(seg["video"] / 60):.1f}" '
+                   f'cy="{y(seg["residual_ms"]):.1f}" r="4" '
+                   f'fill="{color}"><title>{seg["video"] / 60:.1f} min: '
+                   f'{seg["residual_ms"]:+.0f} ms, score '
+                   f'{seg["score"]:.2f}</title></circle>')
+    # overlay panel: video up, aligned AD mirrored down
+    mid, half = 330, 90
+    cols = min(len(vid), W - 2 * PAD)
+    step = max(1, len(vid) // cols)
+    m = len(vid) // step * step
+    v = vid[:m].reshape(-1, step).max(axis=1)
+    d = ad[:m].reshape(-1, step).max(axis=1)
+    scale = max(np.percentile(v, 99.5), np.percentile(d, 99.5), 1e-6)
+    pts_v = " ".join(f"{PAD + i:.0f},{mid - half * min(1, val / scale):.1f}"
+                     for i, val in enumerate(v))
+    pts_d = " ".join(f"{PAD + i:.0f},{mid + half * min(1, val / scale):.1f}"
+                     for i, val in enumerate(d))
+    out += [f'<text x="{PAD}" y="{mid - half - 8}" fill="#333">audio '
+            'onsets: video (up) vs aligned AD (down) - peaks should line '
+            'up</text>',
+            f'<polyline fill="none" stroke="#3d6bd6" points="{pts_v}"/>',
+            f'<polyline fill="none" stroke="#c0601a" points="{pts_d}"/>',
+            f'<line x1="{PAD}" x2="{W - PAD}" y1="{mid}" y2="{mid}" '
+            'stroke="#999"/>']
+    for i in range(0, int(dur_min) + 1, max(1, int(dur_min) // 10 or 1)):
+        out.append(f'<text x="{x(i):.0f}" y="{mid + half + 18}" '
+                   f'text-anchor="middle" fill="#666">{i} min</text>')
+    out.append("</svg>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+
+
+# --------------------------------------------------------------------------
 # Pipeline
 # --------------------------------------------------------------------------
 
 def patch(input_a, input_b, output=None, replace=False, log=print,
-          progress=None):
+          progress=None, save_report=False):
     """Full pipeline: classify inputs, align, verify, mux.
 
     Returns a dict:
         output      path of the written file
         a, b        alignment (video_time = a*ad_time + b, b in seconds)
-        report      [(ad_sec, video_sec, score, residual_ms), ...]
+        confidence  0..1 overall score; band "good" / "check" /
+                    "likely wrong"; warnings: list of sentences
+        signals     raw evidence behind the score (see confidence())
+        segments    [{ad, video, score, residual_ms, used}, ...]
+        report      the same rows as tuples (older callers)
+        plot        (video_env, aligned_ad_env) at PLOT_HZ for charts
         weak        number of report rows below the weak-match threshold
-        suspect     True if most segments matched poorly (probably a
-                    different cut / extended audio description)
+        suspect     True if the result is probably wrong (most segments
+                    weak or band "likely wrong")
         timings     {phase: seconds} for analyze (wall time; video_env
                     and ad_env run in parallel inside it), align, mux,
                     total
     `progress(phase, fraction)`, if given, is called as work advances;
-    phases in order: "analyze", "align", "mux".
+    phases in order: "analyze", "align", "mux". `save_report` also writes
+    <output>.sync.json and <output>.sync.svg.
 
     Raises ValueError / RuntimeError with a user-readable message on
     failure.
@@ -583,7 +765,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     log("aligning...")
     if progress:
         progress("align", 0.0)
-    a, b_sec, rows = fit_alignment(ad_env, vid_env, log=log)
+    a, b_sec, rows, signals = fit_alignment(ad_env, vid_env, log=log)
     if progress:
         progress("align", 1.0)
     lap("align")
@@ -597,15 +779,19 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
     log("  sync check (AD time -> video time, match score, residual):")
     weak = 0
-    for ad_t, vid_t, score, resid in rows:
+    for ad_t, vid_t, score, resid, _ in rows:
         flag = ""
         if score <= WEAK_SCORE:
             weak += 1
             flag = "  <- weak match"
         log(f"    {ad_t / 60:6.1f}m -> {vid_t / 60:6.1f}m   "
             f"score {score:4.2f}   {resid:+6.0f} ms{flag}")
-    suspect = weak > len(rows) // 2
-    if suspect:
+    conf, band, warnings = confidence(signals)
+    log(f"  confidence {conf:.2f} ({band})")
+    for w in warnings:
+        log(f"  warning: {w}")
+    suspect = weak > len(rows) // 2 or band == "likely wrong"
+    if suspect and not warnings:
         log("  warning: most segments matched poorly - the AD file may be "
             "for a different cut of this video (or an extended audio "
             "description, which pauses the video and cannot be patched "
@@ -644,8 +830,23 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s")
     log("AD track is the default audio; original audio kept as track 2."
         if not replace else "original audio replaced with AD track.")
-    return {"output": output, "a": a, "b": b_sec, "report": rows,
-            "weak": weak, "suspect": suspect, "timings": timings}
+    result = {
+        "output": output, "a": a, "b": b_sec,
+        "confidence": conf, "band": band, "warnings": warnings,
+        "signals": signals,
+        "segments": [{"ad": r[0], "video": r[1], "score": r[2],
+                      "residual_ms": r[3], "used": r[4]} for r in rows],
+        "report": rows, "weak": weak, "suspect": suspect,
+        "timings": timings,
+        "plot": plot_data(vid_env, ad_env, a, b_sec),
+    }
+    if save_report:
+        stem = os.path.splitext(output)[0]
+        with open(stem + ".sync.json", "w", encoding="utf-8") as f:
+            json.dump(report_json(result), f, indent=1)
+        write_report_svg(stem + ".sync.svg", result, result["plot"])
+        log(f"sync report: {stem}.sync.svg (+ .json)")
+    return result
 
 
 def main():
@@ -658,11 +859,15 @@ def main():
     p.add_argument("--replace", action="store_true",
                    help="drop the original audio instead of keeping it "
                         "as a second track")
+    p.add_argument("--report", action="store_true",
+                   help="also write <output>.sync.json and .sync.svg "
+                        "(drift + waveform-match plot)")
     args = p.parse_args()
     bar = ConsoleProgress() if sys.stderr.isatty() else None
     try:
         patch(args.inputs[0], args.inputs[1],
               output=args.output, replace=args.replace,
+              save_report=args.report,
               log=bar.log if bar else print,
               progress=bar.update if bar else None)
     except (ValueError, RuntimeError) as e:

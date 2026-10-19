@@ -54,6 +54,11 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   2. stretch AD envelope by best factor, then 30 s `segment_match()`
      windows across the runtime → weighted linear fit with outlier
      rejection → final a, b + per-segment sync report.
+  Also returns `signals` → `confidence()` = score, band
+  (good/check/likely wrong), warnings. `patch(save_report=True)` /
+  CLI `--report` writes .sync.json + .sync.svg; web UI draws drift +
+  waveform-match charts with vendored uPlot (static/vendor/uplot, MIT)
+  from `result["plot"]` via /api/jobs/<id>/envelopes.
 - `patch(..., log, progress)` — `progress(phase, frac)` with phases
   analyze/align/mux. Video + AD envelopes run in parallel threads via
   `cached_envelope()` (content-keyed .npy cache in

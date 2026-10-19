@@ -1,5 +1,10 @@
 # 04 — Drift plot + waveform match view (Iteration 3, v0.6.0)
 
+> **Outcome (2026-10-19):** web charts with uPlot 1.6.32 (vendored,
+> npm integrity verified), hand-written SVG for `--report`. Android
+> drift chart not done (optional) — the verdict shows in the status
+> line instead.
+
 ## Goal
 
 Let a user *see* the sync before watching a 2-hour movie:

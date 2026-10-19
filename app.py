@@ -27,7 +27,9 @@ import webbrowser
 try:
     import uvicorn
     from fastapi import FastAPI, File, Form, Request, UploadFile
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import (FileResponse, HTMLResponse,
+                                   JSONResponse, Response)
+    from fastapi.staticfiles import StaticFiles
     import adpatch
 except ImportError as e:
     sys.exit(f"missing package: {e.name} - run start_app.bat, which "
@@ -38,6 +40,8 @@ PORT = 8756
 JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
 
 app = FastAPI(title="AudioDescriptionPatcher")
+app.mount("/static", StaticFiles(directory=os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "static")), name="static")
 
 # job id -> {"status": queued|running|done|error, "log": [...],
 #            "output": path|None, "error": str|None, "name": str}
@@ -65,6 +69,8 @@ def run_job(job_id, video_path, ad_path, output_path, replace):
                                replace=replace, log=job["log"].append,
                                progress=progress)
         job["output"] = result["output"]
+        job["result"] = adpatch.report_json(result)
+        job["plot"] = result["plot"]
         job["status"] = "done"
         job["ended"] = time.time()
     except Exception as e:   # surface any failure to the UI
@@ -119,7 +125,20 @@ def job_status(job_id: str):
     return {"status": job["status"], "log": job["log"],
             "error": job["error"], "name": job["name"],
             "phase": job["phase"], "frac": job["frac"],
-            "elapsed": elapsed}
+            "elapsed": elapsed, "result": job.get("result")}
+
+
+@app.get("/api/jobs/{job_id}/envelopes")
+def job_envelopes(job_id: str):
+    """Video + aligned-AD onset envelopes for the waveform-match chart:
+    raw float32, video samples then AD samples (equal halves)."""
+    job = jobs.get(job_id)
+    if not job or job.get("plot") is None:
+        return JSONResponse({"error": "not ready"}, status_code=404)
+    vid, ad = job["plot"]
+    return Response(vid.tobytes() + ad.tobytes(),
+                    media_type="application/octet-stream",
+                    headers={"X-Hz": str(adpatch.PLOT_HZ)})
 
 
 @app.get("/api/jobs/{job_id}/download")
@@ -173,6 +192,8 @@ INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AD Patcher</title>
+<link rel="stylesheet" href="static/vendor/uplot/uPlot.min.css">
+<script src="static/vendor/uplot/uPlot.iife.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   body { font-family: system-ui, sans-serif; background: #14161a;
@@ -206,6 +227,12 @@ INDEX_HTML = """<!doctype html>
   body.dragging main { outline: 3px dashed #3d6bd6; outline-offset: 6px;
                        border-radius: 12px; }
   details { margin-top: .6rem; }
+  .badge { display: inline-block; padding: .3rem .7rem; border-radius: 8px;
+           font-weight: 600; margin-bottom: .5rem; }
+  .badge.good { background: #2f8f4e; } .badge.check { background: #9a7420; }
+  .badge.wrong { background: #8f2f2f; }
+  ul.warn { padding-left: 1.1rem; margin: .3rem 0 .6rem; }
+  .uplot { font-family: inherit; } .u-legend { color: #b7c0cc; }
 </style>
 </head>
 <body>
@@ -239,6 +266,17 @@ INDEX_HTML = """<!doctype html>
     <details id="logbox"><summary class="hint">log</summary>
       <pre id="log"></pre></details>
     <a class="dl" id="dl" hidden>&#11015;&#65039; Download patched video</a>
+  </div>
+  <div class="card" id="sync" hidden>
+    <div><span class="badge" id="badge"></span>
+      <span class="hint" id="align"></span></div>
+    <ul class="warn" id="warns"></ul>
+    <div class="hint">Sync per 30 s segment (ms) &mdash; inside the
+      &plusmn;50 ms band = in sync; grey = not used in the fit</div>
+    <div id="drift"></div>
+    <details id="wm"><summary class="hint">Show waveform match
+      (video up, aligned AD down &mdash; peaks should line up; drag to zoom)
+      </summary><div id="overlay"></div></details>
   </div>
 </main>
 <script>
@@ -346,6 +384,7 @@ go.onclick = () => {
   fd.append('replace', document.getElementById('rep').checked);
   document.getElementById('prog').hidden = false;
   document.getElementById('dl').hidden = true;
+  document.getElementById('sync').hidden = true;
   go.disabled = true;
   stage.textContent = 'Uploading\\u2026';
   const t0 = Date.now();
@@ -397,11 +436,92 @@ function poll(id) {
       const a = document.getElementById('dl');
       a.href = 'api/jobs/' + id + '/download'; a.hidden = false;
       go.disabled = !(files.video && files.ad);
+      if (j.result) showSync(id, j.result);
     } else if (j.status === 'error') {
       clearInterval(t); fail(j.error);
     }
   }, 700);
 }
+
+// ---- sync report: badge, warnings, drift + waveform-match charts ----
+const AXIS = {stroke: '#9aa2af', grid: {stroke: '#2a2f38'},
+              ticks: {stroke: '#2a2f38'}};
+let charts = [];
+
+function showSync(id, res) {
+  charts.forEach(c => c.destroy()); charts = [];
+  const card = document.getElementById('sync');
+  card.hidden = false;
+  const badge = document.getElementById('badge');
+  badge.className = 'badge ' + (res.band === 'likely wrong' ? 'wrong' : res.band);
+  badge.textContent = {good: '\u2714 In sync', check: '\u26a0 Check it',
+    'likely wrong': '\u2716 Likely wrong'}[res.band] +
+    '  \u00b7  confidence ' + Math.round(100 * res.confidence) + '%';
+  document.getElementById('align').textContent =
+    'offset ' + res.b.toFixed(3) + ' s, speed \u00d7' + res.a.toFixed(5);
+  const warns = document.getElementById('warns');
+  warns.replaceChildren(...res.warnings.map(w => {
+    const li = document.createElement('li'); li.textContent = w; return li; }));
+  if (!window.uPlot) return;   // charts are optional
+  // A background tab may not be laid out yet (width 0): start with a
+  // guess and let the ResizeObserver below fix sizes once it is.
+  const chartWidth = () => Math.max(200, Math.min(card.clientWidth - 32, 900));
+  const width = chartWidth();
+
+  const segs = res.segments;
+  const xs = segs.map(s => s.video / 60);
+  const clamp = v => Math.max(-500, Math.min(500, v));
+  const used = segs.map(s => s.used ? clamp(s.residual_ms) : null);
+  const unused = segs.map(s => s.used ? null : clamp(s.residual_ms));
+  const dots = c => ({stroke: c, fill: c, paths: () => null,
+                      points: {show: true, size: 8, fill: c}});
+  const xMax = Math.max(...xs, 1);
+  charts.push(new uPlot({
+    width, height: 170, cursor: {sync: {key: 'adp'}},
+    scales: {x: {time: false, range: [0, xMax * 1.02]},
+             y: {range: [-Math.max(150, ...segs.map(s => Math.abs(clamp(s.residual_ms)) * 1.2)),
+                          Math.max(150, ...segs.map(s => Math.abs(clamp(s.residual_ms)) * 1.2))]}},
+    axes: [{...AXIS, values: (u, v) => v.map(m => m.toFixed(0) + 'm')},
+           {...AXIS, size: 64, values: (u, v) => v.map(m => m + 'ms')}],
+    series: [{label: 'min'}, {label: 'used', ...dots('#4caf72')},
+             {label: 'not used', ...dots('#777')}],
+    hooks: {drawClear: [u => {   // the +-50 ms "in sync" band
+      const c = u.ctx, y1 = u.valToPos(50, 'y', true),
+            y2 = u.valToPos(-50, 'y', true);
+      c.fillStyle = 'rgba(76,175,114,.15)';
+      c.fillRect(u.bbox.left, y1, u.bbox.width, y2 - y1);
+    }]},
+  }, [xs, used, unused], document.getElementById('drift')));
+
+  document.getElementById('wm').ontoggle = async e => {
+    if (!e.target.open || charts.length > 1) return;
+    const r = await fetch('api/jobs/' + id + '/envelopes');
+    if (!r.ok) return;
+    const hz = +r.headers.get('X-Hz');
+    const all = new Float32Array(await r.arrayBuffer());
+    const n = all.length / 2;
+    const t = new Float64Array(n), v = new Float64Array(n), a = new Float64Array(n);
+    let mx = 1e-6;
+    for (let i = 0; i < n; i++) mx = Math.max(mx, all[i], all[n + i]);
+    for (let i = 0; i < n; i++) {
+      t[i] = i / hz / 60; v[i] = all[i] / mx; a[i] = -all[n + i] / mx; }
+    charts.push(new uPlot({
+      width, height: 220, cursor: {sync: {key: 'adp'}},
+      scales: {x: {time: false}, y: {range: [-1, 1]}},
+      axes: [{...AXIS, values: (u, vals) => vals.map(m => m.toFixed(1) + 'm')},
+             {...AXIS, values: () => []}],
+      series: [{label: 'min'}, {label: 'video', stroke: '#5b8def', width: 1},
+               {label: 'AD (aligned)', stroke: '#e0874a', width: 1}],
+    }, [t, v, a], document.getElementById('overlay')));
+  };
+}
+
+new ResizeObserver(() => {
+  const card = document.getElementById('sync');
+  if (card.hidden || !card.clientWidth) return;
+  const w = Math.max(200, Math.min(card.clientWidth - 32, 900));
+  charts.forEach(c => { if (c.width !== w) c.setSize({width: w, height: c.height}); });
+}).observe(document.getElementById('sync'));
 
 function fmtTime(s) {
   s = Math.round(s);
