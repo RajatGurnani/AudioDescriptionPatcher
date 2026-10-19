@@ -143,6 +143,57 @@ keep model calls behind a `Describer` interface so a PC backend
 `adpatch.py` gets the same pipeline in Python for the harness-style
 testing and the desktop app.
 
+## 8a. Resume from any point (required)
+
+The app can be killed mid-movie (OOM, thermal, user, reboot), so every
+stage checkpoints and is idempotent. Job dir per input, keyed by a
+content hash (same idea as `cached_envelope()`), plus `manifest.json`
+holding model id, prompt version, TTS voice and stage status:
+
+| Stage | Checkpoint | On restart |
+|---|---|---|
+| gaps (VAD) | `gaps.json` | skip if present |
+| shots | `shots.json` | skip if present |
+| describe | `.ad.vtt` + `cues.jsonl`, one line appended + fsync **per cue** | continue after last cue id |
+| TTS | `tts/<cue>.wav` per cue, written to temp then renamed | synthesize only missing/stale clips |
+| mix + mux | output written to `.part`, renamed when done | redo this stage only (minutes, no AI) |
+
+Changing model/prompt/voice invalidates only the affected stage (a cue
+edited in `.ad.vtt` re-renders its TTS clip only). `PatchService`
+re-queues unfinished jobs from `JobStore` on next launch; worst-case
+loss on a kill = the one cue in flight. Exit check (A4/A5): kill the
+app with `adb shell am force-stop` mid-describe and mid-TTS → resumed
+output identical to an uninterrupted run.
+
+## 8b. Getting AD audio from existing AD apps
+
+Checked 2026-10-19: [MovieReading](https://www.moviereading.com/)
+(Universal Multimedia Access, IT), [Earcatch](https://apps.apple.com/app/id1021220730)
+(NL/BE), Actiview → now Spectrum Access (Charter, US), KinoSync, and
+Netflix/Disney+ AD.
+
+- All of them are **second-screen players**: you download a
+  **narration-only** track inside the app, it listens through the
+  mic, syncs by audio fingerprint, and plays the narration in your
+  headphones while the film plays elsewhere.
+- **No export, no public API, no public catalogue**; tracks are
+  licensed from distributors and kept in app-private storage. Netflix
+  and Disney+ AD exists only inside their DRM streams.
+- Pulling files out of these apps would mean bypassing app protection
+  and/or breaking their terms + the distributor's copyright → **out of
+  scope; we won't do it.**
+- Legit routes: (1) ask the operator for a licence/partnership (Earcatch
+  and MovieReading work with distributors, unlikely for a hobby app);
+  (2) users keep using those apps *alongside* playback — no patching
+  needed; (3) [YouDescribe/YuWA](https://github.com/youdescribe-sfsu/You-Described-We-Archived)
+  publishes human AD clips for YouTube videos under CC BY-NC-ND 4.0
+  (non-commercial, no derivatives → mixing them into a new file is
+  likely a "derivative"; idea/eval data only).
+- Useful takeaway: if a user *legitimately* has a **narration-only**
+  file (own recording, describer's own work), the A5 mixer can take it
+  instead of TTS output: align it with the existing engine, then duck
+  and mix. That would be a small extra input mode, not a new pipeline.
+
 ## 9. Iteration plan (Android, app 0.5.x)
 
 Each iteration ends with a headless check on the PC or a run on the CMF
@@ -155,7 +206,7 @@ movies, CC-BY) kept local.
 | A1 | **Spike: llama.cpp on the CMF** — build `libmtmd` for arm64 via NDK, JNI wrapper, load SmolVLM2-500M + Qwen3-VL-2B, caption one bitmap | measured s/frame + peak RAM for both models recorded here; no crash on 5.3 GB |
 | A2 | **Gaps** — Silero VAD (ONNX Runtime) on the existing 8 kHz decode → gap list; debug overlay in logs | on 3 test clips, ≥ 90 % of hand-marked gaps found, < 5 % of gaps overlap speech |
 | A3 | **Shots + frame picking** — MediaCodec → small frames, cut detector, gap → frames | cut recall ≥ 85 % on test clips; 2 h movie scanned < 10 min |
-| A4 | **Describe** — prompts, word budget, context, rewrite loop; `.ad.vtt` written | lines fit their gaps; spot review of 30 lines: ≥ 80 % correct + useful |
+| A4 | **Describe** — prompts, word budget, context, rewrite loop; per-cue checkpoint (8a) | lines fit their gaps; spot review of 30 lines: ≥ 80 % correct + useful; force-stop mid-run resumes at the next cue |
 | A5 | **Speak + mix + mux** — system TTS → PCM, ducking, AAC, default track; UI "Generate AD" job in `PatchService` with progress + cancel | playable output on the CMF and VLC; no narration over dialogue; original track kept |
 | A6 | **Natural voice** — Kokoro ONNX + dictionary G2P, optional download | RTF measured; A/B vs. system TTS |
 | A7 | **Names + context (optional)** — whisper.cpp transcript / subtitles into the prompt | fewer "a man/a woman" in spot review |
