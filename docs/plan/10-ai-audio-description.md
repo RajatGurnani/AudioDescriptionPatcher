@@ -1,6 +1,6 @@
 # 10 — AI audio description (generate AD where none exists)
 
-Status: **research done, awaiting owner go-ahead** (2026-10-19).
+Status: **A1 done** (2026-10-19) — VLM runs in-app on the CMF; next A2.
 Scope: Android app first (`com.fuzzypyjamas.adpatcher`); a PC-assisted
 path reuses the same design. Constraints: open-source, zero cost, local
 models only, licences per [THIRD_PARTY.md](THIRD_PARTY.md).
@@ -62,9 +62,32 @@ model choice ≈ Gemma), ONNX Runtime (MIT; Florence-2, Kokoro, Silero),
 ExecuTorch (BSD; heavier build). Pick **llama.cpp** for the VLM,
 **ONNX Runtime** for the small models.
 
-Budget example: 2 h movie, ~1 description per 20–40 s of film →
-200–350 VLM calls. Qwen3-VL-2B at ~20 s → **~1–2 h on the CMF**, run as
-a foreground service with the screen off. SmolVLM2-500M → ~20–40 min.
+### Measured on the CMF (A1, 2026-10-19)
+
+In-app via `VlmDescriber` (JNI, llama.cpp `7951f60`, CPU, 4 threads,
+`armv8.2-a+dotprod+fp16`), Sintel trailer frames (CC-BY) scaled to
+512×288, model kept loaded, greedy decoding, prompt = AD instruction
+(≤ 15 words):
+
+| Model | Load | Per frame (encode+prefill / gen) | PSS | Sample line (dragon frame) |
+|---|---|---|---|---|
+| SmolVLM2-500M-Video Q8_0 + mmproj Q8_0 | 0.7 s | **5.3 s** (4.9 s / 0.4 s, 177 prompt tok) | **1.1 GB** | "A hand pointing at a flying creature in the sky." |
+| Qwen3-VL-2B-Instruct Q4_K_M + mmproj Q8_0, `image_max_tokens=256` | 5.4 s | **8.7 s** (6.4 s / 2.2 s, 188 prompt tok) | **2.5–2.7 GB** | "A large, winged creature soars through a warm, orange sky, its form partially obscured by a hand reaching out below." |
+
+- Full 854×480 frame: Smol 7.5 s, Qwen 13.1 s → always downscale to
+  512 px wide first.
+- 8 threads is *slower* than 4 (A55 little cores drag): Smol 9.1 vs
+  7.4 s encode in the CLI test. Keep 4.
+- MemAvailable stayed ~3 GB with Qwen loaded; no crash. Battery temp
+  31 → 36 °C over ~25 short CLI runs; sustained-load throttling is
+  measured in A4.
+- Qwen is clearly better (names objects right: dragon vs. "bat", sword
+  vs. "hammer") but wordier → word budget + rewrite step matter.
+
+Budget: 2 h movie, ~1 description per 20–40 s of film → 200–350 calls
+→ **Qwen ≈ 30–50 min, Smol ≈ 20–30 min** on the CMF, plus decode/TTS.
+Default = Qwen3-VL-2B ("Best"), SmolVLM2-500M as "Fast" / low-RAM
+fallback (< 4 GB devices).
 Acceptable for a "start it and come back" job; offer a model picker
 (Fast = SmolVLM2-500M, Best = Qwen3-VL-2B).
 
@@ -203,7 +226,7 @@ movies, CC-BY) kept local.
 
 | Iter | Theme | Exit criteria |
 |---|---|---|
-| A1 | **Spike: llama.cpp on the CMF** — build `libmtmd` for arm64 via NDK, JNI wrapper, load SmolVLM2-500M + Qwen3-VL-2B, caption one bitmap | measured s/frame + peak RAM for both models recorded here; no crash on 5.3 GB |
+| A1 ✅ | **Spike: llama.cpp on the CMF** — build `libmtmd` for arm64 via NDK, JNI wrapper, load SmolVLM2-500M + Qwen3-VL-2B, caption one bitmap | measured s/frame + peak RAM for both models recorded here; no crash on 5.3 GB — **done**, see §3 "Measured" |
 | A2 | **Gaps** — Silero VAD (ONNX Runtime) on the existing 8 kHz decode → gap list; debug overlay in logs | on 3 test clips, ≥ 90 % of hand-marked gaps found, < 5 % of gaps overlap speech |
 | A3 | **Shots + frame picking** — MediaCodec → small frames, cut detector, gap → frames | cut recall ≥ 85 % on test clips; 2 h movie scanned < 10 min |
 | A4 | **Describe** — prompts, word budget, context, rewrite loop; per-cue checkpoint (8a) | lines fit their gaps; spot review of 30 lines: ≥ 80 % correct + useful; force-stop mid-run resumes at the next cue |
@@ -211,6 +234,14 @@ movies, CC-BY) kept local.
 | A6 | **Natural voice** — Kokoro ONNX + dictionary G2P, optional download | RTF measured; A/B vs. system TTS |
 | A7 | **Names + context (optional)** — whisper.cpp transcript / subtitles into the prompt | fewer "a man/a woman" in spot review |
 | P1 | **PC path** — same pipeline in `adpatch.py` + `llama-server` on GPU; web/desktop "Generate AD" | 2 h movie < 15 min on dev PC |
+
+A1 build notes: `android/app/src/main/cpp/` (CMake fetches llama.cpp
+at a pinned commit + SHA-256, links `mtmd`+`llama` statically into
+`libadpvlm.so`, 7 MB; APK 13 MB). `ndk.abiFilters = arm64-v8a`, so the
+APK no longer installs on 32-bit-only phones — fine for now; revisit
+(stub lib or dynamic feature) before a public release. Dev probe:
+`describe/VlmProbeActivity` (adb-only via DUMP permission) reads
+`files/models/*.gguf` + `files/frames/*.jpg`, logs to tag `ADP-VLM`.
 
 Risks: RAM (Qwen3-VL-2B + decode buffers on 5.3 GB; fall back to
 SmolVLM2), thermal throttling on hour-long runs (pace + resume from the

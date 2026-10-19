@@ -51,13 +51,13 @@ program, never link/copy · **Idea**: read for design only, no code ·
 | HandBrake / HandBrakeCLI | GPL-2.0 | hand-off button only |
 | qBittorrent | GPL-2.0 | Web API calls only |
 
-## AI audio description ([10](10-ai-audio-description.md), proposed)
+## AI audio description ([10](10-ai-audio-description.md))
 
 Model weights are downloaded at runtime, never committed or bundled.
 
 | Project | Licence | Verdict | What for |
 |---|---|---|---|
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) (`libmtmd`) | MIT | **Use** | on-device VLM runtime (JNI); `llama-server` as separate exe for PC path |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) (`libmtmd`) | MIT | **Use** (A1, fetched at build, commit `7951f60`) | on-device VLM runtime (`android/app/src/main/cpp`); `llama-server` as separate exe for PC path |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | **Use** | Silero VAD, Kokoro, optional Florence-2/TransNetV2 |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | **Use** | speech/non-speech gaps (8 kHz) |
 | Qwen3-VL-2B-Instruct | Apache-2.0 | **Use (weights)** | "Best" describer |

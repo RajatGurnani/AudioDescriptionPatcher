@@ -33,6 +33,9 @@ A tool that "patches" a regular video file with its audio-described (AD) version
 # Android APK (needs Gradle 8.9 on PATH or a downloaded dist;
 # JDK 17 from Android Studio: set JAVA_HOME to
 # "C:\Program Files\Android\Android Studio\jbr")
+# native VLM lib (docs/plan/10) also needs NDK 27.2 + CMake 3.22+ (with
+# ninja.exe in its bin/): android/local.properties keys adp.ndkPath,
+# cmake.dir; llama.cpp is fetched by CMake at a pinned commit
 cd android && gradle assembleRelease
 # apk: android/app/build/outputs/apk/release/app-release.apk
 adb install -r app-release.apk

@@ -44,6 +44,14 @@
             android:name=".LogsActivity"
             android:exported="false" />
 
+        <!-- dev probe for AI audio description (docs/plan/10, A1);
+             DUMP permission = only adb shell can start it -->
+        <activity
+            android:name=".describe.VlmProbeActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
