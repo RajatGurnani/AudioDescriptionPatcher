@@ -16,6 +16,21 @@ crosses over per iteration and what deliberately doesn't.
 | 6 desktop | pywebview + PyInstaller | n/a |
 | 7 output options | stream/codec options | subset only: keep/drop original audio (exists), AD bitrate. MediaMuxer can't write mkv/srt — no subtitle injection |
 
+## On-device check (2026-10-19, CMF Phone 1, app 0.4.1)
+
+Driven over adb with the harness cut+PAL pair (10 min):
+- Fixed: the chunk-parallel envelope crashed (`ArrayIndexOutOfBounds`
+  in `EnvelopeAccumulator.feed`) when a ranged decode's first chunk
+  starts later than its timestamps say; such gaps are now silence.
+- Works: 2 pieces found (offsets −0.04 s / +40.00 s; truth 0 / +40),
+  confidence 1.00, gap left silent as designed.
+- **Open:** in the phone's output piece 1 is ~−8 ms but piece 2 is
+  ~−53 ms — a ~45 ms step at the splice that the PC render doesn't have
+  and the phone's own fit doesn't predict (its residuals are ~0). Making
+  `Patcher` follow decoder timestamps was tried and reverted (it shifted
+  both pieces ~35 ms further). Next: isolated phone runs (cut-only,
+  PAL-only) to separate analysis-side from render-side causes.
+
 ## Shared test vectors
 
 > **Implemented (iteration 4) differently from below:** a JVM unit test

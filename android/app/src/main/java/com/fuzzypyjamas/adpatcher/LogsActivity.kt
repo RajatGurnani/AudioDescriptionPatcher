@@ -1,4 +1,4 @@
-package com.renderedideas.adpatcher
+package com.fuzzypyjamas.adpatcher
 
 import android.content.Intent
 import android.os.Bundle

@@ -122,7 +122,9 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
 - `app.py` — FastAPI wrapper around `adpatch.patch()`: multipart upload →
   background thread → poll `/api/jobs/<id>` → download. Inline single-page
   UI (mobile-first). Jobs live in `jobs/<id>/`; uploads deleted after run.
-- `android/` — standalone Kotlin port, NO ffmpeg: `AudioEngine`
+- `android/` — package `com.fuzzypyjamas.adpatcher` (renamed from
+  com.renderedideas.adpatcher in 0.4.1 — a separate app id, so the old
+  install has to be removed by hand). Standalone Kotlin port, NO ffmpeg: `AudioEngine`
   (MediaCodec decode → same onset envelope), `Aligner` (same two-stage
   fit, JTransforms FFT), `Patcher` (MediaMuxer: video samples copied, AD
   re-encoded AAC with offset+resample applied; AAC csd-0 crafted by hand

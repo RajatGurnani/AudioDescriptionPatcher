@@ -1,4 +1,4 @@
-package com.renderedideas.adpatcher
+package com.fuzzypyjamas.adpatcher
 
 import org.jtransforms.fft.FloatFFT_1D
 import kotlin.math.abs

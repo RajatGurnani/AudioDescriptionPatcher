@@ -1,4 +1,4 @@
-package com.renderedideas.adpatcher
+package com.fuzzypyjamas.adpatcher
 
 import android.content.Context
 import android.media.MediaCodec

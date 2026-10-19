@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the app icon (same artwork as the Android launcher icon:
 android/app/src/main/res/drawable/ic_launcher_foreground.xml on
-#274690) to static/icon.ico - numpy only, PNG-in-ICO (Vista+).
+#0B7A75) to static/icon.ico - numpy only, PNG-in-ICO (Vista+).
 
     .venv\\Scripts\\python tools\\make_icon.py
 """
@@ -13,8 +13,7 @@ import zlib
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BG = (0x27, 0x46, 0x90)
-WAVE2 = (0xB9, 0xCC, 0xF2)
+BG = (0x0B, 0x7A, 0x75)
 
 
 def render(size, ss=4):
@@ -33,27 +32,25 @@ def render(size, ss=4):
     def paint(mask, rgb):
         img[mask] = (*rgb, 255)
 
-    # play triangle (40,34) (40,74) (70,54)
-    def side(ax, ay, bx, by):
-        return (bx - ax) * (y - ay) - (by - ay) * (x - ax)
-    s1, s2, s3 = side(40, 34, 40, 74), side(40, 74, 70, 54), \
-        side(70, 54, 40, 34)
-    paint(((s1 >= 0) & (s2 >= 0) & (s3 >= 0)) |
-          ((s1 <= 0) & (s2 <= 0) & (s3 <= 0)), (255, 255, 255))
+    def rounded_rect(x0, y0, x1, y1, rad):
+        dx = np.maximum(np.maximum(x0 + rad - x, x - (x1 - rad)), 0)
+        dy = np.maximum(np.maximum(y0 + rad - y, y - (y1 - rad)), 0)
+        return (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1) & \
+            (dx * dx + dy * dy <= rad * rad)
 
-    # sound waves: arcs bulging right, stroke 4.5, round caps
-    def arc(x0, y0, y1, radius, rgb, w=4.5):
-        half = (y1 - y0) / 2
-        cx, cy = x0 - np.sqrt(radius ** 2 - half ** 2), (y0 + y1) / 2
-        d = np.hypot(x - cx, y - cy)
-        theta = np.arctan2(half, x0 - cx)   # half-angle of the arc
-        band = (np.abs(d - radius) <= w / 2) & \
-            (np.abs(np.arctan2(y - cy, x - cx)) <= theta)
-        caps = (np.hypot(x - x0, y - y0) <= w / 2) | \
-            (np.hypot(x - x0, y - y1) <= w / 2)
-        paint(band | caps, rgb)
-    arc(74, 44, 64, 14, (255, 255, 255))
-    arc(80, 37, 71, 23, WAVE2)
+    def triangle(ax, ay, bx, by, cx, cy):
+        def side(px, py, qx, qy):
+            return (qx - px) * (y - py) - (qy - py) * (x - px)
+        s1, s2, s3 = side(ax, ay, bx, by), side(bx, by, cx, cy), \
+            side(cx, cy, ax, ay)
+        return ((s1 >= 0) & (s2 >= 0) & (s3 >= 0)) | \
+            ((s1 <= 0) & (s2 <= 0) & (s3 <= 0))
+
+    # speech bubble (body + tail) with the play triangle cut out - same
+    # geometry as the Android vector
+    bubble = rounded_rect(28, 32, 80, 68, 8) | triangle(39, 67, 50, 67,
+                                                         37, 79)
+    paint(bubble & ~triangle(48, 41, 48, 59, 63, 50), (255, 255, 255))
 
     # downsample (box filter) with premultiplied alpha
     a = img[..., 3:] / 255

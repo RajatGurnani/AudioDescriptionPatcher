@@ -51,6 +51,20 @@ includes the licences of everything bundled (`_internal\licenses`,
 including ffmpeg's GPLv3 notice). The exe is unsigned, so SmartScreen
 may ask once ("More info → Run anyway").
 
+What the target PC needs — all part of Windows itself, nothing to
+install in the normal case:
+- Windows 10 or 11, 64-bit.
+- **Edge WebView2 runtime** — preinstalled on Windows 11 and on updated
+  Windows 10. On older/LTSC Windows 10 without it the window can't
+  open; install Microsoft's free "Evergreen" WebView2 runtime.
+- .NET Framework 4.7.2+ (built into Windows 10 1803 and later) — used by
+  the window toolkit.
+- Media Foundation for the fast AAC encoder — missing on Windows "N"
+  editions; the app then falls back to ffmpeg's own (slower) AAC
+  encoder automatically.
+Python, all libraries, ffmpeg and the Visual C++ runtime are inside the
+folder.
+
 ## Option 1 — PC, drag and drop
 
 1. Select the video and the AD file in Explorer (both at once) and drag

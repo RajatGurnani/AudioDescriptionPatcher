@@ -1,4 +1,4 @@
-package com.renderedideas.adpatcher
+package com.fuzzypyjamas.adpatcher
 
 import android.app.Notification
 import android.app.NotificationChannel

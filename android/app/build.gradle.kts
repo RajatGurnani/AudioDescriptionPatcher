@@ -4,15 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "com.renderedideas.adpatcher"
+    namespace = "com.fuzzypyjamas.adpatcher"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.renderedideas.adpatcher"
+        applicationId = "com.fuzzypyjamas.adpatcher"
         minSdk = 26        // MediaMuxer multi-track needs API 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.4.0"
+        versionCode = 7
+        versionName = "0.4.1"
     }
 
     buildTypes {

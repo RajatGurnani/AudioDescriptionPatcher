@@ -1,4 +1,4 @@
-package com.renderedideas.adpatcher
+package com.fuzzypyjamas.adpatcher
 
 import org.junit.Assume.assumeTrue
 import org.junit.Test

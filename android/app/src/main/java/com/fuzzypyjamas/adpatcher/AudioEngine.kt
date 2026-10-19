@@ -1,4 +1,4 @@
-package com.renderedideas.adpatcher
+package com.fuzzypyjamas.adpatcher
 
 import android.content.Context
 import android.media.MediaCodec
@@ -219,6 +219,7 @@ object AudioEngine {
         private var nextPos = -1.0    // global input-sample position
         private var globalIn = -1L    // input index of current chunk start
         private var prevLast = 0f
+        private var gapLogged = false
 
         fun feed(chunk: PcmChunk) {
             val n = chunk.samples.size / chunk.channels
@@ -247,9 +248,20 @@ object AudioEngine {
             while (pos < limit) {
                 val i = pos.toLong()
                 val local = (i - globalIn).toInt()
-                val s0 = if (local < 0) prevLast else mono[local]
-                val s1 = mono[local + 1]
-                val v = s0 + (s1 - s0) * (pos - i).toFloat()
+                // local < -1: this chunk starts later than expected (a
+                // pts gap, e.g. right after a ranged seek) - the missing
+                // stretch is silence; the grid stays pts-anchored
+                if (local < -1 && !gapLogged) {
+                    gapLogged = true
+                    android.util.Log.i(TAG, "envelope: pts gap of " +
+                        "${-local - 1} samples at ${"%.2f".format(
+                            i / chunk.sampleRate.toDouble())}s - silence")
+                }
+                val v = if (local < -1) 0f else {
+                    val s0 = if (local < 0) prevLast else mono[local]
+                    val s1 = mono[local + 1]
+                    s0 + (s1 - s0) * (pos - i).toFloat()
+                }
                 acc += v * v
                 if (++accCount == HOP) {
                     if (count == energies.size)
