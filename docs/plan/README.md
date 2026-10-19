@@ -87,4 +87,5 @@ Ordering rationale:
 - [07-desktop-app.md](07-desktop-app.md) — shutdown button, pywebview shell, PyInstaller build
 - [08-output-options-and-handoffs.md](08-output-options-and-handoffs.md) — track/codec options, external tools
 - [09-android-parity.md](09-android-parity.md) — what must be mirrored in Kotlin
+- [10-ai-audio-description.md](10-ai-audio-description.md) — generate AD with local VLM + TTS (proposed, Android first)
 - [THIRD_PARTY.md](THIRD_PARTY.md) — every reused library/algorithm with license + verdict

@@ -51,6 +51,32 @@ program, never link/copy · **Idea**: read for design only, no code ·
 | HandBrake / HandBrakeCLI | GPL-2.0 | hand-off button only |
 | qBittorrent | GPL-2.0 | Web API calls only |
 
+## AI audio description ([10](10-ai-audio-description.md), proposed)
+
+Model weights are downloaded at runtime, never committed or bundled.
+
+| Project | Licence | Verdict | What for |
+|---|---|---|---|
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) (`libmtmd`) | MIT | **Use** | on-device VLM runtime (JNI); `llama-server` as separate exe for PC path |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | **Use** | Silero VAD, Kokoro, optional Florence-2/TransNetV2 |
+| [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | **Use** | speech/non-speech gaps (8 kHz) |
+| Qwen3-VL-2B-Instruct | Apache-2.0 | **Use (weights)** | "Best" describer |
+| [SmolVLM2](https://github.com/huggingface/smollm) 256M/500M/2.2B | Apache-2.0 | **Use (weights)** | "Fast" describer |
+| InternVL3/3.5-1B, Moondream 2, Florence-2 | MIT / Apache-2.0 / MIT | Optional | alternatives |
+| [Kokoro-82M](https://github.com/hexgrad/kokoro) | Apache-2.0 | **Use (weights)** | natural voice (optional download) |
+| [misaki](https://github.com/hexgrad/misaki) lexicons, CMUdict | Apache-2.0 / BSD | **Use (data)** | dictionary G2P for Kokoro without espeak-ng |
+| [microsoft/ai-audio-descriptions](https://github.com/microsoft/ai-audio-descriptions) | MIT | **Adapt** | GenerateAD/RenderAD split, WebVTT cues, fit + duck + mix |
+| [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) | BSD-3 | **Adapt** | ContentDetector cut heuristic (re-implemented in Kotlin) |
+| [TransNetV2](https://github.com/soCzech/TransNetV2) | MIT | Optional | learned shot detection |
+| [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | MIT | Optional | dialogue transcript for names/context |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Apache-2.0, TTS links espeak-ng | **No** (linked) | pulls GPL-3.0 espeak-ng into the APK |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) | GPL-3.0 | Run (PC only) | phonemizer as separate exe/dll for `kokoro-onnx`; never linked on Android |
+| [Piper](https://github.com/OHF-Voice/piper1-gpl) | GPL-3.0 (old rhasspy/piper MIT, archived) | No | — |
+| Qwen2.5-VL-3B | Qwen Research licence | **No** | non-open licence |
+| Gemma 3n (MediaPipe / LiteRT-LM) | Gemma Terms of Use | **No** (owner may waive) | runtime is Apache, weights are not open-licensed |
+| LFM2-VL | LFM Open License | No | revenue-gated |
+| lanad22/VideoDescribe, AutoAD*, UniAD | none / NOASSERTION | Idea | research pipelines |
+
 ## Attribution format (for adapted code)
 
 ```python
