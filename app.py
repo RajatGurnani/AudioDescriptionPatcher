@@ -26,11 +26,12 @@ import webbrowser
 
 try:
     import uvicorn
-    from fastapi import FastAPI, File, Form, Request, UploadFile
+    from fastapi import Body, FastAPI, File, Form, Request, UploadFile
     from fastapi.responses import (FileResponse, HTMLResponse,
                                    JSONResponse, Response)
     from fastapi.staticfiles import StaticFiles
     import adpatch
+    import batch
 except ImportError as e:
     sys.exit(f"missing package: {e.name} - run start_app.bat, which "
              "installs the dependencies (or: pip install -r "
@@ -150,6 +151,110 @@ def job_download(job_id: str):
                         media_type="video/x-matroska")
 
 
+# ---- batch (folders on this PC; localhost only) ----
+batch_state = {"scan": None, "queue": batch.Queue.load(), "thread": None}
+
+
+def _local_only(request):
+    if not is_local(request):
+        return JSONResponse({"error": "batch mode works on this PC only"},
+                            status_code=403)
+    return None
+
+
+def _batch_running():
+    t = batch_state["thread"]
+    return t is not None and t.is_alive()
+
+
+@app.post("/api/batch/scan")
+def batch_scan(request: Request, payload: dict = Body(...)):
+    if (denied := _local_only(request)):
+        return denied
+    folders = [f for f in payload.get("folders", []) if f]
+    missing = [f for f in folders if not os.path.exists(f)]
+    if not folders or missing:
+        return JSONResponse({"error": "folder not found: " +
+                             ", ".join(missing or ["(none given)"])},
+                            status_code=400)
+    sc = {"status": "running", "phase": "probe", "frac": 0.0, "log": [],
+          "rows": None, "unused": None, "error": None}
+    batch_state["scan"] = sc
+
+    def run():
+        def progress(phase, frac):
+            sc["phase"], sc["frac"] = phase, frac
+        try:
+            rows, unused = batch.scan(folders, payload.get("recursive", True),
+                                      log=sc["log"].append,
+                                      progress=progress)
+            sc["rows"] = [{**r, "score": float(r["score"]),
+                           "alternatives": [[d, float(x)] for d, x in
+                                            r["alternatives"]]}
+                          for r in rows]
+            sc["unused"], sc["status"] = unused, "done"
+        except Exception as e:   # surface to the UI
+            sc["error"], sc["status"] = str(e), "error"
+    threading.Thread(target=run, daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/batch/scan")
+def batch_scan_status():
+    return batch_state["scan"] or {"status": "idle", "log": []}
+
+
+def _start_queue(q):
+    batch_state["queue"] = q
+    q.stop.clear()
+    t = threading.Thread(target=q.run, kwargs={"log": lambda *a: None},
+                         daemon=True)
+    batch_state["thread"] = t
+    t.start()
+
+
+@app.post("/api/batch/start")
+def batch_start(request: Request, payload: dict = Body(...)):
+    if (denied := _local_only(request)):
+        return denied
+    if _batch_running():
+        return JSONResponse({"error": "a batch is already running"},
+                            status_code=409)
+    pairs = [(p["video"], p["ad"]) for p in payload.get("pairs", [])
+             if p.get("video") and p.get("ad")]
+    if not pairs:
+        return JSONResponse({"error": "no pairs selected"}, status_code=400)
+    _start_queue(batch.Queue.create(pairs, payload.get("outdir"),
+                                    bool(payload.get("replace"))))
+    return {"started": len(pairs)}
+
+
+@app.post("/api/batch/resume")
+def batch_resume(request: Request):
+    if (denied := _local_only(request)):
+        return denied
+    q = batch_state["queue"] or batch.Queue.load()
+    if _batch_running() or not q or not q.pending:
+        return JSONResponse({"error": "nothing to resume"}, status_code=409)
+    _start_queue(q)
+    return {"resumed": len(q.pending)}
+
+
+@app.post("/api/batch/stop")
+def batch_stop(request: Request):
+    if (denied := _local_only(request)):
+        return denied
+    if batch_state["queue"]:
+        batch_state["queue"].stop.set()   # finishes the current job first
+    return {"stopping": True}
+
+
+@app.get("/api/batch")
+def batch_status():
+    q = batch_state["queue"]
+    return {"items": q.items if q else [], "running": _batch_running()}
+
+
 @app.get("/api/info")
 def info(request: Request):
     return {"app": "adpatch", "can_shutdown": is_local(request)}
@@ -162,6 +267,10 @@ def shutdown(request: Request, force: bool = False):
                             status_code=403)
     running = [j["name"] for j in jobs.values()
                if j["status"] in ("queued", "running")]
+    if _batch_running():
+        running += [os.path.basename(it["output"])
+                    for it in batch_state["queue"].items
+                    if it["status"] in ("pending", "running")]
     if running and not force:
         return JSONResponse({"error": "jobs running", "running": running},
                             status_code=409)
@@ -227,6 +336,16 @@ INDEX_HTML = """<!doctype html>
   body.dragging main { outline: 3px dashed #3d6bd6; outline-offset: 6px;
                        border-radius: 12px; }
   details { margin-top: .6rem; }
+  textarea, input:not([type]), select { background: #14161a; color: #e8e8e8;
+    border: 1px solid #3a3f4a; border-radius: 8px; padding: .5rem;
+    font: inherit; }
+  table.bt { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  table.bt td, table.bt th { padding: .35rem .3rem; text-align: left;
+    border-bottom: 1px solid #2a2f38; vertical-align: middle; }
+  table.bt select { max-width: 100%; }
+  table.bt progress { display: block; }
+  .st.matched { color: #4caf72; } .st.check { color: #e6b355; }
+  .st.nomatch { color: #9aa2af; }
   .badge { display: inline-block; padding: .3rem .7rem; border-radius: 8px;
            font-weight: 600; margin-bottom: .5rem; }
   .badge.good { background: #2f8f4e; } .badge.check { background: #9a7420; }
@@ -277,6 +396,34 @@ INDEX_HTML = """<!doctype html>
     <details id="wm"><summary class="hint">Show waveform match
       (video up, aligned AD down &mdash; peaks should line up; drag to zoom)
       </summary><div id="overlay"></div></details>
+  </div>
+  <div class="card" id="batch" hidden>
+    <h2 style="font-size:1.1rem;margin:0 0 .3rem">Batch &mdash; folders on this PC</h2>
+    <div class="hint" style="margin-bottom:.6rem">Point at folders with
+      movies and AD files (names don't matter &mdash; files are paired by
+      their audio). Check the pairs, then patch them all.</div>
+    <textarea id="bfolders" rows="3" style="width:100%;box-sizing:border-box"
+      placeholder="one folder per line, e.g. D:/Movies"></textarea>
+    <input id="boutdir" style="width:100%;box-sizing:border-box;margin:.4rem 0"
+      placeholder="output folder (optional - default: next to each video)">
+    <label class="hint" style="display:block;margin-bottom:.6rem">
+      <input type="checkbox" id="brec" checked> include subfolders</label>
+    <button id="bscan">Find pairs</button>
+    <div id="bscanprog" hidden style="margin-top:.6rem">
+      <div class="hint" id="bscanstage"></div>
+      <progress id="bscanbar" max="100" value="0"></progress></div>
+    <div id="bpairs" hidden style="margin-top:.8rem">
+      <table class="bt" id="btable"></table>
+      <div class="hint" id="bunused" style="margin:.4rem 0"></div>
+      <button id="bstart">Patch selected</button>
+    </div>
+    <div id="bqueue" hidden style="margin-top:.8rem">
+      <table class="bt" id="bqtable"></table>
+      <div style="display:flex;gap:.5rem;margin-top:.6rem">
+        <button id="bresume" hidden>Resume batch</button>
+        <button id="bstop" hidden>Stop after current</button>
+      </div>
+    </div>
   </div>
 </main>
 <script>
@@ -535,6 +682,128 @@ new ResizeObserver(() => {
   const w = Math.max(200, Math.min(card.clientWidth - 32, 900));
   charts.forEach(c => { if (c.width !== w) c.setSize({width: w, height: c.height}); });
 }).observe(document.getElementById('sync'));
+
+// ---- batch: folders on this PC (localhost only) ----
+const $ = id => document.getElementById(id);
+const base = p => p ? p.split(/[\\\\/]/).pop() : '';
+let scanRows = [];
+for (const [id, key] of [['bfolders', 'adp-bfolders'], ['boutdir', 'adp-boutdir']]) {
+  try { $(id).value = localStorage.getItem(key) || ''; } catch {}
+  $(id).oninput = () => { try { localStorage.setItem(key, $(id).value); } catch {} };
+}
+const SCAN_PHASES = {probe: 'Reading file info', analyze: 'Analyzing audio',
+                     pair: 'Matching movies to AD files'};
+
+$('bscan').onclick = async () => {
+  const folders = $('bfolders').value.split('\\n').map(s => s.trim()).filter(Boolean);
+  if (!folders.length) return;
+  $('bscan').disabled = true; $('bpairs').hidden = true;
+  $('bscanprog').hidden = false; $('bscanstage').textContent = 'Starting…';
+  const r = await fetch('api/batch/scan', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({folders, recursive: $('brec').checked})});
+  if (!r.ok) { $('bscanstage').textContent = (await r.json()).error;
+               $('bscan').disabled = false; return; }
+  const t = setInterval(async () => {
+    const s = await (await fetch('api/batch/scan')).json();
+    $('bscanstage').textContent = (SCAN_PHASES[s.phase] || 'Working') + '…' +
+      (s.log.length ? '  ' + s.log[s.log.length - 1] : '');
+    $('bscanbar').value = 100 * (s.frac || 0);
+    if (s.status === 'running') return;
+    clearInterval(t); $('bscan').disabled = false;
+    if (s.status === 'error') { $('bscanstage').textContent = s.error; return; }
+    $('bscanprog').hidden = true; showPairs(s.rows, s.unused);
+  }, 700);
+};
+
+function showPairs(rows, unused) {
+  scanRows = rows;
+  const tb = $('btable');
+  tb.replaceChildren();
+  const head = tb.insertRow();
+  for (const h of ['', 'Movie', 'AD file (by match score)', '']) {
+    const th = document.createElement('th'); th.textContent = h; head.append(th); }
+  rows.forEach((row, i) => {
+    const tr = tb.insertRow();
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = row.status === 'matched'; cb.id = 'bc' + i;
+    tr.insertCell().append(cb);
+    tr.insertCell().textContent = base(row.video);
+    const sel = document.createElement('select'); sel.id = 'bs' + i;
+    sel.append(new Option('- none -', ''));
+    for (const [ad, sc] of row.alternatives)
+      sel.append(new Option(base(ad) + '  (' + sc.toFixed(2) + ')', ad, false, ad === row.ad));
+    // unpaired AD files can always be picked by hand
+    for (const ad of unused)
+      if (!row.alternatives.some(([a]) => a === ad))
+        sel.append(new Option(base(ad) + '  (no match)', ad));
+    sel.onchange = () => { cb.checked = !!sel.value; };
+    tr.insertCell().append(sel);
+    const st = tr.insertCell(); st.className = 'st ' + row.status.replace(' ', '');
+    st.textContent = {matched: '✔ matched', check: '⚠ check', 'no match': '– no match'}[row.status];
+  });
+  $('bunused').textContent = unused.length
+    ? 'Not paired: ' + unused.map(base).join(', ') : '';
+  $('bpairs').hidden = false;
+}
+
+$('bstart').onclick = async () => {
+  const pairs = scanRows.map((row, i) => ({video: row.video, ad: $('bs' + i).value,
+    on: $('bc' + i).checked})).filter(p => p.on && p.ad);
+  if (!pairs.length) return;
+  const r = await fetch('api/batch/start', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pairs, outdir: $('boutdir').value.trim() || null,
+                          replace: $('rep').checked})});
+  if (!r.ok) { alert((await r.json()).error); return; }
+  $('bpairs').hidden = true; pollQueue();
+};
+$('bresume').onclick = async () => {
+  await fetch('api/batch/resume', {method: 'POST'}); pollQueue(); };
+$('bstop').onclick = async () => {
+  await fetch('api/batch/stop', {method: 'POST'});
+  $('bstop').textContent = 'Stopping after current…'; };
+
+const ST = {pending: '… waiting', running: '▶ running', done: '✔ done',
+            error: '✖ error', skipped: '↷ exists'};
+let qTimer = null;
+function renderQueue(q) {
+  $('bqueue').hidden = !q.items.length;
+  const tb = $('bqtable'); tb.replaceChildren();
+  for (const it of q.items) {
+    const tr = tb.insertRow();
+    tr.insertCell().textContent = base(it.video);
+    const c = tr.insertCell();
+    if (it.status === 'running' && it.phase) {
+      const pr = document.createElement('progress');
+      pr.max = 100; pr.value = 100 * it.frac;
+      c.append((PHASES[it.phase] || [''])[1] || it.phase, pr);
+    } else if (it.status === 'done') {
+      const b = document.createElement('span');
+      b.className = 'badge ' + (it.band === 'likely wrong' ? 'wrong' : it.band);
+      b.textContent = (it.band === 'good' ? '✔ ' : '⚠ ') + Math.round(100 * it.confidence) + '%' +
+        (it.pieces > 1 ? '  ·  ' + it.pieces + ' pieces' : '');
+      c.append(b);
+    } else c.textContent = ST[it.status] + (it.error ? ': ' + it.error : '');
+  }
+  const pending = q.items.some(it => it.status === 'pending');
+  $('bresume').hidden = q.running || !pending;
+  $('bstop').hidden = !q.running;
+  if (!q.running) $('bstop').textContent = 'Stop after current';
+}
+function pollQueue() {
+  clearInterval(qTimer);
+  const tick = async () => {
+    const q = await (await fetch('api/batch')).json();
+    renderQueue(q);
+    if (!q.running) clearInterval(qTimer);
+  };
+  tick(); qTimer = setInterval(tick, 1000);
+}
+fetch('api/info').then(r => r.json()).then(j => {
+  if (!j.can_shutdown) return;   // batch reads folders on this PC only
+  $('batch').hidden = false; pollQueue();
+}).catch(() => {});
 
 function fmtTime(s) {
   s = Math.round(s);

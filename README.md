@@ -12,7 +12,7 @@ Three ways to use it:
 | Interface | Where | Best for |
 |---|---|---|
 | `patch.bat` / `adpatch.py` | Windows CLI / drag-drop | quick one-offs on the PC |
-| `start_app.bat` (web app) | browser on PC **or phone** (same Wi-Fi) | phone files, no install |
+| `start_app.bat` (web app) | browser on PC **or phone** (same Wi-Fi) | phone files, no install; **batch**: whole folders, auto-paired by audio (PC) |
 | Android app (`android/`) | on the phone itself, offline | fully standalone mobile |
 
 See [docs/USAGE.md](docs/USAGE.md) for the full walkthrough of all three,

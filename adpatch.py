@@ -1285,6 +1285,9 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "batch":
+        import batch   # folder mode: content-based pairing + queue
+        return batch.main(sys.argv[2:])
     p = argparse.ArgumentParser(
         description="Patch a video with its audio-description track.")
     p.add_argument("inputs", nargs=2, metavar="FILE",

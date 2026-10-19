@@ -91,6 +91,13 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
 
 ## Other components
 
+- `batch.py` — folder mode (`adpatch.py batch <folders> | --resume`, web
+  Batch card, localhost-only /api/batch/*): discover → 15 % duration
+  gate → `match_score()` (stage-1 speed-scan peak on cached envelopes)
+  → greedy one-to-one assignment with uniqueness (else "check"; names
+  only break ties) → `Queue` persisted atomically to
+  %LOCALAPPDATA%\ADPatcher\queue.json, sequential, resumable. Test:
+  `tools\batch_test.py`.
 - `app.py` — FastAPI wrapper around `adpatch.patch()`: multipart upload →
   background thread → poll `/api/jobs/<id>` → download. Inline single-page
   UI (mobile-first). Jobs live in `jobs/<id>/`; uploads deleted after run.

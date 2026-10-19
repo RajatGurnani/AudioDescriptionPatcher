@@ -154,12 +154,15 @@ normally standard (same-runtime) description and align fine.
 ```
 adpatch.py       PC engine + CLI (envelope / fit_alignment / patch)
 app.py           FastAPI web UI wrapping adpatch.patch (PC + phone)
+batch.py         folder mode: discover -> content pairing -> resumable queue
 patch.bat        drag-and-drop wrapper
 start_app.bat    web app launcher
 android/         Kotlin app: AudioEngine (decode+envelope),
                  Aligner (port of fit_alignment), Patcher (MediaMuxer),
                  MainActivity (UI, wake lock, progress)
 tools/harness.py synthetic accuracy + timing harness (ground truth known)
+tools/batch_test.py  synthetic pairing + queue/resume test
+tools/parity_export.py  envelopes + results for the Kotlin parity test
 docs/            this file + usage guide; docs/plan/ = roadmap
 ```
 

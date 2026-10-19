@@ -54,6 +54,31 @@ get the button). If jobs are still running it asks first, then ends them
 too. Running `start_app.bat` again while the server is up just reopens
 the page. Job folders older than 24 h are cleaned up on start.
 
+## Option 4 — a whole folder at once (batch, PC)
+
+Put movies and AD files in one or more folders — **names don't matter**;
+each movie is matched to its AD file by comparing the audio itself.
+
+- **Web app (on the PC's own browser):** the *Batch* card. Paste folder
+  paths (one per line), optionally an output folder, **Find pairs**.
+  Each row shows the movie, the best AD file with its match score, and
+  ✔ matched / ⚠ check / – no match. Change any row's AD in its dropdown
+  (unpaired AD files can be picked by hand), untick rows to skip,
+  **Patch selected**. Jobs run one after another with progress and a
+  sync verdict per movie. **Stop after current** pauses; the batch
+  survives closing the app — reopen it and press **Resume batch**.
+- **CLI:** `adpatch.py batch D:\Movies D:\AD [-o D:\Out] [--yes]` prints
+  the pairing table and asks before starting (`--yes`: process the
+  ✔ rows without asking). Ctrl+C stops; `adpatch.py batch --resume`
+  continues.
+
+How pairing decides: files whose lengths differ by more than 15 % are
+never paired; the rest are scored by how well their audio lines up
+(score ≥ 0.08 needed, and a pair must clearly beat every rival —
+otherwise it's marked ⚠ check and preselected for you to confirm). File
+names only break near-ties. Outputs that already exist are skipped.
+Batch is PC-only (phones get the single-file page).
+
 ## Option 3 — Android app (fully on-phone, offline)
 
 1. Install `ADPatcher.apk` from the Releases tab

@@ -1,5 +1,18 @@
 # 06 — Batch mode + content-based pairing (Iteration 5, v0.8.0)
 
+> **Outcome (2026-10-19):** done, with one deliberate simplification:
+> pairing scores **full** envelopes (cached) instead of 3x3-min probes.
+> Matched pairs need the full envelopes for alignment anyway, so the only
+> extra decode is for files that end up unpaired - and it avoids probe
+> windows missing each other under PAL drift (a 4 % speed difference
+> shifts the 85 % probe by ~4 min on a 2 h film). Duration gate widened
+> to 15 % (a 30 s cut on a short episode exceeds 10 %). Score = stage-1
+> speed-scan peak; greedy assignment with 1.5x uniqueness, names as
+> tie-break. tools/batch_test.py: 7 movies incl. two episodes sharing a
+> 60 s intro, a cut, PAL/NTSC, decoy AD, video without AD -> all correct;
+> queue stop/resume (also across a server restart in the web UI) and
+> skip-existing verified.
+
 ## Goal
 
 Point at a folder (or several) of movies and AD files with arbitrary
