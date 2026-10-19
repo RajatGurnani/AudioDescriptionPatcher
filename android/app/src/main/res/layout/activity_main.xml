@@ -80,6 +80,80 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            app:cardBackgroundColor="?attr/colorSurface"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:id="@+id/vbLabel"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingStart="4dp"
+                    android:paddingBottom="6dp"
+                    android:textAppearance="?attr/textAppearanceTitleSmall"
+                    android:text="Voice boost (clearer dialogue)" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/vbLevel"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:contentDescription="Voice boost strength"
+                    app:checkedButton="@+id/vbOff"
+                    app:selectionRequired="true"
+                    app:singleSelection="true">
+
+                    <Button
+                        android:id="@+id/vbOff"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:contentDescription="Voice boost off"
+                        android:text="Off" />
+
+                    <Button
+                        android:id="@+id/vbLow"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:contentDescription="Voice boost low"
+                        android:text="Low" />
+
+                    <Button
+                        android:id="@+id/vbHigh"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:contentDescription="Voice boost high"
+                        android:text="High" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
+                <com.google.android.material.checkbox.MaterialCheckBox
+                    android:id="@+id/vbTrack"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Add extra track: original audio + voice boost" />
+
+                <com.google.android.material.checkbox.MaterialCheckBox
+                    android:id="@+id/vbAd"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Also boost the AD track" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <Button
             android:id="@+id/goButton"
             style="@style/Widget.Material3.Button"
