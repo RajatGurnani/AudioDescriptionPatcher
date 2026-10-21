@@ -171,7 +171,39 @@ def main():
           abs(lv_out - lv_orig) <= 1.5, f"{lv_out:.1f} vs {lv_orig:.1f} dB")
     check("loudness: sync", *in_sync(out, ref))
 
-    # 6. fit to size (GPU encoder if any) on the realistic harness video
+    # 6. voice boost (PC twin of the Android feature): extra boosted
+    # track + boosted AD, in sync, per container / AD encoder priming
+    def stream_env(path, idx):
+        wav = os.path.join(WORK, f"_a{idx}.wav")
+        ff("-i", path, "-map", f"0:a:{idx}", "-ac", "1", "-ar", "8000", wav)
+        return adpatch.onset_envelope(wav)
+
+    def lag_ok(env):
+        import numpy as np
+        L, lags = 500, []
+        for s0 in range(1000, min(len(env), len(ref)) - L - 1000, 2000):
+            m = adpatch.segment_match(env, ref, s0, L, s0, 100)
+            if m and m[1] >= 0.3:
+                lags.append((m[0] - s0) / adpatch.FPS * 1000)
+        worst = max((abs(x) for x in lags), default=float("inf"))
+        return len(lags) >= 5 and worst <= harness.MAX_LAG_MS,             f"{worst:.1f} ms over {len(lags)} windows"
+
+    saved_enc = adpatch._ad_encoder
+    for tag, ext, enc in (("vb_mkv", "mkv", None),
+                          ("vb_mkv_aac", "mkv", ("aac", 1024)),
+                          ("vb_mp4", "mp4", None)):
+        adpatch._ad_encoder = enc or saved_enc
+        out, res, s = run(tag, video, ad, ext,
+                          {"voice_boost": "high", "voice_boost_ad": True})
+        a = kinds(s, "audio")
+        check(f"{tag}: AD + original + boosted track",
+              len(a) == 3 and "voice boost" in a[2]["title"] and
+              not a[2]["default"], str([(x["codec"], x["title"]) for x in a]))
+        check(f"{tag}: boosted AD in sync", *in_sync(out, ref))
+        check(f"{tag}: boosted original in sync", *lag_ok(stream_env(out, 2)))
+    adpatch._ad_encoder = saved_enc
+
+    # 7. fit to size (GPU encoder if any) on the realistic harness video
     big = os.path.join(tempfile.gettempdir(), "adpatch-harness",
                        "video_real_20m.mkv")
     big_ad = os.path.join(tempfile.gettempdir(), "adpatch-harness",

@@ -566,6 +566,14 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
         <label><input type="checkbox" id="o_loud"> match AD loudness to the original</label>
       </div>
       <div class="og">
+        <label>Voice boost <select id="o_vb">
+          <option value="off">off</option><option value="low">low</option>
+          <option value="high">high</option></select></label>
+        <label><input type="checkbox" id="o_vbtrack" checked> extra track
+          (original + boost)</label>
+        <label><input type="checkbox" id="o_vbad"> also boost the AD</label>
+      </div>
+      <div class="og">
         <label>Size <select id="o_fit">
           <option value="">keep the video as is (fast)</option>
           <option value="fit">fit to a size (re-encodes, slow)</option>
@@ -1110,6 +1118,9 @@ function collectOptions() {
              ad_channels: O('o_channels').value ? +O('o_channels').value : null,
              keep_audio: O('o_keepa').value, keep_subs: O('o_keeps').value,
              loudness_match: O('o_loud').checked,
+             voice_boost: O('o_vb').value,
+             voice_boost_track: O('o_vbtrack').checked,
+             voice_boost_ad: O('o_vbad').checked,
              fit_gb: O('o_fit').value ? +O('o_gb').value : null,
              max_height: O('o_fit').value && O('o_height').value ? +O('o_height').value : null};
   if (probedTracks) {   // per-track picks override the coarse choices
@@ -1130,6 +1141,9 @@ function applyOptions(o) {
   O('o_keepa').value = Array.isArray(d.keep_audio) ? 'all' : d.keep_audio;
   O('o_keeps').value = Array.isArray(d.keep_subs) ? 'all' : d.keep_subs;
   O('o_loud').checked = !!d.loudness_match;
+  O('o_vb').value = d.voice_boost || 'off';
+  O('o_vbtrack').checked = d.voice_boost_track !== false;
+  O('o_vbad').checked = !!d.voice_boost_ad;
   O('o_fit').value = d.fit_gb ? 'fit' : '';
   if (d.fit_gb) O('o_gb').value = d.fit_gb;
   O('o_height').value = d.max_height || '';
@@ -1142,7 +1156,9 @@ function syncOptionsUi() {
   O('optsum').textContent = '  ' + [o.container.toUpperCase(),
     o.ad_codec.toUpperCase() + ' ' + o.ad_bitrate,
     o.fit_gb ? 'fit ' + o.fit_gb + ' GB' : null,
-    o.loudness_match ? 'loudness' : null].filter(Boolean).join(' · ');
+    o.loudness_match ? 'loudness' : null,
+    o.voice_boost !== 'off' ? 'voice boost ' + o.voice_boost : null]
+    .filter(Boolean).join(' · ');
   try { localStorage.setItem('adp-options', JSON.stringify(o)); } catch {}
 }
 document.querySelectorAll('#opts select, #opts input').forEach(el =>

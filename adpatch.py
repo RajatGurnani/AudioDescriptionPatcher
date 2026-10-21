@@ -91,7 +91,64 @@ DEFAULT_OPTIONS = {
     "loudness_match": False,   # level the AD to the original's loudness
     "fit_gb": None,            # re-encode video to fit N GB (slow)
     "max_height": None,        # with fit_gb: downscale to this height
+    "voice_boost": "off",      # off | low | high (dialogue clarity)
+    "voice_boost_track": True,  # add "original + voice boost" track
+    "voice_boost_ad": False,   # also boost the AD track itself
 }
+# Voice boost (dialogue clarity) - the PC twin of android VoiceBoost.kt,
+# same parameter table: (side gain, low-shelf dB @150 Hz, presence dB
+# @2.5 kHz, duck dB for out-of-band sound while speech, compressor ratio,
+# threshold dB, makeup dB). See docs/plan/11-voice-boost.md.
+VOICE_BOOST = {
+    "low": (0.6, -3.0, 4.0, 4.0, 2.0, -28.0, 5.5),
+    "high": (0.35, -6.0, 7.0, 8.0, 3.0, -30.0, 8.5),
+}
+VOICE_BOOST_LIMITER_MS = 5.0   # alimiter look-ahead, trimmed back off
+# ffmpeg's acompressor/sidechain ducking take more level than the Kotlin
+# chain; +6 dB extra makeup brings the voice back to ~0 dB like Android
+# (tools/voiceboost_test.py) - clarity up, overall loudness not.
+VOICE_BOOST_PC_MAKEUP_DB = 6.0
+
+
+def voice_boost_graph(inp, out, level, tag="vb", rate=AD_RATE,
+                      extra_trim_s=0.0):
+    """filter_complex fragment: [inp] -> voice-boosted stereo [out].
+
+    Chain (as on Android): low-shelf cut -> side level down (dialogue and
+    narration sit in the centre) -> presence peak -> split into the
+    speech band (300-3400 Hz) and the rest; the rest is ducked by a
+    compressor keyed on the speech band (speech present -> duck) -> RMS
+    compressor + makeup -> -1 dBFS limiter. The limiter looks ahead
+    VOICE_BOOST_LIMITER_MS, which is trimmed off again so the track stays
+    sample-aligned with the original; `extra_trim_s` trims more (encoder
+    priming in mkv).
+    """
+    side, shelf, peak, duck, ratio, thresh, makeup = VOICE_BOOST[level]
+    t = tag
+    band = "highpass=f=300,lowpass=f=3400"
+    duck_ratio = 1 + duck / 2              # ~duck dB at ~4-8 dB over key
+    return ";".join([
+        f"{inp}aresample={rate},aformat=channel_layouts=stereo,"
+        f"lowshelf=f=150:g={shelf},stereotools=slev={side},"
+        f"equalizer=f=2500:t=q:w=0.8:g={peak},asplit=4"
+        f"[{t}x][{t}y][{t}z][{t}k]",
+        f"[{t}x]{band}[{t}band]",
+        f"[{t}z]{band},volume=-1[{t}nb]",
+        f"[{t}y][{t}nb]amix=inputs=2:normalize=0[{t}rest]",
+        f"[{t}k]{band}[{t}key]",
+        f"[{t}rest][{t}key]sidechaincompress=threshold=0.02:"
+        f"ratio={duck_ratio}:attack=20:release=300[{t}ducked]",
+        f"[{t}band][{t}ducked]amix=inputs=2:normalize=0,"
+        f"acompressor=threshold={10 ** (thresh / 20):.5f}:ratio={ratio}:"
+        f"attack=10:release=200:"
+        f"makeup={10 ** ((makeup + VOICE_BOOST_PC_MAKEUP_DB) / 20):.4f},"
+        f"alimiter=limit=0.891:attack={VOICE_BOOST_LIMITER_MS}:"
+        f"release=80:level=0,"
+        f"atrim=start={VOICE_BOOST_LIMITER_MS / 1000 + extra_trim_s:.6f},"
+        f"asetpts=PTS-STARTPTS{out}",
+    ])
+
+
 MP4_AUDIO_OK = {"aac", "mp3", "ac3", "eac3", "opus", "flac", "alac"}
 TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
 VIDEO_ENCODERS = ("hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265")
@@ -111,6 +168,8 @@ BUILTIN_PRESETS = {
     "Phone (MP4, 720p, max 2 GB)": {
         "container": "mp4", "fit_gb": 2.0, "max_height": 720},
     "AD only (replace original audio)": {"keep_audio": "none"},
+    "Clear dialogue (voice boost high, extra track)": {
+        "voice_boost": "high"},
 }
 PRESETS_FILE = os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
@@ -169,6 +228,13 @@ def add_option_args(p):
                    "fit this size (GPU if available; slow)")
     g.add_argument("--max-height", type=int, help="with --fit-gb: "
                    "downscale to this height, e.g. 720")
+    g.add_argument("--voice-boost", choices=("off", "low", "high"),
+                   help="dialogue clarity: adds an 'original + voice "
+                        "boost' track (same DSP as the Android app)")
+    g.add_argument("--voice-boost-ad", action="store_true",
+                   help="with --voice-boost: also boost the AD track")
+    g.add_argument("--no-voice-boost-track", action="store_true",
+                   help="with --voice-boost: don't add the extra track")
 
 
 def options_from_args(args):
@@ -205,6 +271,12 @@ def options_from_args(args):
         opts["keep_subs"] = tracks(args.keep_subs)
     if args.loudness_match:
         opts["loudness_match"] = True
+    if args.voice_boost:
+        opts["voice_boost"] = args.voice_boost
+    if args.voice_boost_ad:
+        opts["voice_boost_ad"] = True
+    if args.no_voice_boost_track:
+        opts["voice_boost_track"] = False
     subs = []
     for spec in args.add_subs:
         # FILE[:LANG[:forced]] - careful with drive letters (C:\...)
@@ -339,6 +411,13 @@ def probe_streams(path):
             streams.append(cur)
         elif cur is not None and re.match(r"\s+title\s*:", line):
             cur["title"] = line.split(":", 1)[1].strip()
+        elif cur is not None and not cur["title"] and \
+                re.match(r"\s+handler_name\s*:", line):
+            # mp4 keeps track names in the handler name
+            name = line.split(":", 1)[1].strip()
+            if name not in ("SoundHandler", "VideoHandler",
+                            "SubtitleHandler"):
+                cur["title"] = name
         elif cur is not None and not line.startswith("      "):
             cur = None if "Stream #" not in line else cur
     return streams
@@ -1262,6 +1341,20 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
         graph = _piecewise_graph(a, pieces, priming_s, fill_gaps, gain)
 
     audio = [st for st in streams if st["type"] == "audio"]
+    vb = opts.get("voice_boost", "off")
+    vb = vb if vb in VOICE_BOOST else None
+    if vb and opts.get("voice_boost_ad"):
+        # both AD graphs end in [ad]: boost it on the way out (the boost
+        # adds no delay - its limiter look-ahead is trimmed)
+        graph = graph[:-len("[ad]")] + "[ad0];" + \
+            voice_boost_graph("[ad0]", "[ad]", vb, "vba")
+        notes.append(f"AD track voice-boosted ({vb})")
+    vb_track = bool(vb and opts.get("voice_boost_track") and audio)
+    if vb_track:
+        # extra track from the first original audio; mkv needs the same
+        # encoder-priming trim as the AD (mp4's edit list handles it)
+        graph += ";" + voice_boost_graph("[0:a:0]", "[vbt]", vb, "vbt",
+                                         extra_trim_s=priming_s)
     subs = [st for st in streams if st["type"] == "subtitle"]
 
     def pick(choice, tracks):
@@ -1282,7 +1375,8 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
 
     # video (copy, or fit-to-size re-encode)
     audio_bps = _bitrate_bps(opts["ad_bitrate"]) + sum(
-        (t["kbps"] or 640) * 1000 for t in keep_a)
+        (t["kbps"] or 640) * 1000 for t in keep_a) + \
+        (192_000 if vb_track else 0)
     v_args, v_notes = _video_args(opts, streams, duration or 1.0, audio_bps)
     cmd += v_args
     notes += v_notes
@@ -1292,6 +1386,8 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
     cmd += ["-map", "[ad]", "-c:a:0", enc_name,
             "-b:a:0", str(opts["ad_bitrate"]),
             "-metadata:s:a:0", f"title={opts['ad_title']}",
+            # mp4 players show the handler name as the track name
+            "-metadata:s:a:0", f"handler_name={opts['ad_title']}",
             "-metadata:s:a:0", f"language={opts['ad_language']}",
             "-disposition:a:0", "default" if ad_default else "0"]
     if opts["ad_channels"]:
@@ -1310,7 +1406,20 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
         cmd += [f"-disposition:a:{k}",
                 "default" if (k == 1 and not ad_default) else "0"]
         if not t["title"]:
-            cmd += [f"-metadata:s:a:{k}", "title=Original Audio"]
+            cmd += [f"-metadata:s:a:{k}", "title=Original Audio",
+                    f"-metadata:s:a:{k}", "handler_name=Original Audio"]
+
+    # extra track: original audio + voice boost (never default)
+    if vb_track:
+        k = 1 + len(keep_a)
+        cmd += ["-map", "[vbt]", f"-c:a:{k}", enc_name, f"-b:a:{k}", "192k",
+                f"-disposition:a:{k}", "0",
+                f"-metadata:s:a:{k}", f"title=Original + voice boost ({vb})",
+                f"-metadata:s:a:{k}",
+                f"handler_name=Original + voice boost ({vb})"]
+        if audio[0]["language"]:
+            cmd += [f"-metadata:s:a:{k}", f"language={audio[0]['language']}"]
+        notes.append(f"extra track: original audio + voice boost ({vb})")
 
     # subtitles: kept + external
     out_s = 0

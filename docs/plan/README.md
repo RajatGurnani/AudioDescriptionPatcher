@@ -1,6 +1,7 @@
 # Roadmap: v0.4 → v1.0 (PC engine + web/desktop app)
 
 Status: **all iterations (0–7) done** on Windows (2026-10-19).
+PC ↔ Android parity: [12-feature-parity.md](12-feature-parity.md).
 Android has the alignment work through iteration 4; iteration 7's
 options are PC-only for now (Android later, per owner). Results
 per iteration in [BENCHMARKS.md](../BENCHMARKS.md). Written
