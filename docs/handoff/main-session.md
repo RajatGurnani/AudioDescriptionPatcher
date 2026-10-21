@@ -78,3 +78,25 @@ file is missing, read that session's transcript in the app.
   test_AD_cut_pal.mp3).
 - Measure sync of any output on the PC: `adpatch.onset_envelope` on the
   output and on the video, then `segment_match` in 5 s windows.
+
+## Update 2026-10-21 — on-device checks PENDING
+
+Main at 655e02e (splice-sync fix e26ade7 + voice boost) builds, and its
+JVM tests pass: AlignerParityTest (Kotlin = Python) and VoiceBoostTest
+(+2.8 / +3.5 dB speech band, wide stereo). APK built locally, **not
+installed**.
+
+The CMF couldn't be reached: Windows logged no USB connect events after
+several replugs and cable changes, and the phone wasn't on wireless adb
+(never paired with this PC). Skipped by the owner; still to do on the
+CMF, in order:
+1. Install main's APK (check the model is A015, pin
+   `-s 00116646S015275`; a second phone, V2310, is on wireless adb —
+   never use it).
+2. Splice-sync check: cut+PAL test pair → expect pieces about 0 / −5 ms
+   (docs/handoff/android-splice-sync.md).
+3. Voice boost run (docs/handoff/voice-boost.md, steps 4–6): High +
+   extra track; check 3 audio streams in sync, then the "boost AD"
+   variant; then bump the version.
+If wireless is easier: on the CMF, Wireless debugging → Pair device with
+pairing code, then `adb pair <ip:port> <code>`.
