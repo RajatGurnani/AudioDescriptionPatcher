@@ -13,6 +13,8 @@ requirements.txt, and a speech model:
   python tools/gaps_ref.py truth FULL ME [--subs X.srt] -o truth.json
   # speech + gaps on any media file (same rules as GapFinder.kt)
   python tools/gaps_ref.py vad MEDIA --model model.int8.onnx -o vad.json
+  # Kotlin parity: --probs-out DIR/NAME.probs.f32 -o DIR/NAME.gaps.json,
+  # then gradle testReleaseUnitTest -Dparity.dir=DIR (GapFinderTest)
   # score detected gaps (vad.json from this tool or the Android probe)
   python tools/gaps_ref.py eval truth.json vad.json
 
@@ -35,8 +37,8 @@ except ImportError:
 # gap rules - keep identical to describe/GapFinder.kt
 MIN_GAP_S = 1.5      # shortest gap worth narrating
 GAP_GUARD_S = 0.2    # keep this far from speech on both sides
-THRESHOLD = 0.5      # Silero speech probability (enter speech)
-NEG_THRESHOLD = 0.35  # leave speech below this
+THRESHOLD = 0.4      # speech probability to enter speech (tuned A2)
+NEG_THRESHOLD = 0.28  # leave speech below this (0.7 x THRESHOLD)
 MIN_SPEECH_S = 0.25
 MIN_SILENCE_S = 0.10
 
@@ -109,6 +111,8 @@ def cmd_vad(a):
     if "x" in [i.name for i in sess.get_inputs()]:
         x = decode(a.media, SEG_SR)[:, 0]
         probs = pyannote_probs(sess, x)
+        if a.probs_out:  # for GapFinderTest (Kotlin rule parity)
+            probs.astype("<f4").tofile(a.probs_out)
         dur = len(x) / SEG_SR
         speech = probs_to_speech(probs, SEG_HOP / SEG_SR)
         res = {"speech": speech, "gaps": gaps_from_speech(speech, dur),
@@ -258,6 +262,7 @@ def main():
     v.add_argument("media"); v.add_argument("--model", required=True)
     v.add_argument("--sr", type=int, default=8000, choices=[8000, 16000])
     v.add_argument("-o", required=True)
+    v.add_argument("--probs-out", help="write pyannote frame probs (f32le)")
     e = sub.add_parser("eval")
     e.add_argument("truth"); e.add_argument("vad")
     e.add_argument("--shift", type=float, default=0.0,

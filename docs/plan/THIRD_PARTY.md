@@ -58,8 +58,9 @@ Model weights are downloaded at runtime, never committed or bundled.
 | Project | Licence | Verdict | What for |
 |---|---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) (`libmtmd`) | MIT | **Use** (A1, fetched at build, commit `7951f60`) | on-device VLM runtime (`android/app/src/main/cpp`); `llama-server` as separate exe for PC path |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | **Use** | Silero VAD, Kokoro, optional Florence-2/TransNetV2 |
-| [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | **Use** | speech/non-speech gaps (8 kHz) |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) (`onnxruntime-android` 1.22.0) | MIT | **Use** (A2) | pyannote segmentation; later Kokoro, optional Florence-2/TransNetV2 |
+| [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) via [sherpa-onnx export](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-segmentation-models) | MIT (CNRS) / export script Apache-2.0 | **Use** (A2, int8 ONNX in `assets/`) | speech/dialogue detection for narration gaps |
+| [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | No (tested A2) | misses film dialogue under music; kept as a `gaps_ref.py` comparison |
 | Qwen3-VL-2B-Instruct | Apache-2.0 | **Use (weights)** | "Best" describer |
 | [SmolVLM2](https://github.com/huggingface/smollm) 256M/500M/2.2B | Apache-2.0 | **Use (weights)** | "Fast" describer |
 | InternVL3/3.5-1B, Moondream 2, Florence-2 | MIT / Apache-2.0 / MIT | Optional | alternatives |

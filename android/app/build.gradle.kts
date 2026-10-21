@@ -76,5 +76,9 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     // FFT for the alignment cross-correlation
     implementation("com.github.wendykierp:JTransforms:3.1")
+    // speech/gap detection model runtime (AI audio description, MIT)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     testImplementation("junit:junit:4.13.2")
+    // real org.json for JVM tests (android.jar ships stubs)
+    testImplementation("org.json:json:20240303")
 }

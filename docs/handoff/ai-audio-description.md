@@ -1,4 +1,9 @@
-# Handoff: AI audio description (2026-10-19)
+# Handoff: AI audio description (2026-10-19, updated 2026-10-21)
+
+> 2026-10-21: A2 resumed — pyannote chosen (th 0.4), `GapFinder.kt` +
+> `GapFinderTest` done and matching the PC reference; results in doc 10
+> "A2 results". Remaining: CMF run (speed, parity on device). The
+> section below is the original 10-19 snapshot.
 
 Branch `claude/ai-ad-generation-c6685c` (not merged to main). Plan +
 research: [docs/plan/10-ai-audio-description.md](../plan/10-ai-audio-description.md).
@@ -12,7 +17,7 @@ research: [docs/plan/10-ai-audio-description.md](../plan/10-ai-audio-description
   Earcatch, …) offer no export or API (§8b).
 - **A1 ✅** (commit 96af797): `android/app/src/main/cpp/` (llama.cpp
   `mtmd` via JNI → `libadpvlm.so`), `describe/VlmDescriber.kt`, adb-only
-  `describe/VlmProbeActivity.kt`. Measured in-app on the CMF at 512 px:
+  `describe/DevProbeActivity.kt`. Measured in-app on the CMF at 512 px:
   SmolVLM2-500M **5.3 s/frame, 1.1 GB**; Qwen3-VL-2B **8.7 s/frame,
   2.6 GB**. A 2 h movie ≈ 20–50 min of VLM time.
 - **A2 in progress** (uncommitted work committed with this handoff):
@@ -82,7 +87,7 @@ adp.ndkPath=C:/Program Files/Unity/Hub/Editor/6000.6.5f1/Editor/Data/PlaybackEng
 ## Probe
 
 ```
-adb -s 00116646S015275 shell am start -n com.fuzzypyjamas.adpatcher/.describe.VlmProbeActivity --es model Qwen3VL-2B-Instruct-Q4_K_M.gguf --es mmproj mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
+adb -s 00116646S015275 shell am start -n com.fuzzypyjamas.adpatcher/.describe.DevProbeActivity --es model Qwen3VL-2B-Instruct-Q4_K_M.gguf --es mmproj mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
 adb -s 00116646S015275 logcat -s ADP-VLM
 ```
 

@@ -1,6 +1,6 @@
 # 10 — AI audio description (generate AD where none exists)
 
-Status: **A1 done** (2026-10-19) — VLM runs in-app on the CMF; next A2.
+Status: **A1 done** (2026-10-19); **A2 PC-side done** (2026-10-21) — `GapFinder.kt` matches the PC reference, on-device run pending (CMF busy).
 Scope: Android app first (`com.fuzzypyjamas.adpatcher`); a PC-assisted
 path reuses the same design. Constraints: open-source, zero cost, local
 models only, licences per [THIRD_PARTY.md](THIRD_PARTY.md).
@@ -108,11 +108,13 @@ optional "natural voice" download in a later iteration.
 
 ## 5. Pause + shot detection (steps 1–2)
 
-- **Speech vs. non-speech:** [Silero VAD](https://github.com/snakers4/silero-vad)
-  (MIT, ~2 MB ONNX, supports **8 kHz**) → reuses the existing 8 kHz mono
-  decode in `AudioEngine`. Gap = no speech ≥ 1.5 s (tunable), merged
-  across < 0.3 s blips, trimmed 0.2 s each side. Fallback without ONNX:
-  energy + spectral-flatness heuristic on the same PCM.
+- **Speech vs. non-speech:** ~~Silero VAD~~ → **pyannote
+  segmentation-3.0** (MIT, CNRS; ONNX int8 export by sherpa-onnx,
+  1.5 MB) via ONNX Runtime, 16 kHz, 10 s windows, 50 % overlap, mean
+  of overlapping probabilities, hysteresis 0.4 / 0.28. Gap = no speech
+  ≥ 1.5 s, 0.2 s guard each side. Decode = `AudioEngine.decodeAudio`
+  (unchanged) → own downmix + 32-tap windowed-sinc resample to 16 kHz.
+  See "A2 results" below.
 - **Shot cuts:** decode video via MediaCodec to a small surface
   (ImageReader, ~64×36 luma) at ~2–4 fps sampled frames, colour-histogram
   + luma-diff cut detector (PySceneDetect's ContentDetector idea, BSD —
@@ -227,7 +229,7 @@ movies, CC-BY) kept local.
 | Iter | Theme | Exit criteria |
 |---|---|---|
 | A1 ✅ | **Spike: llama.cpp on the CMF** — build `libmtmd` for arm64 via NDK, JNI wrapper, load SmolVLM2-500M + Qwen3-VL-2B, caption one bitmap | measured s/frame + peak RAM for both models recorded here; no crash on 5.3 GB — **done**, see §3 "Measured" |
-| A2 | **Gaps** — Silero VAD (ONNX Runtime) on the existing 8 kHz decode → gap list; debug overlay in logs | on 3 test clips, ≥ 90 % of hand-marked gaps found, < 5 % of gaps overlap speech |
+| A2 | **Gaps** — speech model (ONNX Runtime) on the existing decode → gap list | on 3 test clips, ≥ 90 % of real gaps found, < 5 % of gaps overlap speech — **PC: 3.4 % overlap ✅, 86 % of all gaps / 98 % of gaps ≥ 3 s found**; CMF run pending |
 | A3 | **Shots + frame picking** — MediaCodec → small frames, cut detector, gap → frames | cut recall ≥ 85 % on test clips; 2 h movie scanned < 10 min |
 | A4 | **Describe** — prompts, word budget, context, rewrite loop; per-cue checkpoint (8a) | lines fit their gaps; spot review of 30 lines: ≥ 80 % correct + useful; force-stop mid-run resumes at the next cue |
 | A5 | **Speak + mix + mux** — system TTS → PCM, ducking, AAC, default track; UI "Generate AD" job in `PatchService` with progress + cancel | playable output on the CMF and VLC; no narration over dialogue; original track kept |
@@ -235,12 +237,51 @@ movies, CC-BY) kept local.
 | A7 | **Names + context (optional)** — whisper.cpp transcript / subtitles into the prompt | fewer "a man/a woman" in spot review |
 | P1 | **PC path** — same pipeline in `adpatch.py` + `llama-server` on GPU; web/desktop "Generate AD" | 2 h movie < 15 min on dev PC |
 
+### A2 results (2026-10-21)
+
+Ground truth without hand-marking: Blender open movies ship a
+**music+effects stem** next to the full mix. Dialogue = frames where the
+full mix's 300–3400 Hz power is ≥ 6 dB above the level-matched M&E
+(spectral, so ms offsets between stems don't matter), kept only near
+subtitle lines (the stem also holds breaths/grunts/screams, which AD
+may talk over). `tools/gaps_ref.py truth|vad|eval`.
+
+| Clip (CC-BY) | Length | Truth gaps | Stems + subs |
+|---|---|---|---|
+| Tears of Steel | 12:14 | 30 | `TOS_DVDSTEREOMIX.aif` / `TOS_MUSIC+FX_NO_DIALOGUE.aif`, `TOS-en.srt` |
+| Sintel | 14:48 | 19 | 720p mkv (5.1) / `sintel-m+e-st.flac`, embedded German subs |
+| Elephants Dream | 10:58 | 27 | 480p mov / `ED-ME-5.1-DVD.ac3` (starts 2.49 s late, trimmed), Commons `TimedText:Elephants_Dream.ogv.en.srt` |
+
+Speech model comparison (all 3 clips, guard 0.2 s):
+
+| Detector | Dialogue lines hit (ToS, 76) | Gaps found | Gaps overlapping speech |
+|---|---|---|---|
+| Silero VAD 8 kHz, any threshold 0.1–0.5 | 41 | — | 40–100 % per clip |
+| Silero VAD 16 kHz | 48 | — | 45–52 % |
+| pyannote seg-3.0, th 0.5 | 72 | 91 % | 7.0 % (6 / 86) |
+| **pyannote seg-3.0, th 0.4 (chosen)** | — | **86 % (65/76); 98 % of gaps ≥ 3 s (55/56)** | **3.4 % (3 / 88)** |
+| pyannote, th 0.3 | — | 80 % | 2.2 % |
+
+- Silero is fine on clean speech but misses dialogue under film music
+  (12–40 % speech recall on Sintel); stereo centre extraction didn't help.
+- Missed gaps at th 0.4 are 1.6–3.7 s long — the narration budget there
+  is 4–9 words; long gaps are all found. Overlaps left: single shouted
+  words with model probability 0.33–0.47.
+- 75 % window overlap and max-instead-of-mean were not better.
+- Kotlin = Python: `GapFinderTest` replays the PC model probabilities
+  through `GapFinder.probsToSpeech/gapsFromSpeech` → identical gaps on
+  all 3 clips; resampler test (48 kHz stereo → 16 kHz: 440 Hz kept,
+  10 kHz alias < −34 dB, pts lead preserved).
+- PC speed: pyannote int8 ≈ 4–6 s CPU per 12 min of audio.
+- APK grows 13 → 33 MB (ONNX Runtime 18 MB arm64). Options later:
+  ORT custom minimal build (~3–5 MB), or run the model through ggml.
+
 A1 build notes: `android/app/src/main/cpp/` (CMake fetches llama.cpp
 at a pinned commit + SHA-256, links `mtmd`+`llama` statically into
 `libadpvlm.so`, 7 MB; APK 13 MB). `ndk.abiFilters = arm64-v8a`, so the
 APK no longer installs on 32-bit-only phones — fine for now; revisit
 (stub lib or dynamic feature) before a public release. Dev probe:
-`describe/VlmProbeActivity` (adb-only via DUMP permission) reads
+`describe/DevProbeActivity` (adb-only via DUMP permission) reads
 `files/models/*.gguf` + `files/frames/*.jpg`, logs to tag `ADP-VLM`.
 
 Risks: RAM (Qwen3-VL-2B + decode buffers on 5.3 GB; fall back to
