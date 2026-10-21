@@ -182,6 +182,38 @@ prompt cache off, median of 11 warm requests:
   espeak-ng only as a separate exe/dll — allowed on PC); GPU via
   ONNX Runtime DirectML/CUDA only if CPU proves too slow (A6).
 
+### Target PC (owner, 2026-10-21): Ryzen 5 250 laptop + RTX 5060 Laptop (8 GB, Blackwell sm_120)
+
+The GTX 1650 numbers above are the dev box only. Sizing for the target:
+
+- **No PyTorch anywhere** in this pipeline (llama.cpp + ONNX Runtime +
+  ffmpeg), so the "torch needs cu128+ for sm_120" problem doesn't
+  arise. What matters:
+  - llama.cpp **Vulkan** build: works on any driver/arch, fully open →
+    default, same as on the dev box.
+  - llama.cpp **CUDA** build must be **CUDA ≥ 12.8** for sm_120 (the
+    `cuda-12.4` release zip has no Blackwell kernels; use the
+    `cuda-13.x` zip + its `cudart` zip). Optional, pick whichever
+    benchmarks faster on the target (proprietary runtime DLLs).
+  - ONNX Runtime (pyannote, Kokoro): CPU is fast enough (pyannote
+    ≈ 5 s per 12 min on the dev CPU); GPU EP not needed.
+- **Model by free VRAM** (auto-picked at start, override in settings):
+
+  | Free VRAM | Describer | Weights + mmproj + KV (ctx 2048) |
+  |---|---|---|
+  | ≥ 7 GB (RTX 5060 8 GB) | **Qwen3-VL-8B** Q4_K_M | 5.0 + 0.75 + ~0.3 ≈ 6.1 GB |
+  | 4–7 GB | Qwen3-VL-4B Q4_K_M | 2.5 + 0.45 + ~0.3 ≈ 3.3 GB |
+  | 2.5–4 GB | Qwen3-VL-2B Q4_K_M | ≈ 2.0 GB |
+  | no usable GPU | **CPU fallback**: Qwen3-VL-2B Q4_K_M on CPU (or Vulkan on the Radeon iGPU) | RAM ≈ 2.6 GB |
+
+  Expected on the 5060 (estimate, measure on the target): 8B fully on
+  GPU ≈ 1–2 s/frame (8B partly on CPU took 8–11 s on the 1650; fully
+  resident it is bandwidth-bound like the 4B), i.e. a 2 h film's lines
+  in ~5–10 min. CPU fallback (Ryzen 5 250, 6 Zen 4 cores) ≈ 3–6 s/frame
+  for 2B → ~15–30 min per film.
+- P1 exit criteria get a target-PC run: measure 8B/4B on the 5060
+  (Vulkan vs CUDA 13.x) and the CPU fallback, record here.
+
 Three ways to run, one pipeline (`Describer` interface):
 
 | Mode | Gaps + shots + TTS + mux | Descriptions | Best for |
@@ -264,7 +296,7 @@ movies, CC-BY) kept local.
 | A5 | **Speak + mix + mux** — system TTS → PCM, ducking, AAC, default track; UI "Generate AD" job in `PatchService` with progress + cancel | playable output on the CMF and VLC; no narration over dialogue; original track kept |
 | A6 | **Natural voice** — Kokoro ONNX + dictionary G2P, optional download | RTF measured; A/B vs. system TTS |
 | A7 | **Names + context (optional)** — whisper.cpp transcript / subtitles into the prompt | fewer "a man/a woman" in spot review |
-| P1 | **PC fast path** — same pipeline in `adpatch.py` + `llama-server` (Vulkan, Qwen3-VL-4B); web/desktop "Generate AD" | 2 h movie < 15 min on dev PC; lines spot-checked vs. phone 2B |
+| P1 | **PC fast path** — same pipeline in `adpatch.py` + `llama-server` (Vulkan; model picked by free VRAM: 8B/4B/2B, CPU fallback); web/desktop "Generate AD" | 2 h movie < 15 min on dev PC; target RTX 5060 + CPU-fallback runs recorded; lines spot-checked vs. phone 2B |
 | P2 | **Phone → PC offload** — `POST /api/describe` in `app.py`, phone `Describer` backend with on-device fallback | phone job uses PC lines; pulling Wi-Fi mid-job falls back without losing cues |
 
 ### A2 results (2026-10-21)
