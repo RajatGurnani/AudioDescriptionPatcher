@@ -129,6 +129,7 @@ object JobRunner {
                     setStage("analyzing both audio streams…")
                     var vidEnv: FloatArray? = null
                     var adEnv: FloatArray? = null
+                    var hits = 0
                     var decodeError: Throwable? = null
                     var pv = 0f
                     var pa = 0f
@@ -136,21 +137,29 @@ object JobRunner {
                     timed("audio analysis") {
                         val tv = Thread {
                             try {
-                                vidEnv = AudioEngine.onsetEnvelopeParallel(
-                                    app, videoUri, 2)
-                                { f -> pv = f; combined((pv + pa) * 0.5f) }
+                                val (e, hit) = EnvelopeCache.get(app,
+                                    videoUri, { f -> pv = f
+                                        combined((pv + pa) * 0.5f) }) {
+                                    AudioEngine.onsetEnvelopeParallel(
+                                        app, videoUri, 2, it) }
+                                vidEnv = e; if (hit) hits++
                             } catch (t: Throwable) { decodeError = t }
                         }
                         val ta = Thread {
                             try {
-                                adEnv = AudioEngine.onsetEnvelopeParallel(
-                                    app, adUri, 2)
-                                { f -> pa = f; combined((pv + pa) * 0.5f) }
+                                val (e, hit) = EnvelopeCache.get(app,
+                                    adUri, { f -> pa = f
+                                        combined((pv + pa) * 0.5f) }) {
+                                    AudioEngine.onsetEnvelopeParallel(
+                                        app, adUri, 2, it) }
+                                adEnv = e; if (hit) hits++
                             } catch (t: Throwable) { decodeError = t }
                         }
                         tv.start(); ta.start(); tv.join(); ta.join()
                     }
                     decodeError?.let { throw it }
+                    if (hits > 0) log("analysis: $hits of 2 envelopes " +
+                        "from cache")
                     log("video: %.1f min".format(
                         vidEnv!!.size / AudioEngine.FPS / 60))
                     log("AD audio: %.1f min".format(

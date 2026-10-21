@@ -120,6 +120,7 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
         }
 
         setupVoiceBoost()
+        setupOutput()
         restoreInputs()
         offerResumeIfAny()
         UpdateChecker.check(this, manual = false)
@@ -216,6 +217,26 @@ class MainActivity : AppCompatActivity(), JobRunner.Listener {
             if (checked) save() }
         track.setOnCheckedChangeListener { _, _ -> save() }
         ad.setOnCheckedChangeListener { _, _ -> save() }
+    }
+
+    /** Output card: AD bitrate + keep original audio, saved on change;
+     *  Patcher reads the saved OutputOptions. */
+    private fun setupOutput() {
+        val group = findViewById<com.google.android.material.button
+            .MaterialButtonToggleGroup>(R.id.outBitrate)
+        val keep = findViewById<android.widget.CheckBox>(R.id.outKeepOrig)
+        val ids = mapOf(128_000 to R.id.outBr128, 192_000 to R.id.outBr192,
+            256_000 to R.id.outBr256)
+        val o = OutputOptions.load(this)
+        group.check(ids.getValue(o.adBitrate))
+        keep.isChecked = o.keepOriginal
+        fun save() = OutputOptions(
+            ids.entries.firstOrNull { it.value == group.checkedButtonId }
+                ?.key ?: OutputOptions.DEFAULT_BITRATE,
+            keep.isChecked).save(this)
+        group.addOnButtonCheckedListener { _, _, checked ->
+            if (checked) save() }
+        keep.setOnCheckedChangeListener { _, _ -> save() }
     }
 
     private fun updateButton() {

@@ -57,7 +57,8 @@ object Patcher {
         a: Double, bSec: Double,
         log: (String) -> Unit, onProgress: (Float) -> Unit,
         pieces: List<Aligner.Piece> = emptyList(),
-        boost: VoiceBoost.Options = VoiceBoost.Options.load(context)
+        boost: VoiceBoost.Options = VoiceBoost.Options.load(context),
+        output: OutputOptions = OutputOptions.load(context)
     ) {
         val t0 = android.os.SystemClock.elapsedRealtime()
         fun logT(msg: String) = android.util.Log.d(TAG,
@@ -110,7 +111,10 @@ object Patcher {
                     var origTrackOut = -1
                     val origMime =
                         audioFormat?.getString(MediaFormat.KEY_MIME)
-                    if (audioFormat != null && origMime in COPYABLE_AUDIO) {
+                    if (audioFormat != null && !output.keepOriginal) {
+                        log("original audio left out (output option)")
+                    } else if (audioFormat != null &&
+                        origMime in COPYABLE_AUDIO) {
                         origTrackOut = muxer.addTrack(audioFormat)
                     } else if (audioFormat != null) {
                         log("original audio ($origMime) can't be copied " +
@@ -179,7 +183,7 @@ object Patcher {
                             adTrackOut, a, bSec, outRate, onProgress,
                             pieces,
                             if (boost.boostsAd) boost.level
-                            else VoiceBoost.Level.OFF)
+                            else VoiceBoost.Level.OFF, output.adBitrate)
                     } catch (t: Throwable) { adError = t }
                     copyThread.join()
                     boostThread?.join()
@@ -220,10 +224,11 @@ object Patcher {
         extractor.unselectTrack(trackIn)
     }
 
-    internal fun encoderFormat(outRate: Int): MediaFormat =
+    internal fun encoderFormat(outRate: Int,
+                               bitrate: Int = AD_BITRATE): MediaFormat =
         MediaFormat.createAudioFormat(
             MediaFormat.MIMETYPE_AUDIO_AAC, outRate, OUT_CHANNELS).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, AD_BITRATE)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_AAC_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 16)
@@ -380,7 +385,8 @@ object Patcher {
         track: Int, a: Double, bSec: Double, outRate: Int,
         onProgress: (Float) -> Unit,
         pieces: List<Aligner.Piece> = emptyList(),
-        boostLevel: VoiceBoost.Level = VoiceBoost.Level.OFF
+        boostLevel: VoiceBoost.Level = VoiceBoost.Level.OFF,
+        bitrate: Int = AD_BITRATE
     ) {
         // Different edit: AD is placed piece by piece (output frame ranges
         // [startJ, endJ) read AD from adFrom on), silence in gaps, 10 ms
@@ -402,7 +408,7 @@ object Patcher {
         val delay = encoderDelay(outRate)
         val encoder = MediaCodec.createEncoderByType(
             MediaFormat.MIMETYPE_AUDIO_AAC)
-        encoder.configure(encoderFormat(outRate), null, null,
+        encoder.configure(encoderFormat(outRate, bitrate), null, null,
             MediaCodec.CONFIGURE_FLAG_ENCODE)
         encoder.start()
         val sink = EncoderSink(encoder, muxer, muxerLock, track, outRate,
