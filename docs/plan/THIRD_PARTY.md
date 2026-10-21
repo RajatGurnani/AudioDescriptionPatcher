@@ -69,7 +69,8 @@ Model weights are downloaded at runtime, never committed or bundled.
 | [Kokoro-82M](https://github.com/hexgrad/kokoro) | Apache-2.0 | **Use (weights)** | natural voice (optional download) |
 | [misaki](https://github.com/hexgrad/misaki) lexicons, CMUdict | Apache-2.0 / BSD | **Use (data)** | dictionary G2P for Kokoro without espeak-ng |
 | [microsoft/ai-audio-descriptions](https://github.com/microsoft/ai-audio-descriptions) | MIT | **Adapt** | GenerateAD/RenderAD split, WebVTT cues, fit + duck + mix |
-| [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) | BSD-3 | **Adapt** | ContentDetector cut heuristic (re-implemented in Kotlin) |
+| [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) | BSD-3 | **Idea + dev reference** (A3) | adaptive-ratio cut idea (own implementation); `tools/shots_ref.py ref` uses it (+ opencv-python, Apache-2.0) as a dev-only reference, not shipped |
+| Windows SAPI (`System.Speech`) | part of Windows | **Use (OS API)** | PC TTS until Kokoro (A6); called through PowerShell, nothing bundled |
 | [TransNetV2](https://github.com/soCzech/TransNetV2) | MIT | Optional | learned shot detection |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | MIT | Optional | dialogue transcript for names/context |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Apache-2.0, TTS links espeak-ng | **No** (linked) | pulls GPL-3.0 espeak-ng into the APK |

@@ -19,6 +19,9 @@ import kotlin.concurrent.thread
  *   # A1: caption every jpg/png in frames/ with a VLM
  *   adb shell am start -n com.fuzzypyjamas.adpatcher/.describe.DevProbeActivity \
  *       --es model X.gguf --es mmproj mmproj-X.gguf [--ei maxImgTok 256]
+ *   # A3: shots (+ cues and frames when the A2 gaps file exists)
+ *   adb shell am start -n com.fuzzypyjamas.adpatcher/.describe.DevProbeActivity \
+ *       --es task shots --es clip NAME [--ei workers 2]
  *   # A2: narration gaps of clips/NAME -> out/NAME.gaps.json
  *   adb shell am start -n com.fuzzypyjamas.adpatcher/.describe.DevProbeActivity \
  *       --es task gaps --es clip NAME [--ei workers 4] [--ei threads 2]
@@ -33,6 +36,7 @@ class DevProbeActivity : Activity() {
                 when (task) {
                     "gaps" -> runGaps(intent.getStringExtra("clip") ?: "")
                     "decode" -> runDecode(intent.getStringExtra("clip") ?: "")
+                    "shots" -> runShots(intent.getStringExtra("clip") ?: "")
                     else -> runVlm()
                 }
             } catch (t: Throwable) {
@@ -63,6 +67,49 @@ class DevProbeActivity : Activity() {
         Log.i(TAG, "gaps $clip: ${res.speech.size} speech, ${res.gaps.size} gaps " +
             "(${res.gaps.sumOf { it[1] - it[0] }.toInt()} s) in ${res.durationS.toInt()} s audio; " +
             "$ms ms (${"%.1f".format(res.durationS * 1000 / ms)}x realtime), ${memMb()} -> ${out.name}")
+    }
+
+    /** A3: shots of clips/NAME -> out/NAME.shots.json; with out/NAME.gaps.json
+     *  also plans cues -> out/NAME.cues.json and grabs their frames. */
+    private fun runShots(clip: String) {
+        val src = File(getExternalFilesDir("clips"), clip)
+        val outDir = getExternalFilesDir("out")!!
+        val workers = intent.getIntExtra("workers", 2)
+        val sd = ShotDetector(workers)
+        var lastPct = -1
+        val res = sd.analyze(this, Uri.fromFile(src)) { f ->
+            val pct = (f * 100).toInt()
+            if (pct / 10 != lastPct / 10) { lastPct = pct; Log.i(TAG, "shots $pct%") }
+        }
+        File(outDir, "$clip.shots.json").writeText(
+            res.toJson().put("wall_ms", sd.wallMs).put("workers", workers).toString())
+        Log.i(TAG, "shots $clip: ${res.cuts.size} cuts, ${res.frames} frames in ${res.durationS.toInt()} s; " +
+            "${sd.wallMs} ms (${"%.1f".format(res.durationS * 1000 / sd.wallMs)}x realtime, " +
+            "${"%.0f".format(res.frames * 1000.0 / sd.wallMs)} fps, workers=$workers), ${memMb()}")
+        val gapsFile = File(outDir, "$clip.gaps.json")
+        if (!gapsFile.exists()) return
+        val cues = CuePlanner.plan(GapFinder.load(gapsFile).gaps, res.shots())
+        File(outDir, "$clip.cues.json").writeText(
+            org.json.JSONArray().apply { cues.forEach { put(it.toJson()) } }.toString())
+        val fdir = File(outDir, "$clip.frames").apply { mkdirs() }
+        val t = SystemClock.elapsedRealtime()
+        var n = 0
+        val r = android.media.MediaMetadataRetriever()
+        try {
+            r.setDataSource(src.path)
+            for ((i, c) in cues.withIndex()) for ((j, ft) in c.frameTimes.withIndex()) {
+                val bmp = CuePlanner.grab(r, ft) ?: continue
+                File(fdir, "c%03d_%d.jpg".format(i, j)).outputStream().use {
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, it)
+                }
+                bmp.recycle(); n++
+            }
+        } finally {
+            r.release()
+        }
+        File(outDir, "$clip.cues.timing").writeText("grab_ms=${SystemClock.elapsedRealtime() - t} frames=$n\n")
+        Log.i(TAG, "cues $clip: ${cues.size} cues (${cues.count { it.fresh }} fresh), $n frames grabbed " +
+            "in ${SystemClock.elapsedRealtime() - t} ms")
     }
 
     /** Decode-only and decode+resample timings (no model). */

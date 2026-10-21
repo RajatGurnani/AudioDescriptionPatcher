@@ -1,6 +1,6 @@
 # 10 — AI audio description (generate AD where none exists)
 
-Status: **A1 done** (2026-10-19); **A2 done** (2026-10-21) — pyannote gaps on the CMF match the PC reference at 42–52× realtime; next A3 (shots).
+Status: A1, A2, **A3 done**; **P1 first version works** (`adgen.py`, 2026-10-21). Next: A4 (describe on the phone), P1 polish (web/desktop button, speed), A5.
 Scope: Android app first (`com.fuzzypyjamas.adpatcher`); a PC-assisted
 path reuses the same design. Constraints: open-source, zero cost, local
 models only, licences per [THIRD_PARTY.md](THIRD_PARTY.md).
@@ -291,12 +291,12 @@ movies, CC-BY) kept local.
 |---|---|---|
 | A1 ✅ | **Spike: llama.cpp on the CMF** — build `libmtmd` for arm64 via NDK, JNI wrapper, load SmolVLM2-500M + Qwen3-VL-2B, caption one bitmap | measured s/frame + peak RAM for both models recorded here; no crash on 5.3 GB — **done**, see §3 "Measured" |
 | A2 | **Gaps** — speech model (ONNX Runtime) on the existing decode → gap list | on 3 test clips, ≥ 90 % of real gaps found, < 5 % of gaps overlap speech — **✅ CMF = PC: 3.0–3.7 % overlap per clip, 86 % of all gaps / 98 % of gaps ≥ 3 s found; 42–52× realtime, ~170 MB** |
-| A3 | **Shots + frame picking** — MediaCodec → small frames, cut detector, gap → frames | cut recall ≥ 85 % on test clips; 2 h movie scanned < 10 min |
+| A3 ✅ | **Shots + frame picking** — MediaCodec → small frames, cut detector, gap → frames | cut recall ≥ 85 % on test clips; 2 h movie scanned < 10 min — **recall 91–100 % vs two references; CMF ≈ 8 min per 2 h of 720p** |
 | A4 | **Describe** — prompts, word budget, context, rewrite loop; per-cue checkpoint (8a) | lines fit their gaps; spot review of 30 lines: ≥ 80 % correct + useful; force-stop mid-run resumes at the next cue |
 | A5 | **Speak + mix + mux** — system TTS → PCM, ducking, AAC, default track; UI "Generate AD" job in `PatchService` with progress + cancel | playable output on the CMF and VLC; no narration over dialogue; original track kept |
 | A6 | **Natural voice** — Kokoro ONNX + dictionary G2P, optional download | RTF measured; A/B vs. system TTS |
 | A7 | **Names + context (optional)** — whisper.cpp transcript / subtitles into the prompt | fewer "a man/a woman" in spot review |
-| P1 | **PC fast path** — same pipeline in `adpatch.py` + `llama-server` (Vulkan; model picked by free VRAM: 8B/4B/2B, CPU fallback); web/desktop "Generate AD" | 2 h movie < 15 min on dev PC; target RTX 5060 + CPU-fallback runs recorded; lines spot-checked vs. phone 2B |
+| P1 (v1 ✅) | **PC fast path** — `adgen.py` (CLI) + `llama-server` (Vulkan; model picked by free VRAM: 8B/4B/2B, CPU fallback); web/desktop "Generate AD" | 2 h movie < 15 min on dev PC; target RTX 5060 + CPU-fallback runs recorded; lines spot-checked vs. phone 2B |
 | P2 | **Phone → PC offload** — `POST /api/describe` in `app.py`, phone `Describer` backend with on-device fallback | phone job uses PC lines; pulling Wi-Fi mid-job falls back without losing cues |
 
 ### A2 results (2026-10-21)
@@ -345,6 +345,65 @@ Speech model comparison (all 3 clips, guard 0.2 s):
   PSS ~170 MB**; model time ≈ 9–10 s summed per clip.
 - APK grows 13 → 33 MB (ONNX Runtime 18 MB arm64). Options later:
   ORT custom minimal build (~3–5 MB), or run the model through ggml.
+
+### A3 results (2026-10-21)
+
+Detector (`ShotDetector.kt` = `tools/shots_ref.py own` = `adgen.find_shots`):
+per frame, 64×36 Y + 32×18 U/V block means; score = mean|ΔY|+|ΔU|+|ΔV|
+vs. the previous frame; cut where score ≥ 12 and ≥ 3× the mean of the 4
+neighbouring scores, ≥ 0.6 s apart. Phone reads 1/16 of the pixels per
+block (every 4th pixel/row) from MediaCodec's YUV output.
+
+| Clip | PySceneDetect Adaptive (BSD) | ffmpeg `scene>0.3` | CMF vs PC detector |
+|---|---|---|---|
+| Tears of Steel | recall 100 %, precision 95 % | 94.8 % / 94 % | 99.3 % / 100 % |
+| Sintel | 97.9 % / 85 % | 94.6 % / 54 % | 100 % / 100 % |
+| Elephants Dream | n/a (OpenCV mis-times this VFR file) | 91.6 % / 70 % | 97.3 % / 100 % |
+
+- Extra cuts vs. the references are mostly fast motion/flashes; harmless
+  (more candidate frames, the planner caps frames per cue).
+- Phone speed (2 parallel HW decoders, ByteBuffer YUV): ED 480p 536 fps,
+  ToS 720p 385 fps, Sintel 720p 345 fps → **2 h of 720p/24 fps ≈ 8 min**,
+  PSS ~120 MB. 1080p will be slower (try 3 decoders / keyframe mode).
+- Bugs found on device: `toUs + 1 s` overflowed for the last range
+  (Long.MAX) → that worker decoded nothing; ffmpeg rawvideo output
+  silently duplicated frames (CFR) in the PC reference → `-fps_mode
+  passthrough`.
+- Cue planning (`CuePlanner.kt` = `adgen.plan_cues`): per gap, the ≤ 3
+  newest shots visible in [gap − 4 s, gap end], one frame at the middle
+  of each visible part; gaps > 10 s split into equal cues; a cue whose
+  shots were all shown before is kept only if ≥ 4 s. ED: 55 cues, ToS 71,
+  Sintel 85 (per ~11–15 min).
+- Frame grabs on the phone (`MediaMetadataRetriever`, closest frame,
+  512 px): 0.07 s (ED) to 0.5 s (Sintel, long GOP) per frame — small
+  next to ~9 s of VLM per cue, so A4 grabs lazily per cue.
+
+### P1 results (2026-10-21, dev PC GTX 1650, `adgen.py`)
+
+`python adgen.py VIDEO [-o OUT] [--model auto|2b|4b|8b|cpu]`; one-time
+`--setup` downloads the pinned llama.cpp Vulkan build + model (SHA-256
+checked) into `%LOCALAPPDATA%\ADPatcheri`. Checkpoints per stage in
+`ai\jobs\<content key>\` (gaps.json, shots.json, lines.jsonl appended
+per cue, tts\*.wav) — a rerun resumes ("from checkpoint" verified).
+
+Elephants Dream (11 min) with Qwen3-VL-4B (Vulkan): gaps 5.0 s, shots
+2.7 s, describe 140 s for 56 cues (131 s inside the VLM ≈ 2.3 s/cue with
+1–3 frames + occasional shorten request), SAPI TTS 2.6 s, mux 5.6 s.
+53 lines spoken, 2 dropped (1.5 s cues too short for SAPI). Output: video
+copied, a:0 "Audio description (AI)" default = original ducked by a
+sidechain compressor under the narration + narration, a:1 original.
+Outside cues a:0 = a:1 (−24.7 dB both); inside cues the film is ducked.
+
+- 2 h estimate on the GTX 1650: ~30 min (4B) → **misses the < 15 min
+  goal on the dev box**; options: 2B (~1.5 s/cue), 2 frames max, skip the
+  shorten round-trip by asking for fewer words. Target RTX 5060 with 8B
+  is expected ~2× faster per cue than the 1650 with 4B — measure there.
+- Sample lines: "A man walks along a narrow, wire-laced bridge, lit by a
+  single spotlight." / "Man lunges forward, grabbing another man's arm." /
+  credits read out correctly. Weak spots for A4: some interpretation
+  ("startled", "surprised expression"), repeats across adjacent cues.
+- TTS for now = Windows SAPI (built into Windows, zero cost); Kokoro is
+  A6. Narration level/ducking depth still to tune (A5).
 
 A1 build notes: `android/app/src/main/cpp/` (CMake fetches llama.cpp
 at a pinned commit + SHA-256, links `mtmd`+`llama` statically into
