@@ -58,6 +58,8 @@ Model weights are downloaded at runtime, never committed or bundled.
 | Project | Licence | Verdict | What for |
 |---|---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) (`libmtmd`) | MIT | **Use** (A1, fetched at build, commit `7951f60`) | on-device VLM runtime (`android/app/src/main/cpp`); `llama-server` as separate exe for PC path |
+| llama.cpp prebuilt `llama-server` (Vulkan, Windows) | MIT | **Run** (PC path, separate exe) | Qwen3-VL-4B on the GTX 1650; Vulkan preferred over the CUDA build, whose `cudart`/`cublas` DLLs are NVIDIA-proprietary (free, not open) |
+| Qwen3-VL-4B-Instruct | Apache-2.0 | **Use (weights, PC)** | PC describer |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) (`onnxruntime-android` 1.22.0) | MIT | **Use** (A2) | pyannote segmentation; later Kokoro, optional Florence-2/TransNetV2 |
 | [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) via [sherpa-onnx export](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-segmentation-models) | MIT (CNRS) / export script Apache-2.0 | **Use** (A2, int8 ONNX in `assets/`) | speech/dialogue detection for narration gaps |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | No (tested A2) | misses film dialogue under music; kept as a `gaps_ref.py` comparison |

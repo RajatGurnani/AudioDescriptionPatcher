@@ -153,20 +153,49 @@ New code goes in **new files** (`describe/` package: `GapFinder`,
 changed by another session; we only call their public functions and
 coordinate if a change there is needed.
 
-## 8. On-device vs. PC-assisted
+## 8. On-device vs. PC (GPU) vs. PC-assisted phone
 
-| | On-device (CMF) | PC-assisted (GTX 1650) |
-|---|---|---|
-| VLM | Qwen3-VL-2B Q4 / SmolVLM2-500M, CPU | Qwen3-VL-2B fully on GPU, or Qwen3-VL-4B Q4 partly offloaded; via `llama-server` (MIT, separate exe) |
-| Est. 2 h movie | 30 min – 2 h | ~5–15 min |
-| TTS | system TTS / Kokoro | Kokoro (`kokoro-onnx`, MIT; espeak-ng as separate exe/dll = allowed) |
-| Fit | needs ~2–3 GB free RAM, model download | phone uses the existing web app on Wi-Fi |
+Owner (2026-10-21): "the pc can use the gpu too". Measured on the dev PC
+(GTX 1650 4 GB, driver 596.36) with llama.cpp `b11785` prebuilt
+`llama-server` (MIT, run as a separate exe), same 512 px Sintel frames
+and AD prompt as A1, model resident, `--image-max-tokens 256`, ctx 2048,
+prompt cache off, median of 11 warm requests:
 
-Recommendation: build the **pipeline once, on-device first** (the ask),
-keep model calls behind a `Describer` interface so a PC backend
-(`llama-server` on the LAN) can be added later with no other changes.
-`adpatch.py` gets the same pipeline in Python for the harness-style
-testing and the desktop app.
+| Model (Q4_K_M + mmproj Q8_0) | Vulkan build | CUDA 12.4 build | VRAM | CMF (A1, CPU) |
+|---|---|---|---|---|
+| Qwen3-VL-2B | **0.96 s** | 1.37 s | 2.3 GB | 8.7 s |
+| **Qwen3-VL-4B** | **1.49 s** | 2.26 s | 3.5–3.6 GB | doesn't fit well (5.3 GB RAM) |
+| Qwen3-VL-8B (auto-fit, part on CPU) | — | 8–11 s | 3.75 GB | — |
+
+- **Vulkan beats CUDA here and is fully open** (CUDA needs NVIDIA's
+  proprietary `cudart`/`cublas` DLLs; free but not open source) →
+  PC default = Vulkan build. First request after load is slow
+  (2–80 s shader/kernel warm-up): warm up once per job.
+- **4B is the PC sweet spot**: noticeably better lines than 2B
+  ("A character crouches in a narrow, rubble-strewn alleyway…",
+  "A hand gestures toward a flying, winged creature…") at 1.5 s/frame.
+  8B doesn't fit 4 GB and is slower than the phone. 4B near the VRAM
+  limit spiked to 6–7 s/frame at ctx 4096 → keep ctx ≤ 2048.
+- Budget, 2 h film (~300 descriptions): **PC 4B ≈ 7–8 min**, PC 2B ≈
+  5 min, CMF 2B ≈ 45 min, CMF Smol ≈ 27 min.
+- TTS on PC: Kokoro via `kokoro-onnx` (MIT) on CPU first (phonemizer
+  espeak-ng only as a separate exe/dll — allowed on PC); GPU via
+  ONNX Runtime DirectML/CUDA only if CPU proves too slow (A6).
+
+Three ways to run, one pipeline (`Describer` interface):
+
+| Mode | Gaps + shots + TTS + mux | Descriptions | Best for |
+|---|---|---|---|
+| Phone only | phone | Qwen3-VL-2B / Smol on CPU | no PC around |
+| **PC only (fast path)** | `adpatch.py` (ffmpeg decode, pyannote ONNX on CPU, ffmpeg scene score, ffmpeg mux) | Qwen3-VL-4B, `llama-server` Vulkan | files already on the PC; desktop/web app |
+| **Phone + PC offload** | phone | phone sends 512 px JPEGs (~20 KB, ~6 MB per film) to the PC app over Wi-Fi; PC answers with lines | phone files, much better/faster lines |
+
+Offload protocol: new `POST /api/describe` in `app.py` (LAN, same
+port 8756; phone already reaches the web app this way), body = frames +
+context, reply = lines; PC keeps one `llama-server` warm while jobs run
+and stops it after idle. Phone falls back to on-device if the PC
+disappears mid-job (per-cue checkpoint, §8a, makes that seamless).
+Nothing leaves the LAN.
 
 ## 8a. Resume from any point (required)
 
@@ -235,7 +264,8 @@ movies, CC-BY) kept local.
 | A5 | **Speak + mix + mux** — system TTS → PCM, ducking, AAC, default track; UI "Generate AD" job in `PatchService` with progress + cancel | playable output on the CMF and VLC; no narration over dialogue; original track kept |
 | A6 | **Natural voice** — Kokoro ONNX + dictionary G2P, optional download | RTF measured; A/B vs. system TTS |
 | A7 | **Names + context (optional)** — whisper.cpp transcript / subtitles into the prompt | fewer "a man/a woman" in spot review |
-| P1 | **PC path** — same pipeline in `adpatch.py` + `llama-server` on GPU; web/desktop "Generate AD" | 2 h movie < 15 min on dev PC |
+| P1 | **PC fast path** — same pipeline in `adpatch.py` + `llama-server` (Vulkan, Qwen3-VL-4B); web/desktop "Generate AD" | 2 h movie < 15 min on dev PC; lines spot-checked vs. phone 2B |
+| P2 | **Phone → PC offload** — `POST /api/describe` in `app.py`, phone `Describer` backend with on-device fallback | phone job uses PC lines; pulling Wi-Fi mid-job falls back without losing cues |
 
 ### A2 results (2026-10-21)
 
