@@ -79,7 +79,19 @@ file is missing, read that session's transcript in the app.
 - Measure sync of any output on the PC: `adpatch.onset_envelope` on the
   output and on the video, then `segment_match` in 5 s windows.
 
-## Update 2026-10-21 — on-device checks PENDING
+## Update 2026-10-21 (later) — on-device checks DONE
+
+All passed on the CMF; results are in docs/plan/09 and docs/plan/11.
+**adb gotcha:** the CMF only appeared on **Unity's** adb server (port
+5038), not the SDK one. Use Unity's binary to avoid restarting its
+server: `".../Unity/Hub/Editor/6000.6.5f1/Editor/Data/PlaybackEngines/
+AndroidPlayer/SDK/platform-tools/adb.exe" -P 5038 -s 00116646S015275`
+(check the model is A015; a Motorola edge 40 and a V2310 are on that
+server too, never touch them). The owner asked for the phone to stay
+awake and unlocked (`svc power stayon usb` is set) and for its volume
+to be left alone.
+
+## Update 2026-10-21 — on-device checks PENDING (superseded above)
 
 Main at 655e02e (splice-sync fix e26ade7 + voice boost) builds, and its
 JVM tests pass: AlignerParityTest (Kotlin = Python) and VoiceBoostTest

@@ -96,6 +96,24 @@ Run: `gradle testReleaseUnitTest --tests '*VoiceBoostTest*' -Dvb.out=DIR`
 background (music inside 300-3400 Hz, centred) can't be separated by
 DSP - that needs ML source separation.
 
+## On-device (CMF Phone 1, main 655e02e / app 0.4.1, 2026-10-21)
+
+Harness cut+PAL pair (10 min). Lag measured on the PC: 5 s windows vs
+the input video's own audio.
+
+| Run | Tracks | AD sync (piece 1 / piece 2) | Boosted track | Levels (mean / peak) |
+|---|---|---|---|---|
+| Off | AD + original | −0.1 / −4.4 ms | — | AD −22.1 / −0.2 dB |
+| High + extra track | AD + original + boosted original | −0.1 / −4.4 ms | +0.2 ms over all 119 windows | original −21.1 / 0.0, boosted −25.2 / −0.7 dB |
+| High + boost AD | AD (boosted) + original | +0.1 / −3.5 ms | — | AD −25.8 / −0.8 dB |
+
+Logs: `voice boost: high (AD track)` and `voice-boost track done`; the
+extra track added ~165 s to the 10-min render (377 s vs 212 s). No
+clipping, and the boost doesn't raise loudness. The test audio is
+synthetic bursts, so clarity on real dialogue still needs a listen.
+MediaMuxer flags every audio track as default; players usually take the
+first (the AD).
+
 ## Live overlay / realtime (owner question)
 
 Possible as a follow-up, with caveats: a foreground service that

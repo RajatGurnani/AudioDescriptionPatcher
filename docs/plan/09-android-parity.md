@@ -33,6 +33,10 @@ Driven over adb with the harness cut+PAL pair (10 min):
   priming (no edit list) is measured by loopback and compensated in
   `Patcher`. Details: docs/handoff/android-splice-sync.md.
 
+**Confirmed on device 2026-10-21** (main 655e02e): cut+PAL → phone fit
++0.00 / +40.00 s, speed 1.042711 (truth 1.042709), confidence 1.00;
+output lag piece 1 −0.1 ms (−0.7..0.0), piece 2 −4.4 ms (−8.9..−1.3).
+
 ## Shared test vectors
 
 > **Implemented (iteration 4) differently from below:** a JVM unit test
