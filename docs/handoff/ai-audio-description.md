@@ -1,5 +1,16 @@
 # Handoff: AI audio description (2026-10-19, updated 2026-10-21)
 
+## State 2026-10-21 (latest)
+
+- Branch `claude/ai-ad-generation-c6685c`, last commit aa96c61 (A3 + P1 v1).
+- Done: A1, A2, A3 (Android); P1 v1 `adgen.py` (PC). Results in plan 10.
+- CMF: main's 0.5.0 restored. Test builds need temp versionCode 8 (not committed).
+- Next: A4 (describe on phone: prompt, word budget, per-cue checkpoint);
+  P1 polish (web/desktop button, speed: 2B or 2 frames, RTX 5060 run); A5 TTS/mix.
+- Open: default models (Qwen 2B phone / 8B-4B PC), narrate over grunts?,
+  arm64-only APK, APK +18 MB from ONNX Runtime.
+
+
 > 2026-10-21: A2 resumed — pyannote chosen (th 0.4), `GapFinder.kt` +
 > `GapFinderTest` done and matching the PC reference; results in doc 10
 > "A2 results". CMF run done (matches PC, 42–52× realtime). Next: A3. The
