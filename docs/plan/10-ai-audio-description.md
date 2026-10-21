@@ -1,6 +1,6 @@
 # 10 — AI audio description (generate AD where none exists)
 
-Status: **A1 done** (2026-10-19); **A2 PC-side done** (2026-10-21) — `GapFinder.kt` matches the PC reference, on-device run pending (CMF busy).
+Status: **A1 done** (2026-10-19); **A2 done** (2026-10-21) — pyannote gaps on the CMF match the PC reference at 42–52× realtime; next A3 (shots).
 Scope: Android app first (`com.fuzzypyjamas.adpatcher`); a PC-assisted
 path reuses the same design. Constraints: open-source, zero cost, local
 models only, licences per [THIRD_PARTY.md](THIRD_PARTY.md).
@@ -229,7 +229,7 @@ movies, CC-BY) kept local.
 | Iter | Theme | Exit criteria |
 |---|---|---|
 | A1 ✅ | **Spike: llama.cpp on the CMF** — build `libmtmd` for arm64 via NDK, JNI wrapper, load SmolVLM2-500M + Qwen3-VL-2B, caption one bitmap | measured s/frame + peak RAM for both models recorded here; no crash on 5.3 GB — **done**, see §3 "Measured" |
-| A2 | **Gaps** — speech model (ONNX Runtime) on the existing decode → gap list | on 3 test clips, ≥ 90 % of real gaps found, < 5 % of gaps overlap speech — **PC: 3.4 % overlap ✅, 86 % of all gaps / 98 % of gaps ≥ 3 s found**; CMF run pending |
+| A2 | **Gaps** — speech model (ONNX Runtime) on the existing decode → gap list | on 3 test clips, ≥ 90 % of real gaps found, < 5 % of gaps overlap speech — **✅ CMF = PC: 3.0–3.7 % overlap per clip, 86 % of all gaps / 98 % of gaps ≥ 3 s found; 42–52× realtime, ~170 MB** |
 | A3 | **Shots + frame picking** — MediaCodec → small frames, cut detector, gap → frames | cut recall ≥ 85 % on test clips; 2 h movie scanned < 10 min |
 | A4 | **Describe** — prompts, word budget, context, rewrite loop; per-cue checkpoint (8a) | lines fit their gaps; spot review of 30 lines: ≥ 80 % correct + useful; force-stop mid-run resumes at the next cue |
 | A5 | **Speak + mix + mux** — system TTS → PCM, ducking, AAC, default track; UI "Generate AD" job in `PatchService` with progress + cancel | playable output on the CMF and VLC; no narration over dialogue; original track kept |
@@ -273,6 +273,14 @@ Speech model comparison (all 3 clips, guard 0.2 s):
   all 3 clips; resampler test (48 kHz stereo → 16 kHz: 440 Hz kept,
   10 kHz alias < −34 dB, pts lead preserved).
 - PC speed: pyannote int8 ≈ 4–6 s CPU per 12 min of audio.
+- **CMF (A2 build, 2026-10-21):** device gaps share 98.7–99.8 % of gap
+  time with the PC run; truth scores identical (ToS 26/30 found, 1/33
+  overlapping; Sintel 18/19, 1/28; ED 21/27, 1/27). First version
+  (serial decode, whole film held at 16 kHz) ran 3.3–5.9× realtime and
+  would need ~460 MB per 2 h; the streaming version (4 range decoders
+  like `onsetEnvelopeParallel`, rolling 10 s window per worker, ORT
+  2 threads/run) runs **42–52× realtime (≈ 2.5–3 min per 2 h film),
+  PSS ~170 MB**; model time ≈ 9–10 s summed per clip.
 - APK grows 13 → 33 MB (ONNX Runtime 18 MB arm64). Options later:
   ORT custom minimal build (~3–5 MB), or run the model through ggml.
 

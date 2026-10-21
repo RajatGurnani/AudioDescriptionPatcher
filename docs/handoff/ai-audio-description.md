@@ -2,7 +2,7 @@
 
 > 2026-10-21: A2 resumed — pyannote chosen (th 0.4), `GapFinder.kt` +
 > `GapFinderTest` done and matching the PC reference; results in doc 10
-> "A2 results". Remaining: CMF run (speed, parity on device). The
+> "A2 results". CMF run done (matches PC, 42–52× realtime). Next: A3. The
 > section below is the original 10-19 snapshot.
 
 Branch `claude/ai-ad-generation-c6685c` (not merged to main). Plan +
