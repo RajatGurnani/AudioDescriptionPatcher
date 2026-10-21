@@ -54,16 +54,77 @@ class GapFinderTest {
             m.feed(AudioEngine.PcmChunk(pcm.copyOfRange(2 * off, 2 * (off + k)), 2, inRate, ptsUs))
             ptsUs += k * 1_000_000L / inRate; off += k
         }
-        val y = m.finish()
+        m.flush()
+        val (base, y) = m.snapshot()
+        assertEquals("buffer starts at the pts lead", 8000L, base)
         val sr = GapFinder.SR
-        assertEquals("length (0.5 s lead + 3 s)", 3.5 * sr, y.size.toDouble(), 40.0)
-        assertTrue("lead is silent", y.take(sr / 2 - 10).all { abs(it) < 1e-6 })
-        val a440 = tone(440.0, y, sr, sr, 3 * sr)
-        val a10k = tone(10000.0 * sr / sr, y, sr, sr, 3 * sr)  // aliases to 6 kHz if not filtered
-        val alias = tone(6000.0, y, sr, sr, 3 * sr)
+        assertEquals("length 3 s after the lead", 3.0 * sr, y.size.toDouble(), 40.0)
+        val a440 = tone(440.0, y, sr, sr / 2, 5 * sr / 2)
+        val a10k = tone(10000.0, y, sr, sr / 2, 5 * sr / 2)
+        val alias = tone(6000.0, y, sr, sr / 2, 5 * sr / 2)  // 10 kHz folds to 6 kHz unfiltered
         assertEquals("440 Hz kept", 0.25, a440, 0.01)
         assertTrue("10 kHz alias suppressed: $alias", alias < 0.005)
         assertTrue(a10k < 0.01)
+    }
+
+    /** Synthetic 48 kHz stereo "film": tones + noise bursts, as PCM chunks. */
+    private fun film(secs: Int): ShortArray {
+        val r = java.util.Random(7)
+        val n = 48000 * secs
+        return ShortArray(n * 2) { i ->
+            val t = i / 2 / 48000.0
+            val v = 0.2 * sin(2 * PI * (200 + 50 * (t % 7)) * t) + if ((t % 3) < 1) 0.1 * r.nextGaussian() else 0.0
+            (v.coerceIn(-1.0, 1.0) * 32767).toInt().toShort()
+        }
+    }
+
+    /** Feed samples [fromIn, end) in 1024-frame chunks with pts, like a ranged decode. */
+    private fun feedRange(pcm: ShortArray, fromIn: Int, sink: (AudioEngine.PcmChunk) -> Boolean) {
+        var off = fromIn
+        val n = pcm.size / 2
+        while (off < n) {
+            val k = minOf(1024, n - off)
+            val c = AudioEngine.PcmChunk(pcm.copyOfRange(2 * off, 2 * (off + k)), 2, 48000, off * 1_000_000L / 48000)
+            if (sink(c)) return
+            off += k
+        }
+    }
+
+    @Test
+    fun parallelRangesEqualSingleRun() {
+        val secs = 47
+        val pcm = film(secs)
+        // fake model: per-frame mean |x| of the window, so any sample
+        // misplacement or seam glitch changes the result
+        val model = { w: FloatArray ->
+            FloatArray(589) { f ->
+                var a = 0f
+                val s0 = f * GapFinder.HOP
+                for (i in s0 until minOf(s0 + 991, w.size)) a += abs(w[i])
+                a / 991
+            }
+        }
+        val total = secs * 16000L
+        fun run(workers: Int): FloatArray {
+            val plan = GapFinder.WindowPlan(total)
+            for (w in 0 until workers) {
+                val k0 = plan.windows * w / workers
+                val k1 = plan.windows * (w + 1) / workers
+                val rr = GapFinder.RangeRunner(plan, k0, k1, model)
+                // like analyze(): start 0.5 s early, chunk-aligned (seek lands on a sync frame)
+                val fromIn = (maxOf(0L, k0 * GapFinder.STEP * 3L - 24000L) / 1024 * 1024).toInt()
+                feedRange(pcm, fromIn) { rr.feed(it) }
+                rr.finish()
+            }
+            return plan.probs()
+        }
+        val one = run(1)
+        val four = run(4)
+        assertEquals(one.size, four.size)
+        var maxd = 0f
+        for (i in one.indices) maxd = maxOf(maxd, abs(one[i] - four[i]))
+        assertTrue("4 ranges vs 1 run differ by $maxd", maxd < 1e-5f)
+        assertTrue("windows produced output", one.any { it > 0.01f })
     }
 
     private fun readF32(f: File): FloatArray {

@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.Debug
 import android.os.SystemClock
 import android.util.Log
+import com.fuzzypyjamas.adpatcher.AudioEngine
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -20,7 +21,7 @@ import kotlin.concurrent.thread
  *       --es model X.gguf --es mmproj mmproj-X.gguf [--ei maxImgTok 256]
  *   # A2: narration gaps of clips/NAME -> out/NAME.gaps.json
  *   adb shell am start -n com.fuzzypyjamas.adpatcher/.describe.DevProbeActivity \
- *       --es task gaps --es clip NAME
+ *       --es task gaps --es clip NAME [--ei workers 4] [--ei threads 2]
  */
 class DevProbeActivity : Activity() {
 
@@ -31,6 +32,7 @@ class DevProbeActivity : Activity() {
             try {
                 when (task) {
                     "gaps" -> runGaps(intent.getStringExtra("clip") ?: "")
+                    "decode" -> runDecode(intent.getStringExtra("clip") ?: "")
                     else -> runVlm()
                 }
             } catch (t: Throwable) {
@@ -46,17 +48,37 @@ class DevProbeActivity : Activity() {
         val out = File(getExternalFilesDir("out"), "$clip.gaps.json")
         val t0 = SystemClock.elapsedRealtime()
         var lastPct = -1
-        val res = GapFinder(this).use { gf ->
+        var split = ""
+        val workers = intent.getIntExtra("workers", 4)
+        val threads = intent.getIntExtra("threads", 2)
+        val res = GapFinder(this, workers, threads).use { gf ->
             gf.analyze(this, Uri.fromFile(src)) { f ->
                 val pct = (f * 100).toInt()
                 if (pct / 10 != lastPct / 10) { lastPct = pct; Log.i(TAG, "decode $pct%") }
-            }
+            }.also { split = "wall ${gf.wallMs} ms, model ${gf.modelMs} ms summed (workers=$workers threads/run=$threads)" }
         }
+        Log.i(TAG, split)
         val ms = SystemClock.elapsedRealtime() - t0
         out.writeText(res.toJson().toString())
         Log.i(TAG, "gaps $clip: ${res.speech.size} speech, ${res.gaps.size} gaps " +
             "(${res.gaps.sumOf { it[1] - it[0] }.toInt()} s) in ${res.durationS.toInt()} s audio; " +
             "$ms ms (${"%.1f".format(res.durationS * 1000 / ms)}x realtime), ${memMb()} -> ${out.name}")
+    }
+
+    /** Decode-only and decode+resample timings (no model). */
+    private fun runDecode(clip: String) {
+        val uri = Uri.fromFile(File(getExternalFilesDir("clips"), clip))
+        var n = 0L
+        var t = SystemClock.elapsedRealtime()
+        AudioEngine.decodeAudio(this, uri) { n += it.samples.size }
+        Log.i(TAG, "decode only: ${SystemClock.elapsedRealtime() - t} ms, $n samples")
+        t = SystemClock.elapsedRealtime()
+        val m = GapFinder.Mono16k()
+        var inFeed = 0L
+        AudioEngine.decodeAudio(this, uri) {
+            val a = System.nanoTime(); m.feed(it); m.discardBefore(m.endAbs); inFeed += System.nanoTime() - a
+        }
+        Log.i(TAG, "decode+resample: ${SystemClock.elapsedRealtime() - t} ms (${inFeed / 1_000_000} ms in resampler), ${m.endAbs} out")
     }
 
     private fun runVlm() {

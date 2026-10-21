@@ -5,12 +5,14 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import com.fuzzypyjamas.adpatcher.AudioEngine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.nio.FloatBuffer
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.floor
@@ -25,9 +27,18 @@ import kotlin.math.sin
  * ONNX Runtime on 10 s windows at 16 kHz. Silero VAD was tried first and
  * misses ~40-60 % of film dialogue under music.
  *
+ * Streaming: the timeline is split into [workers] ranges of model
+ * windows, each decoded by its own codec (AudioEngine.decodeAudio with a
+ * range) into a rolling 16 kHz buffer, so memory stays ~1 MB per worker
+ * whatever the film length.
+ *
  * Rules mirror tools/gaps_ref.py (PC reference + scorer) - keep in sync.
  */
-class GapFinder(context: Context) : AutoCloseable {
+class GapFinder(
+    context: Context,
+    private val workers: Int = 4,
+    threadsPerRun: Int = 2,
+) : AutoCloseable {
 
     class Result(
         val speech: List<DoubleArray>,   // [start, end] seconds
@@ -54,156 +65,268 @@ class GapFinder(context: Context) : AutoCloseable {
     }
 
     private val env = OrtEnvironment.getEnvironment()
+    // OrtSession.run is thread-safe: one session shared by all workers
     private val session: OrtSession = env.createSession(
         context.assets.open(MODEL_ASSET).use { it.readBytes() },
-        OrtSession.SessionOptions().apply { setIntraOpNumThreads(4) })
+        OrtSession.SessionOptions().apply { setIntraOpNumThreads(threadsPerRun) })
+
+    /** Wall ms of the last analyze() and ms summed inside the model. */
+    var wallMs = 0L; private set
+    @Volatile var modelMs = 0L; private set
+
+    /** P(nobody speaks) -> P(speech) per output frame for one 10 s window. */
+    private fun runModel(win: FloatArray): FloatArray {
+        val t = SystemClock.elapsedRealtime()
+        val p = OnnxTensor.createTensor(env, FloatBuffer.wrap(win), longArrayOf(1, 1, WIN.toLong()))
+            .use { x ->
+                session.run(mapOf("x" to x)).use { out ->
+                    @Suppress("UNCHECKED_CAST")
+                    val y = (out[0].value as Array<Array<FloatArray>>)[0]
+                    FloatArray(y.size) { 1f - exp(y[it][0]) }   // powerset class 0 = silence
+                }
+            }
+        synchronized(this) { modelMs += SystemClock.elapsedRealtime() - t }
+        return p
+    }
 
     /** Decodes the first audio track of [uri] and returns speech + gaps. */
     fun analyze(context: Context, uri: Uri, onProgress: (Float) -> Unit = {}): Result {
-        val mono = Mono16k()
-        AudioEngine.decodeAudio(context, uri, onProgress = onProgress) { mono.feed(it) }
-        val x = mono.finish()
-        return fromSamples(x)
-    }
-
-    /** Same, from 16 kHz mono samples (tests/probes). */
-    fun fromSamples(x: FloatArray): Result {
-        val probs = speechProbs(x)
-        val dur = x.size / SR.toDouble()
-        val speech = probsToSpeech(probs, HOP / SR.toDouble())
-        return Result(speech, gapsFromSpeech(speech, dur), dur)
-    }
-
-    /** P(anyone speaking) per 270-sample frame; 10 s windows, 50 % overlap, mean. */
-    private fun speechProbs(x: FloatArray): FloatArray {
-        val nfr = x.size / HOP + 1
-        val acc = FloatArray(nfr)
-        val cnt = IntArray(nfr)
-        val win = FloatArray(WIN)
-        val shape = longArrayOf(1, 1, WIN.toLong())
-        var s = 0
-        while (true) {
-            if (AudioEngine.cancelRequested) throw RuntimeException("cancelled")
-            win.fill(0f)
-            System.arraycopy(x, s, win, 0, min(WIN, x.size - s))
-            OnnxTensor.createTensor(env, FloatBuffer.wrap(win), shape).use { t ->
-                session.run(mapOf("x" to t)).use { out ->
-                    @Suppress("UNCHECKED_CAST")
-                    val y = (out[0].value as Array<Array<FloatArray>>)[0]
-                    val f0 = s / HOP
-                    for (i in 0 until min(y.size, nfr - f0)) {
-                        // powerset class 0 = nobody speaks
-                        acc[f0 + i] += 1f - exp(y[i][0])
-                        cnt[f0 + i]++
+        val t0 = SystemClock.elapsedRealtime()
+        modelMs = 0
+        val (durUs, _) = AudioEngine.probeAudio(context, uri)
+        val totalOut = durUs * SR / 1_000_000L
+        val plan = WindowPlan(totalOut)
+        val nw = if (durUs < 60_000_000L) 1 else workers
+        val errors = arrayOfNulls<Throwable>(nw)
+        val frac = FloatArray(nw)
+        val threads = (0 until nw).map { w ->
+            Thread {
+                try {
+                    val k0 = plan.windows * w / nw
+                    val k1 = plan.windows * (w + 1) / nw
+                    val last = w == nw - 1
+                    val runner = RangeRunner(plan, k0, k1, ::runModel)
+                    // decode from a bit before the first window (resampler
+                    // warm-up) to the end of the last window
+                    val fromUs = max(0L, k0 * STEP * 1_000_000L / SR - 500_000L)
+                    val toUs = if (last) Long.MAX_VALUE - 1
+                    else ((k1 - 1) * STEP + WIN) * 1_000_000L / SR + 100_000L
+                    AudioEngine.decodeAudio(context, uri, rangeUs = fromUs..toUs) { c ->
+                        if (runner.feed(c)) throw AudioEngine.StopDecode()
+                        frac[w] = runner.progress()
+                        onProgress(frac.sum() / nw)
                     }
+                    runner.finish()
+                    frac[w] = 1f
+                    onProgress(frac.sum() / nw)
+                } catch (t: Throwable) {
+                    errors[w] = t
                 }
-            }
-            if (s + WIN >= x.size) break
-            s += STEP
+            }.apply { start() }
         }
-        for (i in 0 until nfr) if (cnt[i] > 0) acc[i] /= cnt[i]
-        return acc
+        threads.forEach { it.join() }
+        errors.filterNotNull().firstOrNull()?.let { throw it }
+        wallMs = SystemClock.elapsedRealtime() - t0
+        return plan.result()
     }
 
     override fun close() {
         session.close()
     }
 
+    /** All window probabilities of one film, averaged where windows overlap. */
+    internal class WindowPlan(val totalOut: Long) {
+        // same window count as gaps_ref.pyannote_probs: starts 0, STEP, ...
+        // up to max(total - WIN, 0) inclusive
+        val windows = (max(totalOut - WIN, 0L) / STEP + 1).toInt()
+        private val nfr = (totalOut / HOP + 1).toInt()
+        private val acc = FloatArray(nfr)
+        private val cnt = IntArray(nfr)
+
+        @Synchronized
+        fun add(k: Int, p: FloatArray) {
+            val f0 = (k.toLong() * STEP / HOP).toInt()
+            for (i in 0 until min(p.size, nfr - f0)) { acc[f0 + i] += p[i]; cnt[f0 + i]++ }
+        }
+
+        fun probs() = FloatArray(nfr) { if (cnt[it] > 0) acc[it] / cnt[it] else 0f }
+
+        fun result(): Result {
+            val dur = totalOut / SR.toDouble()
+            val speech = probsToSpeech(probs(), HOP / SR.toDouble())
+            return Result(speech, gapsFromSpeech(speech, dur), dur)
+        }
+    }
+
+    /** Runs windows [k0, k1) of [plan] as their audio arrives. */
+    internal class RangeRunner(
+        private val plan: WindowPlan, k0: Int, private val k1: Int,
+        private val model: (FloatArray) -> FloatArray,
+    ) {
+        private var k = k0
+        private val k0 = k0
+        private val mono = Mono16k()
+        private val win = FloatArray(WIN)
+
+        /** Feed one decoded chunk; true once every window is done. */
+        fun feed(c: AudioEngine.PcmChunk): Boolean {
+            if (AudioEngine.cancelRequested) throw RuntimeException("cancelled")
+            mono.feed(c)
+            while (k < k1 && k.toLong() * STEP + WIN <= mono.endAbs) runWindow()
+            return k >= k1
+        }
+
+        /** End of stream: remaining windows get zero padding. */
+        fun finish() {
+            mono.flush()
+            while (k < k1) runWindow()
+        }
+
+        fun progress() = (k - k0).toFloat() / max(1, k1 - k0)
+
+        private fun runWindow() {
+            val s = k.toLong() * STEP
+            mono.copy(s, win)
+            plan.add(k, model(win))
+            k++
+            mono.discardBefore(k.toLong() * STEP)
+        }
+    }
+
     /**
      * Downmix + bandlimited resample to 16 kHz (windowed-sinc, 32 taps,
-     * 256 phases, cutoff 0.45 x output rate). Places samples by chunk pts
-     * so leading silence/priming offsets land on the right timeline.
+     * 256 phases, cutoff 0.45 x 16 kHz) into a rolling buffer addressed by
+     * absolute output sample index. The first chunk's pts anchors the
+     * timeline, so ranged decodes land on the global grid.
      */
     internal class Mono16k {
-        private var out = FloatArray(1 shl 20)
-        private var n = 0
+        private var buf = FloatArray(1 shl 18)
+        private var bufBase = 0L      // absolute index of buf[0]
+        private var bufLen = 0
+        /** Absolute index one past the last output sample written. */
+        val endAbs get() = bufBase + bufLen
+
         private var inRate = 0
-        private var hist = FloatArray(0)      // recent mono input samples
-        private var histStart = 0L           // absolute input index of hist[0]
-        private var histLen = 0
-        private var inPos = 0L               // absolute input samples received
-        private var nextOut = 0L             // next output sample index
-        private var table = FloatArray(0)
         private var ratio = 1.0
+        private var hist = FloatArray(1 shl 16)  // recent mono input
+        private var histStart = 0L               // absolute input index of hist[0]
+        private var histLen = 0
+        private var nextOut = 0L                 // next absolute output index
+        private var table = FloatArray(0)
 
         fun feed(c: AudioEngine.PcmChunk) {
-            if (inRate == 0) {
-                inRate = c.sampleRate
-                ratio = inRate / SR.toDouble()
-                buildTable()
-                hist = FloatArray(1 shl 16)
-                // pts of the first chunk = where the track starts
-                val lead = (c.ptsUs * SR / 1_000_000L).toInt().coerceAtLeast(0)
-                ensure(lead); n = lead; nextOut = lead.toLong()
-                inPos = (nextOut * ratio).toLong(); histStart = inPos
-            }
             val ch = c.channels
             val frames = c.samples.size / ch
-            if (histLen + frames > hist.size) {
-                // keep only the taps' worth of history
-                val keep = TAPS + 2
-                val drop = max(0, histLen - keep)
-                System.arraycopy(hist, drop, hist, 0, histLen - drop)
-                histLen -= drop; histStart += drop
-                if (histLen + frames > hist.size) hist = hist.copyOf(histLen + frames + 4096)
-            }
+            if (frames == 0) return
+            if (inRate == 0) start(c)
+            if (histLen + frames > hist.size) compactHist(frames)
+            val skipLfe = ch >= 6     // 5.1/7.1: channel 3 is LFE
+            val scale = 1f / ((if (skipLfe) ch - 1 else ch) * 32768f)
+            val smp = c.samples
+            var o = histLen
+            var s = 0
             for (f in 0 until frames) {
                 var v = 0f
-                var k = 0
                 for (j in 0 until ch) {
-                    if (ch >= 6 && j == 3) continue   // skip LFE in 5.1/7.1
-                    v += c.samples[f * ch + j]; k++
+                    if (!(skipLfe && j == 3)) v += smp[s]
+                    s++
                 }
-                hist[histLen++] = v / (k * 32768f)
+                hist[o++] = v * scale
             }
-            inPos += frames
+            histLen = o
             emit()
+        }
+
+        /** End of stream: emit what the remaining input supports, zero-padded. */
+        fun flush() {
+            if (inRate == 0) return
+            if (histLen + TAPS > hist.size) compactHist(TAPS)
+            for (i in 0 until TAPS) hist[histLen++] = 0f
+            emit()
+        }
+
+        private fun start(c: AudioEngine.PcmChunk) {
+            inRate = c.sampleRate
+            ratio = inRate / SR.toDouble()
+            buildTable()
+            // absolute input index of this chunk's first sample; outputs are
+            // a pure function of absolute input indices, so ranged decodes
+            // agree with a full decode once past the zero-history warm-up
+            val in0 = Math.round(max(0L, c.ptsUs) * inRate / 1e6)
+            val lead = kotlin.math.ceil(in0 / ratio).toLong()
+            nextOut = lead
+            bufBase = lead
+            histStart = in0 - TAPS
+            histLen = TAPS                              // zeros
+        }
+
+        private fun compactHist(extra: Int) {
+            // drop input older than the next output's first tap
+            val need = floor(nextOut * ratio).toLong() - TAPS
+            val drop = (need - histStart).toInt().coerceIn(0, histLen)
+            System.arraycopy(hist, drop, hist, 0, histLen - drop)
+            histLen -= drop; histStart += drop
+            if (histLen + extra > hist.size) hist = hist.copyOf(histLen + extra + 4096)
         }
 
         private fun emit() {
             val half = TAPS / 2
+            val h = hist
+            val tab = table
+            val inEnd = histStart + histLen
             while (true) {
-                val t = nextOut * ratio                 // input position
+                val t = nextOut * ratio
                 val base = floor(t).toLong()
-                if (base + half >= inPos) break
-                val frac = t - base
-                val ph = (frac * PHASES).toInt().coerceAtMost(PHASES - 1)
-                var acc = 0f
+                if (base + half >= inEnd) break
+                val ph = ((t - base) * PHASES).toInt().coerceAtMost(PHASES - 1)
+                val i0 = (base - half + 1 - histStart).toInt()
                 val row = ph * TAPS
-                for (k in 0 until TAPS) {
-                    val idx = (base - half + 1 + k - histStart).toInt()
-                    if (idx in 0 until histLen) acc += hist[idx] * table[row + k]
-                }
-                ensure(n + 1); out[n++] = acc
+                var acc = 0f
+                for (k in 0 until TAPS) acc += h[i0 + k] * tab[row + k]
+                if (bufLen == buf.size) buf = buf.copyOf(buf.size * 2)
+                buf[bufLen++] = acc
                 nextOut++
             }
         }
 
+        /** Copy [dst.size] samples from absolute [from]; zeros where unavailable. */
+        fun copy(from: Long, dst: FloatArray) {
+            dst.fill(0f)
+            val a = max(from, bufBase)
+            val b = min(from + dst.size, endAbs)
+            if (b > a) System.arraycopy(buf, (a - bufBase).toInt(), dst, (a - from).toInt(), (b - a).toInt())
+        }
+
+        fun discardBefore(abs: Long) {
+            val d = (abs - bufBase).toInt().coerceIn(0, bufLen)
+            if (d == 0) return
+            System.arraycopy(buf, d, buf, 0, bufLen - d)
+            bufLen -= d; bufBase += d
+        }
+
+        /** Everything still buffered (tests / short clips). */
+        fun snapshot(): Pair<Long, FloatArray> = bufBase to buf.copyOf(bufLen)
+
         private fun buildTable() {
-            // lowpass at 0.45*16k relative to the input rate (no-op guard
-            // for inputs already <= 16 kHz: cutoff capped at input Nyquist)
+            // lowpass at 0.45*16k relative to the input rate (capped at the
+            // input Nyquist for inputs already <= 16 kHz)
             val fc = min(0.45 * SR, 0.5 * inRate) / inRate
             table = FloatArray(PHASES * TAPS)
             val half = TAPS / 2
             for (p in 0 until PHASES) {
                 val frac = p / PHASES.toDouble()
                 var sum = 0.0
+                val row = DoubleArray(TAPS)
                 for (k in 0 until TAPS) {
                     val d = (k - half + 1) - frac           // tap distance in input samples
                     val sinc = if (d == 0.0) 2 * fc else sin(2 * PI * fc * d) / (PI * d)
                     val w = 0.5 + 0.5 * cos(PI * d / half)  // Hann over +-half
-                    val v = if (kotlin.math.abs(d) < half) sinc * w else 0.0
-                    table[p * TAPS + k] = v.toFloat(); sum += v
+                    row[k] = if (abs(d) < half) sinc * w else 0.0
+                    sum += row[k]
                 }
-                for (k in 0 until TAPS) table[p * TAPS + k] = (table[p * TAPS + k] / sum).toFloat()
+                for (k in 0 until TAPS) table[p * TAPS + k] = (row[k] / sum).toFloat()
             }
         }
-
-        private fun ensure(size: Int) {
-            if (size > out.size) out = out.copyOf(max(size, out.size * 2))
-        }
-
-        fun finish(): FloatArray = out.copyOf(n)
     }
 
     companion object {
