@@ -251,6 +251,35 @@ def main():
         check(f"fit lossless: {target} GB target, under it "
               f"(flac shows {flac_kb} kb/s in ffmpeg -i)",
               0.7 <= size / target <= 1.0, f"{size:.3f} GB")
+        # 9. the second-try path: plan with a margin that's too generous so
+        # the first encode overshoots; the retry must land under target.
+        # Noise video: it uses every bit it gets (simple test footage
+        # can't, so it would never overshoot)
+        noisy = os.path.join(WORK, "fit_noise.mkv")
+        if not os.path.exists(noisy):
+            ff("-f", "lavfi", "-i",
+               "nullsrc=s=320x180:r=24:d=120,geq=random(1)*255:128:128",
+               "-i", os.path.join(WORK, "src.wav"), "-t", "120",
+               "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0",
+               "-c:a", "pcm_s16le", noisy)
+        noisy_ad = os.path.join(WORK, "fit_noise_AD.mp3")
+        if not os.path.exists(noisy_ad):
+            ff("-i", os.path.join(WORK, "src.wav"), "-t", "120",
+               "-af", "adelay=1500:all=1", "-c:a", "libmp3lame", noisy_ad)
+        target = 0.03
+        saved_margin, adpatch.FIT_MARGIN = adpatch.FIT_MARGIN, 1.3
+        logs = []
+        out9 = os.path.join(WORK, "out_fit_retry.mkv")
+        try:
+            adpatch.patch(noisy, noisy_ad, output=out9, log=logs.append,
+                          options={"fit_gb": target})
+        finally:
+            adpatch.FIT_MARGIN = saved_margin
+        size = os.path.getsize(out9) / adpatch.GIB
+        retried = [x for x in logs if "encoding again" in x]
+        check("fit retry: first encode was over, second one under",
+              bool(retried) and size <= target,
+              f"{size:.3f} GB; {retried[0].strip() if retried else 'no retry'}")
         check("fit lossless: 3 audio + 1 subtitle",
               len(kinds(s, "audio")) == 3 and len(kinds(s, "subtitle")) == 1,
               str([(t["type"], t["codec"]) for t in s]))
