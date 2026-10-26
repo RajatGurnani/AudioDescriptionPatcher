@@ -136,8 +136,170 @@ def main():
     if [it["status"] for it in q3.items] != ["skipped", "skipped"]:
         fails.append("existing outputs not skipped")
 
+    fails += parser_test()
+    fails += show_test(work)
     print("\n" + ("PASS" if not fails else "FAIL:\n  " + "\n  ".join(fails)))
     sys.exit(1 if fails else 0)
+
+
+PARSE_CASES = {   # name -> (season, episodes) or None
+    "Show.Name.S01E02.720p.mkv": (1, (2,)),
+    "show s1e2 webrip.mkv": (1, (2,)),
+    "Show S01 E02.mkv": (1, (2,)),
+    "Show.S10E120.mkv": (10, (120,)),
+    "Show.S01E03.1080p.x265-GRP.mkv": (1, (3,)),
+    "Show S01E05 - 720p.mkv": (1, (5,)),
+    "Show Name - S01E01-E02 - Pilot (AD).mp3": (1, (1, 2)),
+    "Show.S01E01E02.mkv": (1, (1, 2)),
+    "Show S01E01-03.mkv": (1, (1, 2, 3)),
+    "Show S00E01 Special.mkv": (0, (1,)),
+    "Show 1x05.mkv": (1, (5,)),
+    "Show - 2x10 - Title.mp3": (2, (10,)),
+    "Show Name - Season 1 Episode 9.mp3": (1, (9,)),
+    "Show/Season 3/Episode 4.mkv": (3, (4,)),
+    "Show/S02/Show Ep 07.mp3": (2, (7,)),
+    "Show/Extras/Show Episode 5.mkv": (None, (5,)),
+    "Show/Extras/Show E05.mkv": None,          # bare E, no season: ambiguous
+    "Show/Season 2/Show E05.mkv": (2, (5,)),
+    "Show S01E05-12 Title.mkv": (1, (5,)),
+    "Movie 2019 E-AC3 DDP5.1 x265.mkv": None,
+    "Show.Dolby.E.5.1.mkv": None,
+    "Movie (2019) 1080p x264.mkv": None,
+    "Show 1920x1080.mkv": None,
+    "Harbour Lights.mkv": None,
+    "track_123.mp3": None,
+}
+
+
+def parser_test():
+    fails = []
+    for name, want in PARSE_CASES.items():
+        got = batch.parse_episode(name)
+        if got != want:
+            fails.append(f"parse {name!r}: got {got}, want {want}")
+    return fails
+
+
+def show_test(work):
+    """A whole show: 3 seasons x 8 episodes + a special. Every episode
+    shares a 20 s theme intro and 15 s credits; episodes 2+ open with a
+    30 s "previously on" cut from the previous episode. Checks:
+      A  clean SxxEyy names, AD files in another folder -> all matched
+         with ~one comparison per episode; one AD carries a 30 s ad
+         break; season 2 AD is PAL sped up;
+      C  missing AD (S02E03), extra AD (S04E01), double-episode AD
+         (S03E07-E08) -> no match (with a note) / unused;
+      B  the same AD files with meaningless names -> all matched by
+         content alone."""
+    root = os.path.join(work, "show")
+    vids = os.path.join(root, "My Show")
+    named = os.path.join(root, "AD named")
+    rand = os.path.join(root, "AD random")
+    for d in (named, rand):
+        os.makedirs(d)
+    intro = harness.soundtrack(500, 20 / 60)
+    credits = harness.soundtrack(501, 15 / 60)
+    rng = random.Random(11)
+    ids = iter(rng.sample(range(1000, 9999), 60))
+    want_a, want_b = {}, {}
+    prev_body = None
+    bodies = {}
+    for s in (1, 2, 3):
+        for e in range(1, 9):
+            body = harness.soundtrack(1000 + s * 10 + e, 2.5)
+            parts = [intro]
+            if prev_body is not None:
+                parts.append(prev_body[-30 * GEN_SR:])   # previously on
+            parts += [body, credits]
+            bodies[s, e] = np.concatenate(parts)
+            prev_body = body
+    special = np.concatenate([intro, harness.soundtrack(1999, 3.0)])
+
+    def episode(s, e, wav_audio, folder):
+        wav = os.path.join(work, f"show_{s}_{e}.wav")
+        harness.write_wav(wav, wav_audio)
+        video = os.path.join(folder, f"My Show S{s:02d}E{e:02d}.mkv")
+        os.makedirs(folder, exist_ok=True)
+        make_video(video, wav)
+        return video, wav
+
+    wavs = {}
+    for (s, e), audio in bodies.items():
+        video, wavs[s, e] = episode(s, e, audio,
+                                    os.path.join(vids, f"Season {s}"))
+        want_a[video] = want_b[video] = None
+    sp_video, wavs[0, 1] = episode(0, 1, special,
+                                   os.path.join(vids, "Specials"))
+    want_a[sp_video] = want_b[sp_video] = None
+    by_code = {os.path.basename(v)[8:14]: v for v in want_a}
+
+    def ad(code, wav, filt="adelay=1500:all=1"):
+        path = os.path.join(named, f"My Show - {code} - Title (AD).mp3")
+        make_ad(path, wav, filt)
+        return path
+
+    for (s, e), wav in wavs.items():
+        code = f"S{s:02d}E{e:02d}"
+        if code == "S02E03" or (s == 3 and e in (7, 8)):
+            continue                                # missing / double
+        filt = harness.SPEEDUP if s == 2 else "adelay=1500:all=1"
+        if code == "S01E04":                        # 30 s ad break at 90 s
+            brk = os.path.join(work, "adbreak.wav")
+            harness.write_wav(brk, harness.soundtrack(777, 0.5))
+            path = os.path.join(named, f"My Show - {code} - Title (AD).mp3")
+            ff("-i", wav, "-i", brk, "-filter_complex",
+               "[0:a]asplit[p][q];[p]atrim=0:90,asetpts=PTS-STARTPTS[x];"
+               "[q]atrim=start=90,asetpts=PTS-STARTPTS[y];"
+               "[x][1:a][y]concat=n=3:v=0:a=1[o]", "-map", "[o]",
+               "-c:a", "libmp3lame", "-b:a", "96k", path)
+        else:
+            path = ad(code, wav, filt)
+        want_a[by_code[code]] = path
+        copy = os.path.join(rand, f"{next(ids)}.mp3")
+        shutil.copy(path, copy)
+        want_b[by_code[code]] = copy
+    # double-episode AD + an AD for an episode we don't have
+    dbl = os.path.join(work, "dbl.wav")
+    harness.write_wav(dbl, np.concatenate([bodies[3, 7], bodies[3, 8]]))
+    dbl_ad = os.path.join(named, "My Show - S03E07-E08 - Two Parter (AD).mp3")
+    make_ad(dbl_ad, dbl, "anull")
+    extra = os.path.join(work, "extra_ep.wav")
+    harness.write_wav(extra, harness.soundtrack(4001, 3.5))
+    extra_ad = os.path.join(named, "My Show - S04E01 - Next Year (AD).mp3")
+    make_ad(extra_ad, extra, "anull")
+
+    fails = []
+    for label, folders, want in (("A", [vids, named], want_a),
+                                 ("B", [vids, rand], want_b)):
+        logs = []
+        rows, unused = batch.scan(folders, log=logs.append)
+        print(f"\nshow case {label}: " + logs[-1])
+        batch._print_rows(rows, unused)
+        for r in rows:
+            v = r["video"]
+            if v not in want:
+                fails.append(f"{label}: unexpected video {v}")
+                continue
+            exp = want[v]
+            if r["ad"] != exp or (exp and r["status"] != "matched") or \
+                    (not exp and r["status"] != "no match"):
+                fails.append(f"{label} {os.path.basename(v)}: got "
+                             f"{r['ad'] and os.path.basename(r['ad'])} "
+                             f"({r['status']}), want "
+                             f"{exp and os.path.basename(exp)}")
+        n_scored = int(logs[-1].split()[1])
+        if label == "A":
+            notes = {os.path.basename(r["video"]): r["note"] for r in rows}
+            for code in ("S03E07", "S03E08"):
+                if "double" not in notes.get(f"My Show {code}.mkv", ""):
+                    fails.append(f"A {code}: no double-episode note")
+            for d in (dbl_ad, extra_ad):
+                if d not in unused:
+                    fails.append(f"A: {os.path.basename(d)} not unused")
+            if n_scored > 2 * len(want):
+                fails.append(f"A: {n_scored} comparisons for {len(want)} "
+                             "videos (episode codes not used?)")
+    return fails
 
 
 if __name__ == "__main__":
