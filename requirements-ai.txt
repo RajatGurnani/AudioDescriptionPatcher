@@ -1,0 +1,2 @@
+# AI audio description (adgen.py, docs/plan/10) - on top of requirements.txt
+onnxruntime>=1.20

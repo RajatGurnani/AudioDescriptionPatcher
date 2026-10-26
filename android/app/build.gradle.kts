@@ -1,3 +1,10 @@
+import java.util.Properties
+
+val localProps = Properties().apply {
+    rootProject.file("local.properties").takeIf { f -> f.exists() }
+        ?.inputStream()?.use { s -> load(s) }
+}
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -13,6 +20,24 @@ android {
         targetSdk = 34
         versionCode = 8
         versionName = "0.5.0"
+        // on-device VLM (libadpvlm, docs/plan/10) is arm64 only
+        ndk { abiFilters += "arm64-v8a" }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_static")
+                targets += "adpvlm"
+            }
+        }
+    }
+
+    // NDK/CMake location are machine-specific: local.properties keys
+    // adp.ndkPath (NDK of ndkVersion) and cmake.dir (CMake 3.22+)
+    ndkVersion = "27.2.12479018"
+    localProps.getProperty("adp.ndkPath")?.let { path -> ndkPath = path }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     buildTypes {
@@ -54,5 +79,9 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     // FFT for the alignment cross-correlation
     implementation("com.github.wendykierp:JTransforms:3.1")
+    // speech/gap detection model runtime (AI audio description, MIT)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     testImplementation("junit:junit:4.13.2")
+    // real org.json for JVM tests (android.jar ships stubs)
+    testImplementation("org.json:json:20240303")
 }

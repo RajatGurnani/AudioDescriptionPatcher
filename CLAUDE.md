@@ -31,6 +31,12 @@ A tool that "patches" a regular video file with its audio-described (AD) version
 # POST /api/shutdown: localhost only; 409 if jobs run, ?force=true kills tree
 .venv\Scripts\python app.py
 
+# AI audio description for videos without AD (docs/plan/10, P1):
+# local VLM via llama-server (Vulkan) + pyannote gaps + SAPI TTS
+.venv\Scripts\pip install -r requirements-ai.txt
+.venv\Scripts\python adgen.py --setup [--model 4b]
+.venv\Scripts\python adgen.py <video> [-o out] [--model auto|2b|4b|8b|cpu]
+
 # desktop app (pywebview window over app.py's FastAPI, 127.0.0.1 only)
 .venv\Scripts\python desktop.py
 # headless smoke test (hidden window, never shown) - test GUI this way
@@ -43,6 +49,9 @@ A tool that "patches" a regular video file with its audio-described (AD) version
 # Android APK (needs Gradle 8.9 on PATH or a downloaded dist;
 # JDK 17 from Android Studio: set JAVA_HOME to
 # "C:\Program Files\Android\Android Studio\jbr")
+# native VLM lib (docs/plan/10) also needs NDK 27.2 + CMake 3.22+ (with
+# ninja.exe in its bin/): android/local.properties keys adp.ndkPath,
+# cmake.dir; llama.cpp is fetched by CMake at a pinned commit
 cd android && gradle assembleRelease
 # apk: android/app/build/outputs/apk/release/app-release.apk
 adb install -r app-release.apk

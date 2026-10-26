@@ -172,6 +172,87 @@ def start_patch_local(request: Request, payload: dict = Body(...)):
     return {"job": job_id}
 
 
+# ---- AI audio description for videos without AD (adgen.py, plan 10) ----
+ai_lock = threading.Lock()   # one GPU model at a time
+
+
+def run_ai_job(job_id, video_path, output_path, model, cleanup):
+    job = jobs[job_id]
+
+    def progress(phase, frac):
+        job["phase"], job["frac"] = phase, frac
+
+    try:
+        import adgen
+        with ai_lock:
+            job["status"] = "running"
+            job["started"] = time.time()
+            job["output"] = adgen.generate(video_path, output_path, model,
+                                           log=job["log"].append,
+                                           progress=progress)
+        job["status"] = "done"
+        job["ended"] = time.time()
+    except Exception as e:
+        job["error"] = str(e)
+        job["status"] = "error"
+    finally:
+        if cleanup:
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+
+
+def _patch_running():
+    return any(j.get("kind") != "ai" and j["status"] in ("queued", "running")
+               for j in jobs.values())
+
+
+def _start_ai(video, output, model, cleanup):
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {"kind": "ai", "status": "queued", "log": [], "output": None,
+                    "error": None, "name": os.path.basename(output),
+                    "phase": None, "frac": 0.0}
+    threading.Thread(target=run_ai_job, args=(job_id, video, output,
+                     model, cleanup), daemon=True).start()
+    return {"job": job_id}
+
+
+@app.post("/api/generate")
+async def start_generate(video: UploadFile = File(...),
+                         model: str = Form("auto")):
+    """Upload a video, get it back with an AI-made AD track."""
+    if _patch_running():
+        return JSONResponse({"error": "a patch job is running - try again when it is done"},
+                            status_code=409)
+    job_dir = os.path.join(JOBS_DIR, uuid.uuid4().hex[:12])
+    os.makedirs(job_dir, exist_ok=True)
+    src = os.path.join(job_dir, os.path.basename(video.filename or "video.mp4"))
+    with open(src, "wb") as f:
+        shutil.copyfileobj(video.file, f)
+    stem = os.path.splitext(os.path.basename(src))[0]
+    return _start_ai(src, os.path.join(job_dir, f"{stem}.AIAD.mkv"), model, True)
+
+
+@app.post("/api/generate_local")
+def start_generate_local(request: Request, payload: dict = Body(...)):
+    """Same-PC mode: video by path, output next to it. Localhost only."""
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"}, status_code=403)
+    video = payload.get("video")
+    if not video or not os.path.isfile(video):
+        return JSONResponse({"error": f"file not found: {video}"}, status_code=400)
+    outdir = payload.get("outdir")
+    if outdir and not os.path.isdir(outdir):
+        return JSONResponse({"error": f"folder not found: {outdir}"}, status_code=400)
+    if _patch_running():
+        return JSONResponse({"error": "a patch job is running - try again when it is done"},
+                            status_code=409)
+    stem = os.path.splitext(os.path.basename(video))[0]
+    out = os.path.join(payload.get("outdir") or os.path.dirname(video), f"{stem}.AIAD.mkv")
+    return _start_ai(video, out, payload.get("model") or "auto", False)
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
     job = jobs.get(job_id)
@@ -592,6 +673,7 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
       </div>
     </details>
     <button id="go" disabled>Patch it</button>
+    <button class="stop" id="aigo" disabled title="No AD file? A local AI model describes the video (slow, runs on this PC)">&#129302; No AD file? Generate one with AI</button>
   </div>
   <div class="card" id="prog" hidden>
     <div id="stage">uploading&hellip;</div>
@@ -700,6 +782,7 @@ function setFile(slot, f) {
   document.getElementById(hint).textContent =
     f.name + '  (' + (f.size / 1e6).toFixed(0) + ' MB)';
   go.disabled = !(files.video && files.ad);
+  if (typeof aigo !== 'undefined') aigo.disabled = !files.video || busy;
 }
 
 // Chromium's File System Access picker remembers the last folder per `id`
@@ -773,7 +856,10 @@ async function adpDropPaths(paths, source) {
 // ---- run + progress ----
 const PHASES = {analyze: ['1/3', 'Analyzing video + AD audio'],
                 align: ['2/3', 'Aligning'],
-                mux: ['3/3', 'Writing output']};
+                mux: ['3/3', 'Writing output'],
+                gaps: ['1/4', 'Finding pauses in the dialogue'],
+                shots: ['2/4', 'Finding shot changes'],
+                describe: ['3/4', 'Describing scenes (AI)']};
 const bar = document.getElementById('bar');
 const stage = document.getElementById('stage');
 const pct = document.getElementById('pct');
@@ -796,7 +882,7 @@ go.onclick = async () => {
     poll(j.job);
     return;
   }
-  busy = true;
+  busy = true; aigo.disabled = true;
   const fd = new FormData();
   fd.append('video', files.video);
   fd.append('ad', files.ad);
@@ -831,11 +917,35 @@ go.onclick = async () => {
   xhr.send(fd);
 };
 
+const aigo = document.getElementById('aigo');
+aigo.onclick = async () => {
+  document.getElementById('prog').hidden = false;
+  document.getElementById('dl').hidden = true;
+  document.getElementById('reveal').hidden = true;
+  document.getElementById('sync').hidden = true;
+  aigo.disabled = true; go.disabled = true; busy = true;
+  stage.textContent = 'Starting…'; bar.value = 0; pct.textContent = '';
+  let r;
+  if (files.video.path) {   // desktop: in place, output next to the video
+    r = await fetch('api/generate_local', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({video: files.video.path})});
+  } else {
+    stage.textContent = 'Uploading…';
+    const fd = new FormData(); fd.append('video', files.video);
+    r = await fetch('api/generate', {method: 'POST', body: fd});
+  }
+  const j = await r.json();
+  if (!r.ok) { fail(j.error); return; }
+  poll(j.job);
+};
+
 function fail(msg) {
   stage.innerHTML = '<span class="warn">&#9888;&#65039; </span>';
   stage.firstChild.append(msg);
   go.disabled = !(files.video && files.ad);
   busy = false;
+  aigo.disabled = !files.video;
 }
 
 function poll(id) {
@@ -869,6 +979,7 @@ function poll(id) {
         a.href = 'api/jobs/' + id + '/download'; a.hidden = false;
       }
       go.disabled = !(files.video && files.ad);
+      aigo.disabled = !files.video;
       if (j.result) showSync(id, j.result);
       O('notes').replaceChildren(...((j.result && j.result.notes) || []).map(n =>
         Object.assign(document.createElement('li'), {textContent: n})));

@@ -21,3 +21,4 @@ android/local.properties
 # PyInstaller (desktop build) - local only
 build/
 dist/
+android/app/.cxx/

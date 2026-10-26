@@ -90,6 +90,7 @@ Ordering rationale:
 - [07-desktop-app.md](07-desktop-app.md) — shutdown button, pywebview shell, PyInstaller build
 - [08-output-options-and-handoffs.md](08-output-options-and-handoffs.md) — track/codec options, external tools
 - [09-android-parity.md](09-android-parity.md) — what must be mirrored in Kotlin
+- [10-ai-audio-description.md](10-ai-audio-description.md) — generate AD with local VLM + TTS (proposed, Android first)
 - [11-voice-boost.md](11-voice-boost.md) — Android voice boost (extra dialogue-clarity track)
 - [13-standalone-pc-app.md](13-standalone-pc-app.md) — PC app without upload/download, temp hygiene, fit-size fix, silent-start bug
 - [14-batch-tv-shows.md](14-batch-tv-shows.md) — batch for whole shows: episode parsing, coverage scoring, season review
