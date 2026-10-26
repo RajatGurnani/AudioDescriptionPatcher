@@ -95,6 +95,7 @@ def main():
         "fresh": ("done", None, 0, True),
         "downloaded_now": ("done", 60, 0, True),
         "downloaded_old": ("done", 20 * 60, 0, False),
+        "still_downloading": ("done", 20 * 60, 0, True),
         "old": ("done", None, 7, False),
         "old_running": ("running", None, 7, True),
         "orphan_old": (None, None, 7, False),   # from an earlier run
@@ -110,6 +111,8 @@ def main():
                               "output": os.path.join(path, "out.mkv")}
             if dl:
                 app.jobs[name]["downloaded"] = now - dl
+            if name == "still_downloading":   # a second, slow download
+                app.jobs[name]["downloading"] = 1
     app.clean_old_jobs()
     for name, (*_, kept) in cases.items():
         if os.path.isdir(os.path.join(jobs_dir, name)) != kept:

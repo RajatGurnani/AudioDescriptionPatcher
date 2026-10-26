@@ -350,8 +350,9 @@ def copied_stream_bytes(path, maps):
         for kind, num, unit in re.findall(
                 r"\b(video|audio|subtitle|other streams):\s*([\d.]+)"
                 r"\s*(Ki|k|Mi|M)?B", r.stderr):
-            total += float(num) * {"Ki": 1024, "k": 1000, "Mi": 1024 ** 2,
-                                   "M": 1e6}.get(unit, 1)
+            # ffmpeg's "kB"/"MB" (older builds) are binary too
+            total += float(num) * {"Ki": 1024, "k": 1024, "Mi": 1024 ** 2,
+                                   "M": 1024 ** 2}.get(unit, 1)
         _copied_bytes_cache[key] = total
     return _copied_bytes_cache[key]
 
@@ -1800,11 +1801,15 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         target = (opts["fit_gb"] or 0) * GIB
         if target and os.path.getsize(part) > target:
             # VBR overshot: one more encode, bitrate scaled down to fit
+            # only the video shrinks: scale it by (room left for video) /
+            # (video it actually took); audio/subs stay as they were
             size = os.path.getsize(part)
-            opts = dict(opts, _fit_scale=target / size * 0.98)
+            video_bytes = copied_stream_bytes(part, ["0:v:0"])
+            room = target * 0.98 - (size - video_bytes)
+            scale = max(0.1, room / max(video_bytes, 1.0))
+            opts = dict(opts, _fit_scale=scale)
             log(f"  {size / GIB:.2f} GB is over {opts['fit_gb']} GB - "
-                f"encoding again at {opts['_fit_scale']:.0%} of the "
-                "bitrate")
+                f"encoding again at {scale:.0%} of the video bitrate")
             subs_ok = not any(n.startswith("subtitles dropped")
                               for n in notes)
             rc, err = mux(subs_ok, encoder)   # (mux resets `notes`)

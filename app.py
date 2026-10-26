@@ -30,6 +30,7 @@ try:
     from fastapi.responses import (FileResponse, HTMLResponse,
                                    JSONResponse, Response)
     from fastapi.staticfiles import StaticFiles
+    from starlette.background import BackgroundTask
     import adpatch
     import batch
 except ImportError as e:
@@ -300,13 +301,19 @@ def job_envelopes(job_id: str):
 @app.get("/api/jobs/{job_id}/download")
 def job_download(job_id: str):
     job = jobs.get(job_id)
-    if not job or job["status"] != "done" or not job["output"] or             not os.path.exists(job["output"]):
+    if not job or job["status"] != "done" or not job["output"] or (
+            not os.path.exists(job["output"])):
         return JSONResponse({"error": "not ready (or already cleaned "
                              "up)"}, status_code=404)
-    job.setdefault("downloaded", time.time())   # sweeper deletes it later
+    job["downloading"] = job.get("downloading", 0) + 1
+
+    def finished():   # runs once the whole file has been sent
+        job["downloading"] -= 1
+        job["downloaded"] = time.time()   # the sweeper deletes it later
     return FileResponse(job["output"], filename=job["name"],
                         media_type="video/mp4" if job["output"]
-                        .endswith(".mp4") else "video/x-matroska")
+                        .endswith(".mp4") else "video/x-matroska",
+                        background=BackgroundTask(finished))
 
 
 # ---- batch (folders on this PC; localhost only) ----
@@ -1465,7 +1472,7 @@ def clean_old_jobs(max_age_h=JOB_MAX_AGE_H):
     output was downloaded, or once older than max_age_h. Folders of
     queued/running jobs are never touched."""
     now = time.time()
-    by_dir = {j["dir"]: j for j in jobs.values() if j.get("dir")}
+    by_dir = {j["dir"]: j for j in list(jobs.values()) if j.get("dir")}
     for name in os.listdir(JOBS_DIR):
         path = os.path.join(JOBS_DIR, name)
         if not os.path.isdir(path):
@@ -1473,7 +1480,9 @@ def clean_old_jobs(max_age_h=JOB_MAX_AGE_H):
         job = by_dir.get(path)
         if job and job["status"] in ("queued", "running"):
             continue
-        downloaded = job and job.get("downloaded") and             now - job["downloaded"] > DOWNLOADED_KEEP_S
+        downloaded = (job and job.get("downloaded") and
+                      not job.get("downloading") and
+                      now - job["downloaded"] > DOWNLOADED_KEEP_S)
         if downloaded or os.path.getmtime(path) < now - max_age_h * 3600:
             shutil.rmtree(path, ignore_errors=True)
             if job:
@@ -1485,8 +1494,8 @@ def _sweep_jobs_forever(every_s=300):
         time.sleep(every_s)
         try:
             clean_old_jobs()
-        except OSError:
-            pass
+        except Exception as e:   # never let one bad pass end the sweeper
+            print(f"job cleanup failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
