@@ -426,11 +426,23 @@ class Queue:
                options=None):
         opts = adpatch.resolve_options(options, replace)
         ext = "mp4" if opts["container"] == "mp4" else "mkv"
+        # with an output folder, mirror the folders below the videos'
+        # common root (Show/Season 1/...), so "Season 1/Episode 4" and
+        # "Season 2/Episode 4" don't collide
+        dirs = [os.path.dirname(os.path.abspath(v)) for v, _ in pairs]
+        try:
+            common = os.path.commonpath(dirs) if dirs else ""
+        except ValueError:            # different drives
+            common = ""
         items = []
         for i, (video, ad) in enumerate(pairs):
             stem = os.path.splitext(os.path.basename(video))[0]
-            out = os.path.join(outdir or os.path.dirname(video),
-                               f"{stem}.AD.{ext}")
+            folder = os.path.dirname(video)
+            if outdir:
+                rel = os.path.relpath(dirs[i], common) if common else \
+                    os.path.basename(dirs[i])
+                folder = os.path.normpath(os.path.join(outdir, rel))
+            out = os.path.join(folder, f"{stem}.AD.{ext}")
             items.append({"id": i, "video": video, "ad": ad, "output": out,
                           "status": "skipped" if os.path.exists(out)
                           else "pending",
@@ -463,6 +475,13 @@ class Queue:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp, self.path)   # atomic: never a half-written queue
+
+    def retry_failed(self):
+        """Put errored items back in the queue (resume retries them)."""
+        for it in self.items:
+            if it["status"] == "error":
+                it.update(status="pending", phase=None, frac=0.0)
+                it.pop("error", None)
 
     @property
     def pending(self):
@@ -537,13 +556,16 @@ def main(argv=None):
                         "(rows marked 'check' need you to confirm)")
     p.add_argument("--no-recursive", action="store_true")
     p.add_argument("--resume", action="store_true",
-                   help="continue the last interrupted batch")
+                   help="continue the last interrupted batch (failed "
+                        "items are tried again)")
     adpatch.add_option_args(p)
     args = p.parse_args(argv)
     options = adpatch.options_from_args(args)
 
     if args.resume:
         q = Queue.load()
+        if q:
+            q.retry_failed()
         if not q or not q.pending:
             sys.exit("nothing to resume")
     else:

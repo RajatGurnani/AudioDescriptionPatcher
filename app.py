@@ -293,6 +293,8 @@ def batch_resume(request: Request):
     if (denied := _local_only(request)):
         return denied
     q = batch_state["queue"] or batch.Queue.load()
+    if q and not _batch_running():
+        q.retry_failed()
     if _batch_running() or not q or not q.pending:
         return JSONResponse({"error": "nothing to resume"}, status_code=409)
     _start_queue(q)

@@ -135,6 +135,21 @@ def main():
     q3 = batch.Queue.create(pairs, outdir, path=qpath)
     if [it["status"] for it in q3.items] != ["skipped", "skipped"]:
         fails.append("existing outputs not skipped")
+    # failed items are retried on resume
+    q3.items[0]["status"], q3.items[0]["error"] = "error", "boom"
+    q3.retry_failed()
+    if q3.items[0]["status"] != "pending" or "error" in q3.items[0]:
+        fails.append("retry_failed didn't requeue the failed item")
+    # -o keeps season folders apart (same file name in two seasons)
+    show = os.path.join(work, "Show")
+    q4 = batch.Queue.create(
+        [(os.path.join(show, "Season 1", "Episode 4.mkv"), "a.mp3"),
+         (os.path.join(show, "Season 2", "Episode 4.mkv"), "b.mp3")],
+        outdir, path=qpath)
+    outs = [os.path.relpath(it["output"], outdir) for it in q4.items]
+    if outs != [os.path.join("Season 1", "Episode 4.AD.mkv"),
+                os.path.join("Season 2", "Episode 4.AD.mkv")]:
+        fails.append(f"outdir layout: {outs}")
 
     fails += parser_test()
     fails += show_test(work)
