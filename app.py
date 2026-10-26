@@ -486,6 +486,8 @@ INDEX_HTML = """<!doctype html>
   table.bt progress { display: block; }
   .st.matched { color: #4caf72; } .st.check { color: #e6b355; }
   .st.nomatch { color: #9aa2af; }
+  .st small { display: block; color: #9aa2af; }
+  tr.season td { font-weight: 600; padding-top: .8em; }
   .badge { display: inline-block; padding: .3rem .7rem; border-radius: 8px;
            font-weight: 600; margin-bottom: .5rem; }
   .badge.good { background: #2f8f4e; } .badge.check { background: #9a7420; }
@@ -1021,14 +1023,33 @@ function showPairs(rows, unused) {
   const tb = $('btable');
   tb.replaceChildren();
   const head = tb.insertRow();
-  for (const h of ['', 'Movie', 'AD file (by match score)', '']) {
+  for (const h of ['', 'Video', 'AD file (by match score)', '']) {
     const th = document.createElement('th'); th.textContent = h; head.append(th); }
+  // TV shows: a header row per season with counts + select-all
+  const season = row => (row.episode || '').startsWith('S') ? row.episode.slice(0, 3) : '';
+  let lastSeason = '';
   rows.forEach((row, i) => {
+    const sk = season(row);
+    if (sk && sk !== lastSeason) {
+      const idx = rows.map((r, j) => season(r) === sk ? j : -1).filter(j => j >= 0);
+      const n = st => idx.filter(j => rows[j].status === st).length;
+      const hr = tb.insertRow(); hr.className = 'season';
+      const all = document.createElement('input'); all.type = 'checkbox';
+      all.checked = idx.every(j => rows[j].status === 'matched');
+      all.onchange = () => idx.forEach(j => {
+        if ($('bs' + j).value) $('bc' + j).checked = all.checked; });
+      hr.insertCell().append(all);
+      const c = hr.insertCell(); c.colSpan = 3;
+      c.textContent = (sk === 'S00' ? 'Specials' : 'Season ' + (+sk.slice(1))) +
+        '  ·  ' + n('matched') + ' matched, ' + n('check') + ' to check, ' +
+        n('no match') + ' without AD';
+    }
+    lastSeason = sk || lastSeason;
     const tr = tb.insertRow();
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.checked = row.status === 'matched'; cb.id = 'bc' + i;
     tr.insertCell().append(cb);
-    tr.insertCell().textContent = base(row.video);
+    tr.insertCell().textContent = (row.episode ? row.episode + '  ' : '') + base(row.video);
     const sel = document.createElement('select'); sel.id = 'bs' + i;
     sel.append(new Option('- none -', ''));
     for (const [ad, sc] of row.alternatives)
@@ -1041,6 +1062,8 @@ function showPairs(rows, unused) {
     tr.insertCell().append(sel);
     const st = tr.insertCell(); st.className = 'st ' + row.status.replace(' ', '');
     st.textContent = {matched: '✔ matched', check: '⚠ check', 'no match': '– no match'}[row.status];
+    if (row.note) { const s = document.createElement('small');
+                    s.textContent = ' ' + row.note; st.append(s); }
   });
   $('bunused').textContent = unused.length
     ? 'Not paired: ' + unused.map(base).join(', ') : '';
@@ -1089,7 +1112,9 @@ function renderQueue(q) {
     } else c.textContent = ST[it.status] + (it.error ? ': ' + it.error : '');
   }
   const pending = q.items.some(it => it.status === 'pending');
-  $('bresume').hidden = q.running || !pending;
+  const failed = q.items.some(it => it.status === 'error');
+  $('bresume').hidden = q.running || !(pending || failed);
+  $('bresume').textContent = pending ? 'Resume batch' : 'Retry failed';
   $('bstop').hidden = !q.running;
   if (!q.running) $('bstop').textContent = 'Stop after current';
 }
