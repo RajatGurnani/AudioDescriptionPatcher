@@ -64,7 +64,9 @@ QUEUE_FILE = os.path.join(
 # --------------------------------------------------------------------------
 
 def _is_output(name):
-    return re.search(r"\.AD\.(mkv|mp4|m4v)$", name, re.I) is not None
+    # *.AD.partial.* = an unfinished mux (adpatch renames it when done)
+    return re.search(r"\.AD(\.partial)?\.(mkv|mp4|m4v)$", name,
+                     re.I) is not None
 
 
 def discover(folders, recursive=True):

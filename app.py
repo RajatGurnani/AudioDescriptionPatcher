@@ -65,6 +65,8 @@ def run_job(job_id, video_path, ad_path, output_path, replace,
     job["started"] = time.time()
 
     def progress(phase, frac):
+        if job.get("cancel"):
+            raise adpatch.Cancelled()   # kills ffmpeg, drops the partial
         job["phase"], job["frac"] = phase, frac
 
     try:
@@ -76,6 +78,8 @@ def run_job(job_id, video_path, ad_path, output_path, replace,
         job["plot"] = result["plot"]
         job["status"] = "done"
         job["ended"] = time.time()
+    except adpatch.Cancelled:
+        job["status"] = "cancelled"
     except Exception as e:   # surface any failure to the UI
         job["error"] = str(e)
         job["status"] = "error"
@@ -130,7 +134,7 @@ async def start_patch(video: UploadFile = File(...),
 
     jobs[job_id] = {"status": "queued", "log": [], "output": None,
                     "error": None, "name": f"{stem}.AD.{ext}",
-                    "phase": None, "frac": 0.0}
+                    "phase": None, "frac": 0.0, "dir": job_dir}
     threading.Thread(target=run_job,
                      args=(job_id, video_path, ad_path, output_path,
                            bool(replace)),
@@ -212,7 +216,8 @@ def _start_ai(video, output, model, cleanup):
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {"kind": "ai", "status": "queued", "log": [], "output": None,
                     "error": None, "name": os.path.basename(output),
-                    "phase": None, "frac": 0.0}
+                    "phase": None, "frac": 0.0,
+                    "dir": os.path.dirname(output) if cleanup else None}
     threading.Thread(target=run_ai_job, args=(job_id, video, output,
                      model, cleanup), daemon=True).start()
     return {"job": job_id}
@@ -267,6 +272,18 @@ def job_status(job_id: str):
             "output": job.get("output")}
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+def job_cancel(job_id: str):
+    """Stop a patch job: ffmpeg is killed and the half-written output
+    removed (the job ends as "cancelled")."""
+    job = jobs.get(job_id)
+    if not job or job.get("kind") == "ai":
+        return JSONResponse({"error": "no such patch job"}, status_code=404)
+    if job["status"] in ("queued", "running"):
+        job["cancel"] = True
+    return {"status": job["status"]}
+
+
 @app.get("/api/jobs/{job_id}/envelopes")
 def job_envelopes(job_id: str):
     """Video + aligned-AD onset envelopes for the waveform-match chart:
@@ -283,8 +300,10 @@ def job_envelopes(job_id: str):
 @app.get("/api/jobs/{job_id}/download")
 def job_download(job_id: str):
     job = jobs.get(job_id)
-    if not job or job["status"] != "done":
-        return JSONResponse({"error": "not ready"}, status_code=404)
+    if not job or job["status"] != "done" or not job["output"] or             not os.path.exists(job["output"]):
+        return JSONResponse({"error": "not ready (or already cleaned "
+                             "up)"}, status_code=404)
+    job.setdefault("downloaded", time.time())   # sweeper deletes it later
     return FileResponse(job["output"], filename=job["name"],
                         media_type="video/mp4" if job["output"]
                         .endswith(".mp4") else "video/x-matroska")
@@ -679,10 +698,12 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
     <div id="stage">uploading&hellip;</div>
     <progress id="bar" max="100" value="0"></progress>
     <div class="hint" id="pct"></div>
+    <button class="stop" id="cancel" hidden>&#10006; Cancel</button>
     <details id="logbox"><summary class="hint">log</summary>
       <pre id="log"></pre></details>
     <a class="dl" id="dl" hidden>&#11015;&#65039; Download patched video</a>
     <button id="reveal" hidden>&#128194; Show in folder</button>
+    <button id="play" hidden>&#9654;&#65039; Play</button>
     <div style="display:flex;gap:.5rem;margin-top:.5rem">
       <button class="stop" id="h_mkvtoolnix" hidden></button>
       <button class="stop" id="h_handbrake" hidden></button></div>
@@ -870,6 +891,7 @@ go.onclick = async () => {
     document.getElementById('prog').hidden = false;
     document.getElementById('dl').hidden = true;
     document.getElementById('reveal').hidden = true;
+    document.getElementById('play').hidden = true;
     document.getElementById('sync').hidden = true;
     go.disabled = true; busy = true;
     stage.textContent = 'Starting\u2026'; bar.value = 0; pct.textContent = '';
@@ -922,6 +944,7 @@ aigo.onclick = async () => {
   document.getElementById('prog').hidden = false;
   document.getElementById('dl').hidden = true;
   document.getElementById('reveal').hidden = true;
+  document.getElementById('play').hidden = true;
   document.getElementById('sync').hidden = true;
   aigo.disabled = true; go.disabled = true; busy = true;
   stage.textContent = 'Starting…'; bar.value = 0; pct.textContent = '';
@@ -949,6 +972,12 @@ function fail(msg) {
 }
 
 function poll(id) {
+  const cb = document.getElementById('cancel');
+  cb.hidden = false; cb.disabled = false; cb.textContent = 'Cancel';
+  cb.onclick = async () => {
+    cb.disabled = true; cb.textContent = 'Cancelling...';
+    await fetch('api/jobs/' + id + '/cancel', {method: 'POST'});
+  };
   const t = setInterval(async () => {
     let j;
     try {
@@ -964,6 +993,7 @@ function poll(id) {
       pct.textContent = (100 * j.frac).toFixed(0) + '%' +
         (j.elapsed ? '  \\u00b7  ' + fmtTime(j.elapsed) + ' elapsed' : '');
     }
+    if (j.status !== 'queued' && j.status !== 'running') cb.hidden = true;
     if (j.status === 'done') {
       clearInterval(t);
       stage.textContent = 'Done \\u2705'; bar.value = 100;
@@ -973,6 +1003,8 @@ function poll(id) {
         pct.textContent += '  \u00b7  saved ' + j.output;
         const rv = document.getElementById('reveal');
         rv.hidden = false; rv.onclick = () => api().reveal(j.output);
+        const pl = document.getElementById('play');
+        pl.hidden = false; pl.onclick = () => api().play(j.output);
         showHandoffs(j.output);
       } else {
         const a = document.getElementById('dl');
@@ -985,6 +1017,12 @@ function poll(id) {
         Object.assign(document.createElement('li'), {textContent: n})));
     } else if (j.status === 'error') {
       clearInterval(t); fail(j.error);
+    } else if (j.status === 'cancelled') {
+      clearInterval(t);
+      stage.textContent = 'Cancelled - nothing was written'; bar.value = 0;
+      pct.textContent = ''; busy = false;
+      go.disabled = !(files.video && files.ad);
+      aigo.disabled = !files.video;
     }
   }, 700);
 }
@@ -1418,13 +1456,37 @@ def port_free():
             return False
 
 
-def clean_old_jobs(max_age_h=24):
-    """Delete job folders (uploads + outputs) older than max_age_h."""
-    cutoff = time.time() - max_age_h * 3600
+DOWNLOADED_KEEP_S = 15 * 60   # a re-download (or a retried one) still works
+JOB_MAX_AGE_H = 6
+
+
+def clean_old_jobs(max_age_h=JOB_MAX_AGE_H):
+    """Delete upload job folders (uploads + output): 15 min after the
+    output was downloaded, or once older than max_age_h. Folders of
+    queued/running jobs are never touched."""
+    now = time.time()
+    by_dir = {j["dir"]: j for j in jobs.values() if j.get("dir")}
     for name in os.listdir(JOBS_DIR):
         path = os.path.join(JOBS_DIR, name)
-        if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+        if not os.path.isdir(path):
+            continue
+        job = by_dir.get(path)
+        if job and job["status"] in ("queued", "running"):
+            continue
+        downloaded = job and job.get("downloaded") and             now - job["downloaded"] > DOWNLOADED_KEEP_S
+        if downloaded or os.path.getmtime(path) < now - max_age_h * 3600:
             shutil.rmtree(path, ignore_errors=True)
+            if job:
+                job["output"] = None
+
+
+def _sweep_jobs_forever(every_s=300):
+    while True:
+        time.sleep(every_s)
+        try:
+            clean_old_jobs()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
@@ -1439,6 +1501,7 @@ if __name__ == "__main__":
                  "and try again")
     os.makedirs(JOBS_DIR, exist_ok=True)
     clean_old_jobs()
+    threading.Thread(target=_sweep_jobs_forever, daemon=True).start()
     url = f"http://{lan_ip()}:{PORT}"
     print(f"\n  On this PC:    {local_url}")
     print(f"  On your phone: {url}   (same Wi-Fi)\n")

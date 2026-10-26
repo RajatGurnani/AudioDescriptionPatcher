@@ -115,6 +115,10 @@ class Api:
         """Open Explorer with the file selected."""
         subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
 
+    def play(self, path):
+        """Open the file in the default video player."""
+        os.startfile(os.path.normpath(path))
+
     def open_audiovault(self):
         if self._vault is not None:
             return

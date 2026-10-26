@@ -208,21 +208,52 @@ def main():
                        "video_real_20m.mkv")
     big_ad = os.path.join(tempfile.gettempdir(), "adpatch-harness",
                           "ad4_pal_20m.mp3")
-    if "--no-fit" in sys.argv or not os.path.exists(big):
-        print("skip fit-to-size (no realistic harness video / --no-fit)")
+    if "--no-fit" in sys.argv:
+        print("skip fit-to-size (--no-fit)")
     else:
+        if not os.path.exists(big) or not os.path.exists(big_ad):
+            print("generating the realistic 20 min harness media ...")
+            harness.prepare(os.path.dirname(big), 20, realistic=True)
         target = 0.3
         out, res, s = run("fit", big, big_ad, "mp4",
                           {"fit_gb": target, "max_height": 144})
-        size = os.path.getsize(out) / 1e9
+        size = os.path.getsize(out) / adpatch.GIB
         v = kinds(s, "video")[0]
-        check(f"fit: size within 5 % of {target} GB",
-              abs(size / target - 1) <= 0.05, f"{size:.3f} GB")
+        check(f"fit: {target} GB target, under it but not far",
+              0.85 <= size / target <= 1.0, f"{size:.3f} GB")
         check("fit: hevc, height 144", v["codec"] == "hevc" and
               "x144" in v["details"], v["details"][:60])
         check("fit: encoder note", any("re-encoded" in n
                                        for n in res["notes"]), res["notes"])
         check("fit: sync", *in_sync(out, adpatch.onset_envelope(big)))
+
+        # 8. fit with a lossless track (no bitrate in `ffmpeg -i`) + subs:
+        # the old 640 kb/s guess under-counted it and overshot the target
+        lossless = os.path.join(WORK, "fit_lossless.mkv")
+        srt_path = os.path.join(WORK, "fit.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for i in range(200):
+                f.write(f"{i + 1}\n00:{i // 10:02d}:{(i % 10) * 6:02d},000 --> "
+                        f"00:{i // 10:02d}:{(i % 10) * 6 + 3:02d},000\n"
+                        f"line {i}\n\n")
+        ff("-i", big, "-i", srt_path, "-map", "0:v", "-map", "0:a", "-map", "0:a",
+           "-map", "1", "-c:v", "copy", "-c:a:0", "copy", "-c:a:1", "flac",
+           "-ac:a:1", "2", "-ar:a:1", "48000", "-c:s", "srt", lossless)
+        flac_kb = [t for t in kinds(adpatch.probe_streams(lossless), "audio")
+                   if t["codec"] == "flac"][0]["kbps"]
+        target = 0.45
+        out, res, s = run("fit_lossless", lossless, big_ad, "mkv",
+                          {"fit_gb": target, "max_height": 144,
+                           "keep_audio": "all", "keep_subs": "all"})
+        size = os.path.getsize(out) / adpatch.GIB
+        # simple test footage can't use all its video bits, and here the
+        # video is a small part of the file: under is fine, over is the bug
+        check(f"fit lossless: {target} GB target, under it "
+              f"(flac shows {flac_kb} kb/s in ffmpeg -i)",
+              0.7 <= size / target <= 1.0, f"{size:.3f} GB")
+        check("fit lossless: 3 audio + 1 subtitle",
+              len(kinds(s, "audio")) == 3 and len(kinds(s, "subtitle")) == 1,
+              str([(t["type"], t["codec"]) for t in s]))
 
     print("\nPASS" if not fails else f"\nFAIL: {fails}")
     sys.exit(1 if fails else 0)

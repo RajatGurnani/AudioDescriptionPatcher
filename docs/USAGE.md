@@ -12,7 +12,7 @@
 ## Setup (PC)
 
 Install Python 3.10+ from python.org (tick *Add python.exe to PATH*).
-That's all: the first run of `patch.bat` or `start_app.bat` creates
+That's all: the first run of `patch.bat`, `start_app.bat` or `start_web.bat` creates
 `.venv` and installs everything (needs internet once, ~30 s). Later runs
 skip installation unless `requirements.txt` changed. If
 [uv](https://github.com/astral-sh/uv) is on PATH it's used instead of
@@ -20,22 +20,24 @@ pip, and can even fetch Python itself when none is installed.
 
 ## Option 0 — desktop app (PC, recommended)
 
-`.venv\Scripts\python desktop.py` — or `ADPatcher.exe` from a local build
-(below). The same page as the web app, in its own window:
+`start_app.bat` (or `.venv\Scripts\python desktop.py`, or `ADPatcher.exe`
+from a local build, below). The same page as the web app, in its own
+window, with nothing uploaded or downloaded:
 
 - **Choose video / Choose AD file** open Windows' file dialog, which
   remembers the last folder separately for videos and for AD files.
 - **Drop** files anywhere on the window (both at once is fine).
 - Files are patched **in place** — no upload copy of a multi-GB video;
   the output (`<video>.AD.mkv`) lands next to the video. **Show in
-  folder** opens it in Explorer.
+  folder** opens it in Explorer, **Play** opens it in your video player.
+  **Cancel** stops a running job and deletes the half-written output.
 - **AudioVault** opens audiovault.net in a second window with your own
   login. Save an audio file to your **Downloads** folder there and it
   is picked up as the AD file automatically.
 - Batch mode has **Add folder…** / **Choose output folder…** buttons.
 - Closing the window quits; if jobs are still running it asks first.
 
-Phones keep using `start_app.bat` (the web app serves the Wi-Fi).
+Phones use `start_web.bat` (the web app serves the Wi-Fi).
 
 **Building the exe (local only):**
 
@@ -79,7 +81,7 @@ CLI flags (via `adpatch.py`): `-o OUTPUT` to choose the output path,
 
 ## Option 2 — phone (or any browser) via the web app
 
-1. Run `start_app.bat` on the PC. It opens the page in your browser.
+1. Run `start_web.bat` on the PC. It opens the page in your browser.
    Allow Python through the Windows firewall if prompted.
 2. On the phone: scan the QR code printed in the terminal (or type the
    `http://<ip>:8756` URL). Phone and PC must be on the same Wi-Fi.
@@ -98,8 +100,9 @@ sent to the internet.
 
 To stop the server, press **Stop** on the page *on the PC* (phones don't
 get the button). If jobs are still running it asks first, then ends them
-too. Running `start_app.bat` again while the server is up just reopens
-the page. Job folders older than 24 h are cleaned up on start.
+too. Running `start_web.bat` again while the server is up just reopens
+the page. A job's folder (upload + output) is deleted 15 min after the
+output is downloaded, or after 6 h.
 
 ## Option 4 — a whole folder at once (batch, PC)
 
@@ -161,7 +164,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |
 | Match AD loudness | measures both and levels the AD to the original (±12 dB max; costs one extra decode of each) |
-| Size | *fit to N GB* re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down; N is an upper limit (simple footage comes out smaller). Refused for HDR video: use HandBrake. Slow compared to the default copy. |
+| Size | *fit to N GB* re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down; N is an upper limit in GB as Windows shows them, counting the real size of every kept audio/subtitle track (lossless ones included); if the first encode still comes out over, it encodes once more, smaller. Refused for HDR video: use HandBrake. Slow compared to the default copy. |
 
 CLI examples:
 

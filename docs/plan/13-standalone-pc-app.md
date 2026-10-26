@@ -1,6 +1,16 @@
 # 13 — Standalone PC app (no upload/download)
 
-> **Status:** planned 2026-10-26. Owner priority: develop fully on PC
+> **Status (2026-10-26):** steps 2, 3, 4, 6 done. Step 1 (drop the
+> local server for js_api calls) skipped as YAGNI: the desktop app's
+> server listens on 127.0.0.1 only and the page already works on paths
+> in place, so nothing user-visible would change. Step 2 shipped as
+> Cancel + Play; output-folder setting / name collisions skipped (in
+> place is the expected behaviour; batch has -o). Step 5 waits for a
+> sample file from the owner. Tests: cleanup_test.py (partial files,
+> job sweeper, cancel), options_test fit cases (incl. lossless + subs),
+> desktop_smoke (Play/Cancel/no Download).
+>
+> Planned 2026-10-26. Owner priority: develop fully on PC
 > first; Android paused. Target machine: Ryzen 250 + RTX 5060 Laptop
 > (8 GB, NVENC HEVC/AV1).
 

@@ -11,9 +11,9 @@ Three ways to use it:
 
 | Interface | Where | Best for |
 |---|---|---|
-| **Desktop app** (`desktop.py` / `ADPatcher.exe`) | its own window on the PC | everyday PC use: native file dialogs, drag-drop, no upload copy, AudioVault window, batch |
+| **Desktop app** (`start_app.bat` / `ADPatcher.exe`) | its own window on the PC | everyday PC use: works on your files in place (no upload/download), drag-drop, cancel, AudioVault window, batch incl. whole TV shows |
 | `patch.bat` / `adpatch.py` | Windows CLI / drag-drop | quick one-offs on the PC |
-| `start_app.bat` (web app) | browser on PC **or phone** (same Wi-Fi) | phone files, no install; **batch**: whole folders, auto-paired by audio (PC) |
+| `start_web.bat` (web app) | browser on PC **or phone** (same Wi-Fi) | phone files, no install on the phone |
 | Android app (`android/`) | on the phone itself, offline | fully standalone mobile |
 
 See [docs/USAGE.md](docs/USAGE.md) for the full walkthrough of all three,
@@ -23,7 +23,7 @@ actually works.
 ## Quick start (PC)
 
 Requires Python 3.10+. ffmpeg is bundled via pip — no separate install.
-The first run of `patch.bat` / `start_app.bat` sets up `.venv` and
+The first run of `patch.bat` / `start_app.bat` / `start_web.bat` sets up `.venv` and
 installs dependencies automatically (internet needed once).
 
 Drag the video **and** the AD file together onto `patch.bat`, or:
@@ -39,7 +39,7 @@ track, original audio as track 2.
 ## Quick start (phone via web app)
 
 ```
-start_app.bat
+start_web.bat
 ```
 
 It opens the page on this PC; scan the QR code it prints with your phone

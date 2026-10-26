@@ -19,7 +19,8 @@ A tool that "patches" a regular video file with its audio-described (AD) version
 ## Commands
 
 ```
-# setup: start_app.bat / patch.bat self-bootstrap via tools\ensure_env.bat
+# setup: start_app.bat (desktop) / start_web.bat (phones) / patch.bat
+# self-bootstrap via tools\ensure_env.bat
 # (creates .venv, pip/uv installs when requirements.txt changes)
 .venv\Scripts\pip install -r requirements.txt
 

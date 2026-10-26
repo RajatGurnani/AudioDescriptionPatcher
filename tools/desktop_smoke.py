@@ -80,6 +80,12 @@ def selftest(win, api):
             ("a", "ac3", "spa"), ("s", "subrip", "eng")], str(got))
         check("Show in folder", js("!document.getElementById('reveal').hidden")
               is True)
+        check("Play button", js("!document.getElementById('play').hidden")
+              is True)
+        check("Cancel hidden after the job",
+              js("document.getElementById('cancel').hidden") is True)
+        check("no Download link", js("document.getElementById('dl').hidden")
+              is True)
         badge = js("document.getElementById('badge').textContent") or ""
         piece = js("document.getElementById('align').textContent") or ""
         check("verdict", "In sync" in badge, f"{badge} | {piece}")

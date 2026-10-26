@@ -326,9 +326,41 @@ def _bitrate_bps(text):
     return float(text.rstrip("km")) * mult
 
 
-def _video_args(opts, streams, duration, audio_bps):
+GIB = 1024 ** 3   # "fit N GB" means N GB as Windows counts them (GiB)
+FIT_MARGIN = 0.97  # container overhead + encoder overshoot
+_copied_bytes_cache = {}
+
+
+def copied_stream_bytes(path, maps):
+    """Exact payload bytes of the streams in `maps` ("0:a:1", "0:s:0", ...)
+    when stream-copied: one `-c copy -f null` read of the file, cached
+    per file + stream set. Needed because lossless tracks (TrueHD, DTS-HD,
+    FLAC) often have no bitrate in `ffmpeg -i`."""
+    if not maps:
+        return 0
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_size, st.st_mtime, tuple(maps))
+    if key not in _copied_bytes_cache:
+        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-i", path]
+        for m in maps:
+            cmd += ["-map", m]
+        r = subprocess.run(cmd + ["-c", "copy", "-f", "null", "-"],
+                           capture_output=True, text=True, errors="replace")
+        total = 0.0
+        for kind, num, unit in re.findall(
+                r"\b(video|audio|subtitle|other streams):\s*([\d.]+)"
+                r"\s*(Ki|k|Mi|M)?B", r.stderr):
+            total += float(num) * {"Ki": 1024, "k": 1000, "Mi": 1024 ** 2,
+                                   "M": 1e6}.get(unit, 1)
+        _copied_bytes_cache[key] = total
+    return _copied_bytes_cache[key]
+
+
+def _video_args(opts, streams, duration, other_bytes):
     """Encoder args for a fit-to-size re-encode of the first video stream
-    (`-c:v copy` when not requested)."""
+    (`-c:v copy` when not requested). `other_bytes` = everything else in
+    the output (audio, subtitles); `opts["_fit_scale"]` < 1 shrinks the
+    video bitrate for a second try when the first came out too big."""
     if not opts.get("fit_gb"):
         return ["-map", "0:v", "-c:v", "copy"], []
     vids = [st for st in streams if st["type"] == "video"
@@ -336,15 +368,18 @@ def _video_args(opts, streams, duration, audio_bps):
     if vids and vids[0]["hdr"]:
         raise ValueError("HDR video: fit-to-size would wash out the "
                          "colours - use HandBrake for HDR re-encodes")
-    total = opts["fit_gb"] * 8e9 * 0.985        # ~1.5 % container overhead
-    v_bps = (total - audio_bps * duration) / duration
+    budget = opts["fit_gb"] * GIB * FIT_MARGIN - other_bytes
+    v_bps = budget * 8 / duration * opts.get("_fit_scale", 1.0)
     if v_bps < 300_000:
-        raise ValueError(f"{opts['fit_gb']} GB is too small for this "
-                         f"length ({duration / 60:.0f} min)")
+        raise ValueError(
+            f"{opts['fit_gb']} GB is too small for this length "
+            f"({duration / 60:.0f} min) with {other_bytes / GIB:.2f} GB of "
+            "audio/subtitles kept - drop original audio tracks (lossless "
+            "ones are big) or pick a bigger size")
     enc = video_encoder()
     b = f"{int(v_bps)}"
     args = ["-map", "0:v:0", "-c:v", enc, "-b:v", b,
-            "-maxrate", f"{int(v_bps * 1.5)}", "-bufsize", f"{int(v_bps * 2)}"]
+            "-maxrate", f"{int(v_bps * 1.25)}", "-bufsize", f"{int(v_bps * 2)}"]
     if enc == "hevc_nvenc":
         args += ["-preset", "p5", "-rc", "vbr", "-multipass", "fullres"]
     elif enc == "hevc_amf":
@@ -355,7 +390,7 @@ def _video_args(opts, streams, duration, audio_bps):
     if opts.get("max_height"):
         args += ["-vf", f"scale=-2:'min({int(opts['max_height'])},ih)'"]
     notes = [f"video re-encoded with {enc} at {v_bps / 1e6:.2f} Mb/s "
-             f"to fit {opts['fit_gb']} GB"]
+             f"to fit {opts['fit_gb']} GB (as Windows counts)"]
     return args, notes
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv",
@@ -468,20 +503,31 @@ def _drain(pipe):
     return result
 
 
+class Cancelled(Exception):
+    """Raised from a `progress` callback to stop a job: the running ffmpeg
+    is killed and patch() removes its partial output."""
+
+
 def run_ffmpeg(cmd, duration=None, progress=None):
     """Run an ffmpeg command, reporting completion 0..1 to `progress` from
-    its -progress output. Returns (returncode, stderr_text)."""
+    its -progress output. Returns (returncode, stderr_text). If `progress`
+    raises (Cancelled, Ctrl+C), ffmpeg is killed first."""
     cmd = [cmd[0], "-nostats", "-progress", "pipe:1"] + cmd[1:]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
     err = _drain(proc.stderr)
-    for line in proc.stdout:
-        if progress and duration and line.startswith(b"out_time_us="):
-            try:
-                us = int(line.split(b"=", 1)[1])
-            except ValueError:   # "N/A" before the first frame
-                continue
-            progress(min(1.0, max(0.0, us / 1e6 / duration)))
+    try:
+        for line in proc.stdout:
+            if progress and duration and line.startswith(b"out_time_us="):
+                try:
+                    us = int(line.split(b"=", 1)[1])
+                except ValueError:   # "N/A" before the first frame
+                    continue
+                progress(min(1.0, max(0.0, us / 1e6 / duration)))
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
     rc = proc.wait()
     return rc, err().decode(errors="replace")
 
@@ -533,19 +579,24 @@ def onset_envelope(path, progress=None):
     leftover = b""
     done = 0
     bytes_per_read = 4 * SR * 20
-    while True:
-        chunk = proc.stdout.read(bytes_per_read)
-        if not chunk:
-            break
-        done += len(chunk)
-        if total:
-            progress(min(1.0, done / total))
-        buf = leftover + chunk
-        usable = (len(buf) // 4 // HOP) * HOP * 4
-        if usable:
-            x = np.frombuffer(buf[:usable], dtype=np.float32)
-            energies.append((x.reshape(-1, HOP) ** 2).sum(axis=1))
-        leftover = buf[usable:]
+    try:
+        while True:
+            chunk = proc.stdout.read(bytes_per_read)
+            if not chunk:
+                break
+            done += len(chunk)
+            if total:
+                progress(min(1.0, done / total))   # may raise Cancelled
+            buf = leftover + chunk
+            usable = (len(buf) // 4 // HOP) * HOP * 4
+            if usable:
+                x = np.frombuffer(buf[:usable], dtype=np.float32)
+                energies.append((x.reshape(-1, HOP) ** 2).sum(axis=1))
+            leftover = buf[usable:]
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
     err = err().decode(errors="replace")
     if proc.wait() != 0:
         raise RuntimeError(f"ffmpeg failed decoding {path}:\n{err}")
@@ -1374,10 +1425,23 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
     cmd += ["-filter_complex", graph]
 
     # video (copy, or fit-to-size re-encode)
-    audio_bps = _bitrate_bps(opts["ad_bitrate"]) + sum(
-        (t["kbps"] or 640) * 1000 for t in keep_a) + \
-        (192_000 if vb_track else 0)
-    v_args, v_notes = _video_args(opts, streams, duration or 1.0, audio_bps)
+    other_bytes = 0
+    if opts.get("fit_gb"):
+        dur = duration or 1.0
+        copied = [t for t in keep_a
+                  if not (mp4 and t["codec"] not in MP4_AUDIO_OK)]
+        subs_kept = [t for t in keep_s
+                     if not (mp4 and t["codec"] not in TEXT_SUBS)]
+        encoded_bps = _bitrate_bps(opts["ad_bitrate"]) + \
+            384_000 * (len(keep_a) - len(copied)) + \
+            (192_000 if vb_track else 0)
+        other_bytes = copied_stream_bytes(
+            video, [f"0:a:{t['type_index']}" for t in copied] +
+            [f"0:s:{t['type_index']}" for t in subs_kept]) + \
+            encoded_bps * dur / 8 + \
+            sum(os.path.getsize(s["path"]) for s in opts["add_subs"])
+    v_args, v_notes = _video_args(opts, streams, duration or 1.0,
+                                  other_bytes)
     cmd += v_args
     notes += v_notes
 
@@ -1601,9 +1665,9 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         if not os.path.isfile(sub["path"]):
             raise ValueError(f"subtitle file not found: {sub['path']}")
     if opts["fit_gb"]:   # fail fast, before minutes of analysis
-        _video_args(opts, probe_streams(video),
-                    probe_duration(video) or 1.0,
-                    _bitrate_bps(opts["ad_bitrate"]))
+        dur = probe_duration(video) or 1.0
+        _video_args(opts, probe_streams(video), dur,
+                    _bitrate_bps(opts["ad_bitrate"]) * dur / 8)
 
     timings = {}
     t_start = clock = time.perf_counter()
@@ -1704,31 +1768,64 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             "(dropped)")
 
     notes = []
+    # mux into a .partial file and rename it when ffmpeg succeeds, so a
+    # failed or interrupted run never leaves a half-written output that
+    # looks finished (batch skips outputs that already exist)
+    root, ext = os.path.splitext(output)
+    part = root + ".partial" + ext
 
     def mux(with_subs, encoder):
-        cmd, n = build_mux_cmd(video, ad_audio, output, a, b_sec, opts,
+        cmd, n = build_mux_cmd(video, ad_audio, part, a, b_sec, opts,
                                streams, encoder, pieces, fill, with_subs,
                                gain_db, duration)
         notes[:] = n
         return run_ffmpeg(cmd, duration, report("mux"))
 
     encoder = None if opts["ad_codec"] in AD_CODECS else ad_encoder()
-    rc, err = mux(True, encoder)
-    if rc != 0 and "Subtitle" in err:
-        # some subtitle codecs can't go into the container - retry
-        # without subtitles rather than failing the whole job
-        log("  subtitles couldn't be muxed - retrying without them")
-        rc, err = mux(False, encoder)
-        notes.append("subtitles dropped: the container rejected them")
-    if rc != 0 and encoder is not None and encoder != AD_ENCODERS[-1]:
-        # the fast encoder can reject odd inputs (channel layouts etc.)
-        log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
-        encoder = AD_ENCODERS[-1]
+    try:
         rc, err = mux(True, encoder)
+        if rc != 0 and "Subtitle" in err:
+            # some subtitle codecs can't go into the container - retry
+            # without subtitles rather than failing the whole job
+            log("  subtitles couldn't be muxed - retrying without them")
+            rc, err = mux(False, encoder)
+            notes.append("subtitles dropped: the container rejected them")
+        if rc != 0 and encoder is not None and encoder != AD_ENCODERS[-1]:
+            # the fast encoder can reject odd inputs (channel layouts etc.)
+            log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
+            encoder = AD_ENCODERS[-1]
+            rc, err = mux(True, encoder)
+        if rc != 0:
+            raise RuntimeError(f"muxing failed:\n{err}")
+        target = (opts["fit_gb"] or 0) * GIB
+        if target and os.path.getsize(part) > target:
+            # VBR overshot: one more encode, bitrate scaled down to fit
+            size = os.path.getsize(part)
+            opts = dict(opts, _fit_scale=target / size * 0.98)
+            log(f"  {size / GIB:.2f} GB is over {opts['fit_gb']} GB - "
+                f"encoding again at {opts['_fit_scale']:.0%} of the "
+                "bitrate")
+            subs_ok = not any(n.startswith("subtitles dropped")
+                              for n in notes)
+            rc, err = mux(subs_ok, encoder)   # (mux resets `notes`)
+            if rc != 0:
+                raise RuntimeError(f"muxing failed:\n{err}")
+            if not subs_ok:
+                notes.append("subtitles dropped: the container rejected "
+                             "them")
+            if os.path.getsize(part) > target:
+                notes.append(f"still {os.path.getsize(part) / GIB:.2f} GB "
+                             f"after a second encode (target "
+                             f"{opts['fit_gb']} GB)")
+        os.replace(part, output)
+    except BaseException:   # incl. Ctrl+C: no half-written leftovers
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
     for n in notes:
         log(f"  note: {n}")
-    if rc != 0:
-        raise RuntimeError(f"muxing failed:\n{err}")
     lap("mux")
     timings["total"] = time.perf_counter() - t_start
 
