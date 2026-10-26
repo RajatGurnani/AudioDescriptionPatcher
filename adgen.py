@@ -316,11 +316,14 @@ def grab_frame(media, t, width=512):
 
 # ----------------------------------------------------------- describe (A4)
 WORDS_PER_S = 2.6
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
+VLM_FRAMES = 2          # newest frames sent per cue (speed)
+MIN_SPEAK_S = 1.8       # shorter cues cannot fit a spoken line
 SYSTEM = ("You write audio description for blind and low-vision viewers of a film. "
           "Describe only what is visible: who or what is there, what they do, where. "
-          "Present tense, third person, plain everyday words. No interpretation of "
-          "feelings or intentions, no camera or film terms, never begin with 'In this "
+          "Present tense, third person, plain everyday words. Never guess feelings, "
+          "thoughts or intentions (no 'startled', 'surprised', 'contemplating'); "
+          "describe actions and expressions literally. No camera or film terms, never begin with 'In this "
           "scene', 'The image shows' or 'We see'. Do not repeat what earlier lines "
           "already said. If nothing new is visible, answer exactly SKIP.")
 
@@ -569,9 +572,9 @@ def generate(video, output=None, model="auto", log=print, progress=None):
                 for k, i in enumerate(todo):
                     c = cues[i]
                     words = max(3, min(25, int((c["end"] - c["start"]) * WORDS_PER_S)))
-                    jpegs = futs.pop(i).result()
+                    jpegs = futs.pop(i).result()[-VLM_FRAMES:]
                     tv = time.time()
-                    text = srv.describe([j for j in jpegs if j], words, earlier) if c["fresh"] or words >= 8 else ""
+                    text = srv.describe([j for j in jpegs if j], words, earlier) if (c["end"] - c["start"] >= MIN_SPEAK_S) else ""
                     vlm_s += time.time() - tv
                     row = {"id": i, "v": PROMPT_VERSION, "start": c["start"], "end": c["end"],
                            "text": text, "model": name}

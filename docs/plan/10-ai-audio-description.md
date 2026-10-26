@@ -402,6 +402,12 @@ Outside cues a:0 = a:1 (−24.7 dB both); inside cues the film is ducked.
   single spotlight." / "Man lunges forward, grabbing another man's arm." /
   credits read out correctly. Weak spots for A4: some interpretation
   ("startled", "surprised expression"), repeats across adjacent cues.
+- 2026-10-26: web/desktop "Generate one with AI" button (`/api/generate`,
+  `/api/generate_local`, one AI job at a time) — verified end to end.
+  Prompt v2 (no guessed feelings), ≤ 2 frames per cue, cues < 1.8 s
+  skipped. Re-timing on the dev box was invalid: 3 Unity editors shared
+  the GTX 1650 (prompt eval 75–100 tok/s vs 170 in the clean bench) →
+  measure speed on the target RTX 5060 / with the GPU idle.
 - TTS for now = Windows SAPI (built into Windows, zero cost); Kokoro is
   A6. Narration level/ducking depth still to tune (A5).
 
