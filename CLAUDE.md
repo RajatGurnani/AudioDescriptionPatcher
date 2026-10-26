@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working rules (all sessions, incl. worktrees + subagents)
+
+- **Work queue:** treat all work as a queue of todos. User tweaks/changes/corrections → append to the queue; don't break the queue to jump to them. Only stop when the queue is 100% clear: every item `[x]` or `BLOCKED:`. Items the user put in the queue count as "told"; side-effectful steps (push, deploy, delete, send) still get confirmed.
+- **Queue file:** `D:\PERSONAL\AudioDescriptionPatcher\TODO.md`, always this absolute path, even from a worktree (`git rev-parse --show-toplevel` gives the worktree there, not main). Git-excluded, never committed. Read it before starting work. Re-read it right before each change, and change only your own line(s) with Edit, never a whole-file Write (other sessions edit it too).
+- **Queue format:** `- [ ] item (owner: X)`; done → `- [x]`; blocked → `- [ ] BLOCKED: reason — item (owner: X)`. X = `main` (the session in the main checkout), `user`, or the linked session's short name (e.g. `android-generate-ad-for`). Items owned by `user` are always `BLOCKED: waiting user` (they never hold up the stop test).
+- **Mistakes:** no apologies. Mistake = gap or issue in instruction files → name the gap + suggest the fix. Solution oriented.
+- **YAGNI:** don't overengineer; never expand scope without permission. Suggest scope improvements when they make sense. All work must be justifiable. Judge where the project sits on "quick and dirty" ↔ "production grade" and match engineering to it.
+- **Reply budget:** a mistake-gap note and a scope suggestion get at most 1 line each, counted inside the 8-line cap. A scope suggestion only when it changes what the user decides; unsure → cut.
+- **Review:** after making changes, spin up a subagent on a cheap model with minimal context to review them with fresh eyes. Report its findings only; fix only when told. Skip for one-line or docs-only edits.
+
 ## Project Goal
 
 A tool that "patches" a regular video file with its audio-described (AD) version: given a video and an AD audio file (e.g., an MP3 from audiovault.net), align the AD audio to the video and mux it in as the default audio track.
@@ -107,10 +117,14 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
 ## Other components
 
 - `batch.py` — folder mode (`adpatch.py batch <folders> | --resume`, web
-  Batch card, localhost-only /api/batch/*): discover → 15 % duration
-  gate → `match_score()` (stage-1 speed-scan peak on cached envelopes)
-  → greedy one-to-one assignment with uniqueness (else "check"; names
-  only break ties) → `Queue` persisted atomically to
+  Batch card, localhost-only /api/batch/*): discover → `parse_episode()`
+  (SxxEyy / 1x02 / Episode N + season folder) → candidates tiered same
+  episode → same season → all (15 % duration gate) → `content_score()`
+  = coverage (20 s segments searched over the whole video, counted only
+  when 2+ agree on an offset and each peak stands clear of noise; shared
+  intros/recaps stay low) → greedy one-to-one with uniqueness (else
+  "check"; episode codes / names only break ties; double-episode AD →
+  note, not patched) → `Queue` persisted atomically to
   %LOCALAPPDATA%\ADPatcher\queue.json, sequential, resumable. Test:
   `tools\batch_test.py`.
 - `desktop.py` — pywebview shell: `?desktop=1` page mode, js_api `Api`

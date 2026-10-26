@@ -2,6 +2,8 @@
 
 Status: **all iterations (0–7) done** on Windows (2026-10-19).
 PC ↔ Android parity: [12-feature-parity.md](12-feature-parity.md).
+**Next (2026-10-26): PC first, Android paused** —
+[13](13-standalone-pc-app.md) standalone PC app, [14](14-batch-tv-shows.md) batch for TV shows.
 Android has the alignment work through iteration 4; iteration 7's
 options are PC-only for now (Android later, per owner). Results
 per iteration in [BENCHMARKS.md](../BENCHMARKS.md). Written
@@ -89,4 +91,6 @@ Ordering rationale:
 - [08-output-options-and-handoffs.md](08-output-options-and-handoffs.md) — track/codec options, external tools
 - [09-android-parity.md](09-android-parity.md) — what must be mirrored in Kotlin
 - [11-voice-boost.md](11-voice-boost.md) — Android voice boost (extra dialogue-clarity track)
+- [13-standalone-pc-app.md](13-standalone-pc-app.md) — PC app without upload/download, temp hygiene, fit-size fix, silent-start bug
+- [14-batch-tv-shows.md](14-batch-tv-shows.md) — batch for whole shows: episode parsing, coverage scoring, season review
 - [THIRD_PARTY.md](THIRD_PARTY.md) — every reused library/algorithm with license + verdict
