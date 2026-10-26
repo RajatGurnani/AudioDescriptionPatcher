@@ -1,6 +1,11 @@
 # Handoff: AI audio description (2026-10-19, updated 2026-10-21)
 
-## State 2026-10-21 (latest)
+## 2026-10-26: Android PAUSED (owner)
+
+All phone work (A4+, CMF, APK builds) paused; AI AD is developed fully on
+PC (`adgen.py`) first. Heavy files on D: under `.local`.
+
+## State 2026-10-21
 
 - Branch `claude/ai-ad-generation-c6685c`, last commit aa96c61 (A3 + P1 v1).
 - Done: A1, A2, A3 (Android); P1 v1 `adgen.py` (PC). Results in plan 10.
