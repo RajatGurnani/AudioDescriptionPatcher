@@ -203,9 +203,14 @@ def run_ai_job(job_id, video_path, output_path, model, cleanup):
                 pass
 
 
+def _patch_running():
+    return any(j.get("kind") != "ai" and j["status"] in ("queued", "running")
+               for j in jobs.values())
+
+
 def _start_ai(video, output, model, cleanup):
     job_id = uuid.uuid4().hex[:12]
-    jobs[job_id] = {"status": "queued", "log": [], "output": None,
+    jobs[job_id] = {"kind": "ai", "status": "queued", "log": [], "output": None,
                     "error": None, "name": os.path.basename(output),
                     "phase": None, "frac": 0.0}
     threading.Thread(target=run_ai_job, args=(job_id, video, output,
@@ -217,6 +222,9 @@ def _start_ai(video, output, model, cleanup):
 async def start_generate(video: UploadFile = File(...),
                          model: str = Form("auto")):
     """Upload a video, get it back with an AI-made AD track."""
+    if _patch_running():
+        return JSONResponse({"error": "a patch job is running - try again when it is done"},
+                            status_code=409)
     job_dir = os.path.join(JOBS_DIR, uuid.uuid4().hex[:12])
     os.makedirs(job_dir, exist_ok=True)
     src = os.path.join(job_dir, os.path.basename(video.filename or "video.mp4"))
@@ -234,6 +242,12 @@ def start_generate_local(request: Request, payload: dict = Body(...)):
     video = payload.get("video")
     if not video or not os.path.isfile(video):
         return JSONResponse({"error": f"file not found: {video}"}, status_code=400)
+    outdir = payload.get("outdir")
+    if outdir and not os.path.isdir(outdir):
+        return JSONResponse({"error": f"folder not found: {outdir}"}, status_code=400)
+    if _patch_running():
+        return JSONResponse({"error": "a patch job is running - try again when it is done"},
+                            status_code=409)
     stem = os.path.splitext(os.path.basename(video))[0]
     out = os.path.join(payload.get("outdir") or os.path.dirname(video), f"{stem}.AIAD.mkv")
     return _start_ai(video, out, payload.get("model") or "auto", False)
@@ -856,7 +870,7 @@ go.onclick = async () => {
     poll(j.job);
     return;
   }
-  busy = true;
+  busy = true; aigo.disabled = true;
   const fd = new FormData();
   fd.append('video', files.video);
   fd.append('ad', files.ad);
