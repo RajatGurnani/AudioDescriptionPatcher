@@ -1509,6 +1509,14 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
         flags = [f for f in ("default", "forced") if sub.get(f)]
         cmd += [f"-disposition:s:{out_s}", "+".join(flags) or "0"]
         out_s += 1
+    # Interleaving: copied tracks are ready instantly, the AD comes through
+    # decode + filters + encoder. With ffmpeg's default 10 s leeway the
+    # first ~16 s of video were written before any audio, so players
+    # starting from 0 had no audio until a seek (owner's report). 60 s
+    # waits that out; 0 (wait forever) also works but buffers the whole
+    # gap between cues of a sparse subtitle track (446 MB on a 2.2 GB film
+    # vs 50 MB with a cap) - too much on big remuxes.
+    cmd += ["-max_interleave_delta", "60000000"]   # microseconds
     cmd += ["-map_chapters", "0", output]
     return cmd, notes
 

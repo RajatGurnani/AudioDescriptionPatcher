@@ -92,6 +92,70 @@ MAX_DB_MS = 10
 MAX_LAG_MS = 20
 
 
+def mkv_block_order(path, max_blocks=400):
+    """[(track_number, timestamp_ms), ...] of an mkv's first blocks in FILE
+    order (ffmpeg's tools re-interleave, so they can't show this). Players
+    read the file front to back: an audio track whose first blocks sit
+    after seconds of video starts silent until the user seeks."""
+    def vint(f, marker=False):
+        b = f.read(1)
+        if not b:
+            return None
+        first, length, mask = b[0], 1, 0x80
+        while length <= 8 and not first & mask:
+            mask >>= 1
+            length += 1
+        val = first if marker else first & (mask - 1)
+        for _ in range(length - 1):
+            val = (val << 8) | f.read(1)[0]
+        return val
+    out = []
+    with open(path, "rb") as f:
+        vint(f, True)
+        f.seek(vint(f), 1)                       # EBML header
+        if vint(f, True) != 0x18538067:          # Segment
+            return out
+        vint(f)
+        while len(out) < max_blocks:
+            eid = vint(f, True)
+            if eid is None:
+                break
+            size = vint(f)
+            if eid != 0x1F43B675:                # not a Cluster: skip
+                f.seek(size, 1)
+                continue
+            end, ctime = f.tell() + size, 0
+            while f.tell() < end and len(out) < max_blocks:
+                cid, csize = vint(f, True), vint(f)
+                start = f.tell()
+                if cid == 0xE7:                  # cluster Timecode
+                    ctime = int.from_bytes(f.read(csize), "big")
+                elif cid in (0xA3, 0xA0):        # SimpleBlock / BlockGroup
+                    if cid == 0xA0:
+                        while f.tell() < start + csize:
+                            bid, bsize = vint(f, True), vint(f)
+                            if bid == 0xA1:      # Block
+                                break
+                            f.seek(bsize, 1)
+                    track = vint(f)
+                    rel = int.from_bytes(f.read(2), "big", signed=True)
+                    out.append((track, ctime + rel))
+                f.seek(start + csize)
+            f.seek(end)
+    return out
+
+
+def interleave_gap_ms(path, tracks):
+    """How far into the file (in timestamp ms of what's already been
+    written) each track's first block appears; {track: ms}."""
+    seen_max, first_at = 0, {}
+    for track, ts in mkv_block_order(path):
+        if track in tracks and track not in first_at:
+            first_at[track] = seen_max
+        seen_max = max(seen_max, ts)
+    return {t: first_at.get(t, float("inf")) for t in tracks}
+
+
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:

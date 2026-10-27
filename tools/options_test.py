@@ -118,6 +118,12 @@ def main():
           a[0]["default"] and a[0]["title"] == "Audio Description"
           and a[0]["language"] == "eng" and not a[1]["default"])
     check("default: sync", *in_sync(out, ref))
+    # mkv track numbers: 1 video, 2 AD, 3 original. Each audio track's
+    # first block must come before ~1 s of other content in the file, or
+    # players start silent until a seek (owner's report, 2026-10)
+    gaps = harness.interleave_gap_ms(out, (2, 3))
+    check("default: audio interleaved from the start",
+          all(g <= 1000 for g in gaps.values()), str(gaps))
 
     # 2. all audio, one kept sub + external forced, AC-3 AD, original default
     out, res, s = run("tracks", video, ad, "mkv", {
