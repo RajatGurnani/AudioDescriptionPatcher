@@ -971,7 +971,8 @@ async function adpDropPaths(paths, source) {
       const r = await fetch('api/folder_kind?path=' + encodeURIComponent(d.path));
       addFolder(r.ok && (await r.json()).kind === 'ad' ? 'ad' : 'video', d.path);
     }
-    showTab('batch');
+    // don't pull the view away from a running single-video job
+    if (!busy) showTab('batch');
   }
   infos = infos.filter(f => !f.dir);
   if (busy || !infos.length) return;

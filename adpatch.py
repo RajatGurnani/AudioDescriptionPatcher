@@ -418,10 +418,15 @@ def _nvenc_size_args():
         taq = ["-temporal-aq", "1"]
         bfr = ["-bf", "4", "-b_ref_mode", "middle"]
         for extra in (base + taq + bfr, base + taq, base, []):
-            r = subprocess.run(
-                [FFMPEG, "-v", "error", "-f", "lavfi", "-i",
-                 "testsrc2=s=256x144:d=1", "-c:v", "hevc_nvenc", "-preset",
-                 "p7", *extra, "-f", "null", "-"], capture_output=True)
+            try:
+                r = subprocess.run(
+                    [FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+                     "testsrc2=s=256x144:d=1", "-c:v", "hevc_nvenc",
+                     "-preset", "p7", *extra, "-f", "null", "-"],
+                    capture_output=True, timeout=30)
+            except subprocess.TimeoutExpired:   # a hung driver: no extras
+                _nvenc_size = []
+                break
             if r.returncode == 0:
                 _nvenc_size = extra
                 break
