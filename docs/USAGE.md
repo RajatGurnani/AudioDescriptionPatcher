@@ -36,6 +36,8 @@ window, with nothing uploaded or downloaded:
   is picked up as the AD file automatically.
 - Batch mode has **Add folder…** / **Choose output folder…** buttons.
 - Closing the window quits; if jobs are still running it asks first.
+  If a job is killed half-way (window closed, crash, power cut), its
+  half-written `*.partial.*` file is deleted the next time the app starts.
 
 Phones use `start_web.bat` (the web app serves the Wi-Fi).
 
@@ -161,6 +163,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | Original audio | first track (default), all, or none (AD only) |
 | Subtitles | **English only** (default: tracks tagged eng; if no track has a language tag, all are kept), keep all, or drop |
 | Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox and its measured size, plus a breakdown of the whole file (video / audio / subtitles) |
+| CPU | how many threads ffmpeg may use (all / 75 % / 50 % / 25 % of this PC's), and **low priority** so the PC stays responsive while it works. CLI `--threads N --low-priority`. Batch scans analyze up to 8 files at once, scaled to this setting |
 | Modify the original video | no copy: the result takes the video's name (extension of the chosen container) and the original goes to the Recycle Bin, so it can be restored. If the Recycle Bin move fails nothing is changed. Batch skips videos that already carry the AD track. CLI `--replace-original` |
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |

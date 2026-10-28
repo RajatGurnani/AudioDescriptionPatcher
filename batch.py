@@ -391,7 +391,8 @@ def scan(folders, recursive=True, log=print, progress=None):
             if progress:
                 progress("analyze", done[0] / max(1, len(need)))
         return p, env
-    with ThreadPoolExecutor(3) as pool:
+    workers = max(1, min(8, adpatch.cpu_threads() // 2))
+    with ThreadPoolExecutor(workers) as pool:
         envs = dict(pool.map(analyze, need))
     stats = {}
     rows, unused = pair_files(
@@ -497,7 +498,10 @@ class Queue:
 
     def run(self, log=print, on_update=None):
         """Patch every pending item in order (sequential: the mux is
-        disk-bound, parallel muxes on one disk just thrash)."""
+        disk-bound, parallel muxes on one disk just thrash; analyzing the
+        next item during a mux was measured slower too - same disk)."""
+        opts = adpatch.resolve_options(self.options.get("patch_options"))
+        adpatch.set_resources(opts["threads"], opts["low_priority"])
         for it in self.items:
             if self.stop.is_set():
                 break

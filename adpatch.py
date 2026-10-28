@@ -96,6 +96,8 @@ DEFAULT_OPTIONS = {
     "voice_boost": "off",      # off | low | high (dialogue clarity)
     "voice_boost_track": True,  # add "original + voice boost" track
     "voice_boost_ad": False,   # also boost the AD track itself
+    "threads": 0,              # CPU threads for ffmpeg; 0 = all cores
+    "low_priority": False,     # run ffmpeg below normal priority
     "replace_original": False,  # result takes the video's name; the
                                 # original goes to the Recycle Bin
 }
@@ -217,6 +219,10 @@ def add_option_args(p):
     g.add_argument("--ad-channels", type=int, choices=(1, 2))
     g.add_argument("--ad-lang", help="AD track language (default eng)")
     g.add_argument("--ad-title", help="AD track title")
+    g.add_argument("--threads", type=int,
+                   help="CPU threads ffmpeg may use (default: all cores)")
+    g.add_argument("--low-priority", action="store_true",
+                   help="run below normal priority (PC stays responsive)")
     g.add_argument("--replace-original", action="store_true",
                    help="modify the original video instead of writing a "
                         "copy: the result takes its name and the original "
@@ -280,6 +286,10 @@ def options_from_args(args):
         opts["default_track"] = "original"
     if args.replace_original:
         opts["replace_original"] = True
+    if args.threads is not None:
+        opts["threads"] = args.threads
+    if args.low_priority:
+        opts["low_priority"] = True
     if args.keep_audio:
         opts["keep_audio"] = tracks(args.keep_audio)
     if args.keep_subs:
@@ -591,6 +601,89 @@ def _drain(pipe):
     return result
 
 
+# CPU use: how many threads ffmpeg may use and at which priority. One
+# process-wide setting (jobs run one at a time); set_resources() is called
+# from patch() with the job's options and from batch scans.
+RESOURCES = {"threads": 0, "low_priority": False}
+_BELOW_NORMAL = 0x00004000   # Windows BELOW_NORMAL_PRIORITY_CLASS
+
+
+def set_resources(threads=None, low_priority=None):
+    if threads is not None:
+        RESOURCES["threads"] = max(0, int(threads))
+    if low_priority is not None:
+        RESOURCES["low_priority"] = bool(low_priority)
+
+
+def cpu_threads():
+    """Threads available to us: the setting, else every logical core."""
+    return RESOURCES["threads"] or os.cpu_count() or 4
+
+
+def ff_threads():
+    """ffmpeg -threads args for the current setting ([] = ffmpeg decides,
+    i.e. all cores)."""
+    return ["-threads", str(RESOURCES["threads"])] \
+        if RESOURCES["threads"] else []
+
+
+def popen_kw():
+    """Popen/run kwargs: below-normal priority when asked (Windows)."""
+    if RESOURCES["low_priority"] and os.name == "nt":
+        return {"creationflags": _BELOW_NORMAL}
+    return {}
+
+
+# Half-written outputs (*.partial.*) of jobs that were killed - window
+# closed, crash, power cut - are listed here and removed on next start.
+PARTIALS_FILE = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "ADPatcher", "partials.json")
+_partials_lock = threading.Lock()
+
+
+def _partials(update=None):
+    """Read (and with `update`, rewrite) the registry. Best effort: it only
+    drives the leftover cleanup, so a clash with another running instance
+    (desktop + CLI at once) or an unreadable file never fails a job."""
+    with _partials_lock:
+        try:
+            with open(PARTIALS_FILE, encoding="utf-8") as f:
+                items = set(json.load(f))
+        except (OSError, ValueError):
+            items = set()
+        if update:
+            items = update(items)
+            tmp = f"{PARTIALS_FILE}.{os.getpid()}.tmp"   # per process
+            try:
+                os.makedirs(os.path.dirname(PARTIALS_FILE), exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(sorted(items), f)
+                os.replace(tmp, PARTIALS_FILE)
+            except OSError:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        return items
+
+
+def clean_stale_partials():
+    """Delete the .partial files a killed job left behind. One that's still
+    being written (another instance) is locked by ffmpeg: kept."""
+    gone = []
+    for p in _partials():
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+            gone.append(p)
+        except OSError:
+            pass
+    if gone:
+        _partials(lambda s: s - set(gone))
+    return gone
+
+
 class Cancelled(Exception):
     """Raised from a `progress` callback to stop a job: the running ffmpeg
     is killed and patch() removes its partial output."""
@@ -640,7 +733,7 @@ def run_ffmpeg(cmd, duration=None, progress=None):
     raises (Cancelled, Ctrl+C), ffmpeg is killed first."""
     cmd = [cmd[0], "-nostats", "-progress", "pipe:1"] + cmd[1:]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+                            stderr=subprocess.PIPE, **popen_kw())
     err = _drain(proc.stderr)
     try:
         for line in proc.stdout:
@@ -696,10 +789,11 @@ def onset_envelope(path, progress=None):
         dur = probe_duration(path)
         total = dur * SR * 4 if dur else None
     # -vn/-sn/-dn: don't set up decoders for streams we never read
-    cmd = [FFMPEG, "-v", "error", "-i", path, "-vn", "-sn", "-dn",
-           "-map", "0:a:0", "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
+    cmd = [FFMPEG, "-v", "error", *ff_threads(), "-i", path, "-vn", "-sn",
+           "-dn", "-map", "0:a:0", "-ac", "1", "-ar", str(SR),
+           *ff_threads(), "-f", "f32le", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+                            stderr=subprocess.PIPE, **popen_kw())
     err = _drain(proc.stderr)
     energies = []
     leftover = b""
@@ -1555,7 +1649,8 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
     keep_a, keep_s = pick(opts["keep_audio"], audio), \
         pick(opts["keep_subs"], subs) if with_subs else []
 
-    cmd = [FFMPEG, "-y", "-v", "error", "-i", video, "-i", ad_audio]
+    cmd = [FFMPEG, "-y", "-v", "error", *ff_threads(), "-i", video,
+           *ff_threads(), "-i", ad_audio]
     for sub in opts["add_subs"]:
         cmd += ["-i", sub["path"]]
     cmd += ["-filter_complex", graph]
@@ -1652,6 +1747,9 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
     # gap between cues of a sparse subtitle track (446 MB on a 2.2 GB film
     # vs 50 MB with a cap) - too much on big remuxes.
     cmd += ["-max_interleave_delta", "60000000"]   # microseconds
+    if RESOURCES["threads"]:   # encoders + filter graph use this many
+        cmd += ["-threads", str(RESOURCES["threads"]),
+                "-filter_complex_threads", str(RESOURCES["threads"])]
     cmd += ["-map_chapters", "0", output]
     return cmd, notes
 
@@ -1801,6 +1899,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             raise ValueError(f"file not found: {f}")
     video, ad_audio = classify_inputs(input_a, input_b)
     opts = resolve_options(options, replace)
+    set_resources(opts["threads"], opts["low_priority"])
     if opts["replace_original"]:
         output = replace_target(video, opts)
         if os.path.normcase(os.path.abspath(output)) != os.path.normcase(
@@ -1926,6 +2025,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     # looks finished (batch skips outputs that already exist)
     root, ext = os.path.splitext(output)
     part = root + ".partial" + ext
+    _partials(lambda s: s | {os.path.abspath(part)})
 
     def mux(with_subs, encoder):
         cmd, n = build_mux_cmd(video, ad_audio, part, a, b_sec, opts,
@@ -1991,10 +2091,13 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         try:
             os.replace(part, output)
         except OSError as e:
+            # it's the only copy now: never let the cleanup delete it
+            _partials(lambda s: s - {os.path.abspath(part)})
             raise RuntimeError(
                 f"the patched video is at {part} but couldn't be renamed "
                 f"to {os.path.basename(output)} ({e}); the original is in "
                 "the Recycle Bin") from e
+    _partials(lambda s: s - {os.path.abspath(part)})
     for n in notes:
         log(f"  note: {n}")
     lap("mux")
@@ -2030,6 +2133,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
 
 def main():
+    clean_stale_partials()   # left by a job killed last time
     if len(sys.argv) > 1 and sys.argv[1] == "batch":
         import batch   # folder mode: content-based pairing + queue
         return batch.main(sys.argv[2:])

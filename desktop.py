@@ -183,6 +183,7 @@ def main(selftest=None):
     """Run the app; `selftest(window, api)` (tools/desktop_smoke.py) is
     started on a thread once the page has loaded."""
     os.makedirs(web.JOBS_DIR, exist_ok=True)
+    adpatch.clean_stale_partials()   # left by a job killed last time
     # test hooks: fixed port, and a hidden (never shown) window for
     # headless checks - tools/desktop_smoke.py and the built-exe check
     port = int(os.environ.get("ADPATCH_DESKTOP_PORT") or free_port())

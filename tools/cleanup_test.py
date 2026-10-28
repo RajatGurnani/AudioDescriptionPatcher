@@ -171,6 +171,51 @@ def main():
     if open(keep, "rb").read() != before or leftovers(work):
         fails.append("replace_original: failed recycle changed files")
 
+    # a job killed mid-mux (window closed, crash) leaves a registered
+    # .partial; the next start deletes it - unless it's still being written
+    stale = os.path.join(work, "killed.AD.partial.mkv")
+    busy_p = os.path.join(work, "busy.AD.partial.mkv")
+    for p in (stale, busy_p):
+        with open(p, "wb") as f:
+            f.write(b"half")
+    adpatch._partials(lambda s: s | {stale, busy_p})
+    held = open(busy_p, "rb")          # like ffmpeg still writing it
+    try:
+        import msvcrt
+        msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, 1)
+    except (ImportError, OSError):
+        pass
+    gone = adpatch.clean_stale_partials()
+    if os.path.exists(stale) or stale not in gone:
+        fails.append("stale .partial not cleaned")
+    held.close()
+    adpatch.clean_stale_partials()
+    if os.path.exists(busy_p) or adpatch._partials() & {stale, busy_p}:
+        fails.append(".partial registry not emptied")
+
+    # the registry is best effort: if it can't be written (another
+    # instance holding it, odd permissions) the job still succeeds
+    real_pf = adpatch.PARTIALS_FILE
+    adpatch.PARTIALS_FILE = os.path.join(work, "a_folder_not_a_file")
+    os.makedirs(adpatch.PARTIALS_FILE, exist_ok=True)
+    try:
+        adpatch.patch(video, ad, output=os.path.join(work, "reg.AD.mkv"),
+                      log=lambda *a: None)
+    except OSError as e:
+        fails.append(f"unwritable registry failed the job: {e}")
+    finally:
+        adpatch.PARTIALS_FILE = real_pf
+
+    # CPU control reaches every ffmpeg: threads + low priority
+    adpatch.set_resources(3, True)
+    cmd, _ = adpatch.build_mux_cmd(video, ad, out3, 1.0, 0.0)
+    kw = adpatch.popen_kw()
+    adpatch.set_resources(0, False)
+    if cmd.count("-threads") < 3 or "-filter_complex_threads" not in cmd or \
+            (os.name == "nt" and kw.get("creationflags") != 0x4000):
+        fails.append(f"CPU control not applied: {cmd.count('-threads')} "
+                     f"-threads, {kw}")
+
     # modify the original must never overwrite ANOTHER file of that name
     clash = os.path.join(work, "clash.mp4")
     shutil.copy(mp4[:-4] + ".mkv", clash)

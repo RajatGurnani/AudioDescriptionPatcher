@@ -345,6 +345,8 @@ def batch_scan(request: Request, payload: dict = Body(...)):
     sc = {"status": "running", "phase": "probe", "frac": 0.0, "log": [],
           "rows": None, "unused": None, "error": None}
     batch_state["scan"] = sc
+    o = _parse_options(payload.get("options"))   # CPU use for the scan
+    adpatch.set_resources(o.get("threads", 0), o.get("low_priority", False))
 
     def run():
         def progress(phase, frac):
@@ -740,6 +742,11 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
       </div>
       <div class="og">
         <label><input type="checkbox" id="o_loud"> match AD loudness to the original</label>
+      </div>
+      <div class="og">
+        <label>CPU <select id="o_threads"></select></label>
+        <label><input type="checkbox" id="o_lowprio"> low priority (keeps
+          the PC responsive)</label>
       </div>
       <div class="og">
         <label><input type="checkbox" id="o_inplace"> modify the original video
@@ -1316,7 +1323,8 @@ $('bscan').onclick = async () => {
   $('bscanprog').hidden = false; $('bscanstage').textContent = 'Starting…';
   const r = await fetch('api/batch/scan', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({folders, recursive: $('brec').checked})});
+    body: JSON.stringify({folders, recursive: $('brec').checked,
+                          options: collectOptions()})});
   if (!r.ok) { $('bscanstage').textContent = (await r.json()).error;
                $('bscan').disabled = false; return; }
   const t = setInterval(async () => {
@@ -1485,6 +1493,19 @@ fetch('api/info').then(r => r.json()).then(j => {
 
 // ---- output options (see adpatch.DEFAULT_OPTIONS) ----
 const O = id => document.getElementById(id);
+// CPU choices from this machine's core count (all / 3/4 / half / quarter)
+{
+  const n = navigator.hardwareConcurrency || 8;
+  const sel = O('o_threads'), seen = new Set();
+  sel.append(new Option('all ' + n + ' threads', '0'));
+  for (const f of [0.75, 0.5, 0.25]) {
+    const t = Math.max(1, Math.round(n * f));
+    if (t >= n || seen.has(t)) continue;   // tiny CPUs: no duplicates
+    seen.add(t);
+    sel.append(new Option(t + (t > 1 ? ' threads' : ' thread') + ' (' +
+                          Math.round(100 * f) + '%)', String(t)));
+  }
+}
 let optInfo = {presets: {}, builtin: [], tools: {}};
 let probedTracks = null;   // desktop: tracks of the chosen video
 let probeSeq = 0;          // newest probeTracks() call wins
@@ -1498,6 +1519,8 @@ function collectOptions() {
              keep_audio: O('o_keepa').value, keep_subs: O('o_keeps').value,
              loudness_match: O('o_loud').checked,
              replace_original: O('o_inplace').checked,
+             threads: +O('o_threads').value,
+             low_priority: O('o_lowprio').checked,
              voice_boost: O('o_vb').value,
              voice_boost_track: O('o_vbtrack').checked,
              voice_boost_ad: O('o_vbad').checked,
@@ -1523,6 +1546,12 @@ function applyOptions(o) {
   O('o_keeps').value = Array.isArray(d.keep_subs) ? 'all' : d.keep_subs;
   O('o_loud').checked = !!d.loudness_match;
   O('o_inplace').checked = !!d.replace_original;
+  O('o_threads').value = String(d.threads || 0);
+  if (O('o_threads').value === '') {   // saved on another PC: add it
+    O('o_threads').append(new Option(d.threads + ' threads', String(d.threads)));
+    O('o_threads').value = String(d.threads);
+  }
+  O('o_lowprio').checked = !!d.low_priority;
   O('o_vb').value = d.voice_boost || 'off';
   O('o_vbtrack').checked = d.voice_boost_track !== false;
   O('o_vbad').checked = !!d.voice_boost_ad;
@@ -1541,7 +1570,9 @@ function syncOptionsUi() {
     o.fit_gb ? 'fit ' + o.fit_gb + ' GB' : null,
     o.loudness_match ? 'loudness' : null,
     o.voice_boost !== 'off' ? 'voice boost ' + o.voice_boost : null,
-    o.replace_original ? 'modifies the original' : null]
+    o.replace_original ? 'modifies the original' : null,
+    o.threads ? o.threads + ' threads' : null,
+    o.low_priority ? 'low priority' : null]
     .filter(Boolean).join(' · ');
   try { localStorage.setItem('adp-options', JSON.stringify(o)); } catch {}
 }
@@ -1742,6 +1773,7 @@ if __name__ == "__main__":
                  "and try again")
     os.makedirs(JOBS_DIR, exist_ok=True)
     clean_old_jobs()
+    adpatch.clean_stale_partials()   # left by a job killed last time
     threading.Thread(target=_sweep_jobs_forever, daemon=True).start()
     url = f"http://{lan_ip()}:{PORT}"
     print(f"\n  On this PC:    {local_url}")
