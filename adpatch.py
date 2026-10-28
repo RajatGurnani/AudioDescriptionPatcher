@@ -91,6 +91,8 @@ DEFAULT_OPTIONS = {
     "loudness_match": False,   # level the AD to the original's loudness
     "fit_gb": None,            # re-encode video to fit N GB (slow)
     "max_height": None,        # with fit_gb: downscale to this height
+    "fit_priority": "speed",   # with fit_gb: speed | size (slowest preset,
+                               # best picture per GB)
     "voice_boost": "off",      # off | low | high (dialogue clarity)
     "voice_boost_track": True,  # add "original + voice boost" track
     "voice_boost_ad": False,   # also boost the AD track itself
@@ -233,6 +235,9 @@ def add_option_args(p):
                    help="level the AD to the original's loudness")
     g.add_argument("--fit-gb", type=float, help="re-encode the video to "
                    "fit this size (GPU if available; slow)")
+    g.add_argument("--fit-priority", choices=("speed", "size"),
+                   help="with --fit-gb: speed (default) or size = slowest "
+                        "encoder preset, best picture for the size")
     g.add_argument("--max-height", type=int, help="with --fit-gb: "
                    "downscale to this height, e.g. 720")
     g.add_argument("--voice-boost", choices=("off", "low", "high"),
@@ -267,7 +272,8 @@ def options_from_args(args):
                      ("ad_language", args.ad_lang),
                      ("ad_title", args.ad_title),
                      ("fit_gb", args.fit_gb),
-                     ("max_height", args.max_height)):
+                     ("max_height", args.max_height),
+                     ("fit_priority", args.fit_priority)):
         if val is not None:
             opts[key] = val
     if args.original_default:
@@ -398,6 +404,32 @@ def copied_stream_bytes(path, maps):
     return total
 
 
+_nvenc_size = None
+
+
+def _nvenc_size_args():
+    """Best-compression extras for hevc_nvenc that THIS GPU accepts (HEVC
+    B-frames and temporal AQ need Turing TU10x / Ampere+; a GTX 1650's
+    NVENC refuses both). Probed once with a tiny encode, most capable set
+    first."""
+    global _nvenc_size
+    if _nvenc_size is None:
+        base = ["-tune", "hq", "-spatial-aq", "1", "-rc-lookahead", "32"]
+        taq = ["-temporal-aq", "1"]
+        bfr = ["-bf", "4", "-b_ref_mode", "middle"]
+        for extra in (base + taq + bfr, base + taq, base, []):
+            r = subprocess.run(
+                [FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+                 "testsrc2=s=256x144:d=1", "-c:v", "hevc_nvenc", "-preset",
+                 "p7", *extra, "-f", "null", "-"], capture_output=True)
+            if r.returncode == 0:
+                _nvenc_size = extra
+                break
+        else:
+            _nvenc_size = []
+    return _nvenc_size
+
+
 def _video_args(opts, streams, duration, other_bytes):
     """Encoder args for a fit-to-size re-encode of the first video stream
     (`-c:v copy` when not requested). `other_bytes` = everything else in
@@ -422,12 +454,21 @@ def _video_args(opts, streams, duration, other_bytes):
     b = f"{int(v_bps)}"
     args = ["-map", "0:v:0", "-c:v", enc, "-b:v", b,
             "-maxrate", f"{int(v_bps * 1.25)}", "-bufsize", f"{int(v_bps * 2)}"]
+    small = opts.get("fit_priority") == "size"
     if enc == "hevc_nvenc":
-        args += ["-preset", "p5", "-rc", "vbr", "-multipass", "fullres"]
+        args += ["-preset", "p7" if small else "p5", "-rc", "vbr",
+                 "-multipass", "fullres"]
+        if small:   # slowest + smartest: more bits where the eye looks
+            args += _nvenc_size_args()
+    elif enc == "hevc_qsv":
+        if small:
+            args += ["-preset", "veryslow"]
     elif enc == "hevc_amf":
         args += ["-rc", "vbr_peak"]
+        if small:
+            args += ["-quality", "quality"]
     elif enc == "libx265":
-        args += ["-preset", "medium"]
+        args += ["-preset", "slow" if small else "medium"]
     args += ["-tag:v", "hvc1"]   # plays in Apple/TV players from mp4
     if opts.get("max_height"):
         args += ["-vf", f"scale=-2:'min({int(opts['max_height'])},ih)'"]

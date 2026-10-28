@@ -165,7 +165,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |
 | Match AD loudness | measures both and levels the AD to the original (±12 dB max; costs one extra decode of each) |
-| Size | *fit to N GB* re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down; N is an upper limit in GB as Windows shows them, counting the real size of every kept audio/subtitle track (lossless ones included); if the first encode still comes out over, it encodes once more, smaller. Refused for HDR video: use HandBrake. Slow compared to the default copy. |
+| Size | *fit to N GB* (choose **faster encode** or **best picture for the size**: slowest GPU preset plus the extras the GPU supports, ~1.5-2x slower) re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down; N is an upper limit in GB as Windows shows them, counting the real size of every kept audio/subtitle track (lossless ones included); if the first encode still comes out over, it encodes once more, smaller. Refused for HDR video: use HandBrake. Slow compared to the default copy. |
 
 CLI examples:
 

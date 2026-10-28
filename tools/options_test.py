@@ -294,6 +294,15 @@ def main():
         check("fit retry: first encode was over, second one under",
               bool(retried) and size <= target,
               f"{size:.3f} GB; {retried[0].strip() if retried else 'no retry'}")
+        # 10. "best picture for the size": slowest preset (+ whatever the
+        # GPU supports) still lands under the target
+        out10 = os.path.join(WORK, "out_fit_size.mkv")
+        adpatch.patch(noisy, noisy_ad, output=out10, log=lambda *a: None,
+                      options={"fit_gb": 0.03, "fit_priority": "size"})
+        size = os.path.getsize(out10) / adpatch.GIB
+        check("fit priority size: under target",
+              size <= 0.03, f"{size:.4f} GB, extras "
+              f"{adpatch._nvenc_size_args() if adpatch.video_encoder() == 'hevc_nvenc' else '-'}")
         check("fit lossless: 3 audio + 1 subtitle",
               len(kinds(s, "audio")) == 3 and len(kinds(s, "subtitle")) == 1,
               str([(t["type"], t["codec"]) for t in s]))

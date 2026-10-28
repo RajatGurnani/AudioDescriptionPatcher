@@ -717,7 +717,11 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
           <select id="o_height">
             <option value="">keep resolution</option>
             <option>2160</option><option>1080</option><option>720</option>
-            <option>480</option></select></span>
+            <option>480</option></select>
+          <select id="o_fitprio">
+            <option value="speed">faster encode</option>
+            <option value="size">best picture for the size (slower)</option>
+          </select></span>
       </div>
     </details>
     <button id="go" disabled>Patch it</button>
@@ -1367,6 +1371,7 @@ function collectOptions() {
              voice_boost_track: O('o_vbtrack').checked,
              voice_boost_ad: O('o_vbad').checked,
              fit_gb: O('o_fit').value ? +O('o_gb').value : null,
+             fit_priority: O('o_fitprio').value,
              max_height: O('o_fit').value && O('o_height').value ? +O('o_height').value : null};
   if (probedTracks) {   // per-track picks override the coarse choices
     const picked = t => [...document.querySelectorAll('#o_tracks input[data-t="' + t + '"]')]
@@ -1392,6 +1397,7 @@ function applyOptions(o) {
   O('o_vbad').checked = !!d.voice_boost_ad;
   O('o_fit').value = d.fit_gb ? 'fit' : '';
   if (d.fit_gb) O('o_gb').value = d.fit_gb;
+  O('o_fitprio').value = d.fit_priority || 'speed';
   O('o_height').value = d.max_height || '';
   syncOptionsUi();
 }
