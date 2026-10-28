@@ -54,9 +54,10 @@ def selftest(win, api):
         # track picker: keep both audio tracks, drop the French subtitle
         boxes = js("[...document.querySelectorAll('#o_tracks input')]"
                    ".map(c => c.dataset.t + c.dataset.i + ':' + c.checked)")
+        # (default subtitles = English only: the French one starts unticked)
         check("track picker lists 2 audio + 2 subs", boxes ==
               ["audio0:true", "audio1:false", "subtitle0:true",
-               "subtitle1:true"], str(boxes))
+               "subtitle1:false"], str(boxes))
         js("document.querySelector('#o_tracks input[data-t=audio][data-i=\"1\"]').checked = true;"
            "document.querySelector('#o_tracks input[data-t=subtitle][data-i=\"1\"]').checked = false;"
            "O('o_codec').value = 'opus'; syncOptionsUi()")

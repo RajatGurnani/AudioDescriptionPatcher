@@ -662,6 +662,7 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
           <option value="all">all tracks</option>
           <option value="none">none (AD only)</option></select></label>
         <label>Subtitles <select id="o_keeps">
+          <option value="english">English only</option>
           <option value="all">keep all</option>
           <option value="none">drop</option></select></label>
       </div>
@@ -1383,6 +1384,13 @@ async function loadOptions() {
 loadOptions();
 if (DESKTOP) { O('o_subfile').parentElement.hidden = true; O('o_subpick').hidden = false; }
 
+// same rule as adpatch.english_tracks: no language tags at all -> keep
+const engSub = (st, streams) => {
+  const subs = streams.filter(x => x.type === 'subtitle');
+  return !subs.some(x => x.language && x.language !== 'und') ||
+    ['eng', 'en'].includes(st.language);
+};
+
 // desktop: list the video's tracks with checkboxes
 async function probeTracks(path) {
   probedTracks = null; O('o_tracks').hidden = true;
@@ -1397,7 +1405,7 @@ async function probeTracks(path) {
     c.dataset.t = st.type; c.dataset.i = st.type_index;
     c.checked = st.type === 'audio'
       ? (keepA === 'all' || (keepA === 'first' && st.type_index === 0))
-      : keepS === 'all';
+      : keepS === 'all' || (keepS === 'english' && engSub(st, streams));
     c.onchange = syncOptionsUi;
     l.append(c, ' ' + (st.type === 'audio' ? 'Audio ' : 'Subtitle ') +
       (st.type_index + 1) + ': ' + [st.language, st.codec, st.channels,

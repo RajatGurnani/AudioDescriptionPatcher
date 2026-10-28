@@ -85,7 +85,7 @@ DEFAULT_OPTIONS = {
     "ad_title": "Audio Description",
     "default_track": "ad",     # ad | original: which plays by default
     "keep_audio": "first",     # all | first | none | [type indexes]
-    "keep_subs": "all",        # all | none | [type indexes]
+    "keep_subs": "english",    # english | all | none | [type indexes]
     "add_subs": [],            # [{"path", "language", "title",
                                #   "default", "forced"}]
     "loudness_match": False,   # level the AD to the original's loudness
@@ -217,8 +217,9 @@ def add_option_args(p):
                    help="make the original audio the default track")
     g.add_argument("--keep-audio", help="original audio tracks to keep: "
                    "all | first (default) | none | e.g. 0,2")
-    g.add_argument("--keep-subs", help="subtitle tracks to keep: all "
-                   "(default) | none | e.g. 1")
+    g.add_argument("--keep-subs", help="subtitle tracks to keep: english "
+                   "(default; all if none are language-tagged) | all | "
+                   "none | e.g. 1")
     g.add_argument("--add-subs", action="append", default=[],
                    metavar="FILE[:LANG[:forced]]",
                    help="add an external subtitle file (repeatable)")
@@ -251,7 +252,7 @@ def options_from_args(args):
         opts.update(presets[args.preset])
 
     def tracks(v):
-        return v if v in ("all", "first", "none") else \
+        return v if v in ("all", "first", "none", "english") else \
             [int(x) for x in v.split(",") if x.strip()]
     for key, val in (("container", args.container),
                      ("ad_codec", args.ad_codec),
@@ -1345,6 +1346,14 @@ def _piecewise_graph(a, pieces, priming_s, fill_gaps, gain=""):
     return ";".join(parts)
 
 
+def english_tracks(tracks):
+    """English tracks (eng/en). If no track carries a language tag we
+    can't tell, so all are kept rather than dropping untagged English."""
+    if not any(t["language"] and t["language"] != "und" for t in tracks):
+        return tracks
+    return [t for t in tracks if t["language"] in ("eng", "en")]
+
+
 def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
                   streams=None, encoder=None, pieces=None, fill_gaps=True,
                   with_subs=True, gain_db=0.0, duration=None):
@@ -1416,6 +1425,8 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
             return tracks[:1]
         if choice in ("none", None):
             return []
+        if choice == "english":
+            return english_tracks(tracks)
         return [t for t in tracks if t["type_index"] in choice]
     keep_a, keep_s = pick(opts["keep_audio"], audio), \
         pick(opts["keep_subs"], subs) if with_subs else []

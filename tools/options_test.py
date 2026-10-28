@@ -112,8 +112,16 @@ def main():
     # 1. defaults
     out, res, s = run("default", video, ad, "mkv", None)
     a, sub = kinds(s, "audio"), kinds(s, "subtitle")
-    check("default: AD + first original, both subs",
-          len(a) == 2 and len(sub) == 2, f"{len(a)} audio, {len(sub)} subs")
+    check("default: AD + first original, English subs only",
+          len(a) == 2 and [t["language"] for t in sub] == ["eng"],
+          f"{len(a)} audio, subs {[t['language'] for t in sub]}")
+    # untagged subtitles: can't tell which is English -> keep them all
+    untagged = [{"language": "", "type_index": i} for i in range(2)]
+    tagged = [{"language": "fre", "type_index": 0},
+              {"language": "eng", "type_index": 1}]
+    check("english_tracks: untagged kept, tagged filtered",
+          len(adpatch.english_tracks(untagged)) == 2 and
+          [t["type_index"] for t in adpatch.english_tracks(tagged)] == [1])
     check("default: AD first, default, titled",
           a[0]["default"] and a[0]["title"] == "Audio Description"
           and a[0]["language"] == "eng" and not a[1]["default"])
@@ -145,8 +153,8 @@ def main():
 
     # 3. mp4: pcm original -> aac (note), subs -> mov_text, opus AD
     out, res, s = run("mp4", video, ad, "mp4",
-                      {"keep_audio": "all", "ad_codec": "opus",
-                       "ad_bitrate": "128k"})
+                      {"keep_audio": "all", "keep_subs": "all",
+                       "ad_codec": "opus", "ad_bitrate": "128k"})
     a, sub = kinds(s, "audio"), kinds(s, "subtitle")
     check("mp4: audio codecs opus + aac (converted) + ac3",
           [x["codec"] for x in a] == ["opus", "aac", "ac3"],

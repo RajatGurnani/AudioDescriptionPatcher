@@ -159,7 +159,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | Default audio | which track players start with: the AD or the original |
 | AD codec / bitrate / channels | AAC (default), Opus (small, great quality), AC-3 / E-AC-3 (TV receivers) |
 | Original audio | first track (default), all, or none (AD only) |
-| Subtitles | keep all or drop |
+| Subtitles | **English only** (default: tracks tagged eng; if no track has a language tag, all are kept), keep all, or drop |
 | Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox |
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |
