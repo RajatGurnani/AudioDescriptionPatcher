@@ -1,6 +1,12 @@
 # 14 — Batch for whole TV shows (seasons × episodes)
 
-> **Status (2026-10-26):** done except step 4 auto-split. Steps 1-3
+> **Status: CLOSED (2026-10-28).** Step 4 (auto-split double-episode
+> AD) dropped: per the owner, no AD file covers two episodes.
+> Later additions: progress table (episode, status, %, sync, time,
+> size; 3264c42) and its own full-width "Folder / TV show" tab with
+> Videos / AD-files folder zones (170b03e).
+>
+> Done 2026-10-26: Steps 1-3
 > (`parse_episode`, two-pass candidates, `content_score` coverage),
 > 5 (season headers + select-all, SxxEyy, notes), 6 (retry failed on
 > resume, `-o` mirrors season folders; envelopes were already float32).

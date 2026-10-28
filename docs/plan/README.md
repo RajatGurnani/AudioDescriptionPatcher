@@ -2,7 +2,7 @@
 
 Status: **all iterations (0–7) done** on Windows (2026-10-19).
 PC ↔ Android parity: [12-feature-parity.md](12-feature-parity.md).
-**Next (2026-10-26): PC first, Android paused** —
+**Done (closed 2026-10-28): PC first, Android paused** —
 [13](13-standalone-pc-app.md) standalone PC app, [14](14-batch-tv-shows.md) batch for TV shows.
 Android has the alignment work through iteration 4; iteration 7's
 options are PC-only for now (Android later, per owner). Results
