@@ -160,7 +160,8 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | AD codec / bitrate / channels | AAC (default), Opus (small, great quality), AC-3 / E-AC-3 (TV receivers) |
 | Original audio | first track (default), all, or none (AD only) |
 | Subtitles | **English only** (default: tracks tagged eng; if no track has a language tag, all are kept), keep all, or drop |
-| Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox |
+| Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox and its measured size, plus a breakdown of the whole file (video / audio / subtitles) |
+| Modify the original video | no copy: the result takes the video's name (extension of the chosen container) and the original goes to the Recycle Bin, so it can be restored. If the Recycle Bin move fails nothing is changed. Batch skips videos that already carry the AD track. CLI `--replace-original` |
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |
 | Match AD loudness | measures both and levels the AD to the original (±12 dB max; costs one extra decode of each) |

@@ -54,6 +54,15 @@ def selftest(win, api):
         # track picker: keep both audio tracks, drop the French subtitle
         boxes = js("[...document.querySelectorAll('#o_tracks input')]"
                    ".map(c => c.dataset.t + c.dataset.i + ':' + c.checked)")
+        # size breakdown of the chosen video (measured, a few seconds)
+        for _ in range(40):
+            bd = js("(document.getElementById('o_breakdown') || {})"
+                    ".textContent") or ""
+            if bd.startswith("In this file"):
+                break
+            time.sleep(0.25)
+        check("track size breakdown", bd.startswith("In this file") and
+              "Video" in bd and "Audio" in bd and "Subtitles" in bd, bd)
         # (default subtitles = English only: the French one starts unticked)
         check("track picker lists 2 audio + 2 subs", boxes ==
               ["audio0:true", "audio1:false", "subtitle0:true",

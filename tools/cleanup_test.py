@@ -131,6 +131,78 @@ def main():
         fails.append(f"cancel: status {app.jobs['c']['status']}, output "
                      f"{os.path.exists(out3)}, leftovers {leftovers(work)}")
 
+    # modify the original: result takes the video's name, original to the
+    # Recycle Bin; a failed recycle leaves everything as it was
+    own = os.path.join(work, "own.mkv")
+    shutil.copy(video, own)
+    adpatch.patch(own, ad, log=lambda *a: None,
+                  options={"replace_original": True})
+    if not adpatch.has_ad_track(own) or leftovers(work) or \
+            os.path.exists(os.path.join(work, "own.AD.mkv")):
+        fails.append("replace_original: original not replaced in place")
+    import batch
+    q = batch.Queue.create([(own, ad)], path=os.path.join(work, "q.json"),
+                           options={"replace_original": True})
+    if q.items[0]["status"] != "skipped" or q.items[0]["output"] != own:
+        fails.append(f"batch replace_original: {q.items[0]['status']} "
+                     f"{q.items[0]['output']}")
+    mp4 = os.path.join(work, "own2.mp4")
+    harness.run([adpatch.FFMPEG, "-y", "-v", "error", "-i", video, "-c:v",
+                 "copy", "-c:a", "aac", mp4])
+    adpatch.patch(mp4, ad, log=lambda *a: None,
+                  options={"replace_original": True})
+    if os.path.exists(mp4) or not os.path.exists(mp4[:-4] + ".mkv"):
+        fails.append("replace_original: mp4 -> mkv rename")
+    keep = os.path.join(work, "keep.mkv")
+    shutil.copy(video, keep)
+    before = open(keep, "rb").read()
+    real_recycle = adpatch.recycle
+
+    def no_bin(path):
+        raise RuntimeError("Recycle Bin unavailable")
+    adpatch.recycle = no_bin
+    try:
+        adpatch.patch(keep, ad, log=lambda *a: None,
+                      options={"replace_original": True})
+        fails.append("replace_original: recycle failure didn't raise")
+    except RuntimeError:
+        pass
+    adpatch.recycle = real_recycle
+    if open(keep, "rb").read() != before or leftovers(work):
+        fails.append("replace_original: failed recycle changed files")
+
+    # modify the original must never overwrite ANOTHER file of that name
+    clash = os.path.join(work, "clash.mp4")
+    shutil.copy(mp4[:-4] + ".mkv", clash)
+    other = os.path.join(work, "clash.mkv")
+    with open(other, "wb") as f:
+        f.write(b"someone else's file")
+    try:
+        adpatch.patch(clash, ad, log=lambda *a: None,
+                      options={"replace_original": True})
+        fails.append("replace_original: overwrote an existing target")
+    except ValueError:
+        pass
+    if open(other, "rb").read() != b"someone else's file" or \
+            not os.path.exists(clash):
+        fails.append("replace_original: clash changed files")
+
+    # a failed size measurement is estimated, not cached as zeros
+    real_run = adpatch.subprocess.run
+
+    class Failed:
+        returncode, stderr = 1, ""
+    adpatch.subprocess.run = lambda *a, **k: Failed()
+    adpatch._copied_bytes_cache.clear()
+    try:
+        sizes = adpatch.stream_sizes(keep)
+    finally:
+        adpatch.subprocess.run = real_run
+    if adpatch._copied_bytes_cache:
+        fails.append("stream_sizes cached a failed measurement")
+    if not adpatch.stream_sizes(keep) or not adpatch._copied_bytes_cache:
+        fails.append("stream_sizes didn't measure after a failure")
+
     print("PASS" if not fails else "FAIL:\n  " + "\n  ".join(fails))
     sys.exit(1 if fails else 0)
 

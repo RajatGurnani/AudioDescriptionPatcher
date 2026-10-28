@@ -64,8 +64,8 @@ QUEUE_FILE = os.path.join(
 # --------------------------------------------------------------------------
 
 def _is_output(name):
-    # *.AD.partial.* = an unfinished mux (adpatch renames it when done)
-    return re.search(r"\.AD(\.partial)?\.(mkv|mp4|m4v)$", name,
+    # *.partial.* = an unfinished mux (adpatch renames it when done)
+    return re.search(r"(\.AD|\.partial)\.(mkv|mp4|m4v)$", name,
                      re.I) is not None
 
 
@@ -445,10 +445,16 @@ class Queue:
                     os.path.basename(dirs[i])
                 folder = os.path.normpath(os.path.join(outdir, rel))
             out = os.path.join(folder, f"{stem}.AD.{ext}")
+            if opts["replace_original"]:
+                # same name as the video; already done = it has our track
+                out = adpatch.replace_target(video, opts)
+                done = adpatch.has_ad_track(video, opts["ad_title"])
+            else:
+                done = os.path.exists(out)
             items.append({"id": i, "video": video, "ad": ad, "output": out,
-                          "status": "skipped" if os.path.exists(out)
-                          else "pending",
-                          "phase": None, "frac": 0.0})
+                          "status": "skipped" if done else "pending",
+                          "phase": None, "frac": 0.0,
+                          "episode": episode_label(parse_episode(video))})
         q = cls(items, {"outdir": outdir, "replace": replace,
                         "patch_options": options or {},
                         "created": time.time()}, path)
@@ -517,7 +523,8 @@ class Queue:
                                     log=log, progress=progress)
                 it.update(status="done", confidence=res["confidence"],
                           band=res["band"], warnings=res["warnings"],
-                          pieces=len(res["pieces"]) or 1)
+                          pieces=len(res["pieces"]) or 1,
+                          size=os.path.getsize(it["output"]))
             except Exception as e:   # one bad pair must not stop the batch
                 it.update(status="error", error=str(e))
                 log(f"  error: {e}")

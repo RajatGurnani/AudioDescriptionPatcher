@@ -420,7 +420,8 @@ def batch_stop(request: Request):
 @app.get("/api/batch")
 def batch_status():
     q = batch_state["queue"]
-    return {"items": q.items if q else [], "running": _batch_running()}
+    return {"items": q.items if q else [], "running": _batch_running(),
+            "now": time.time()}   # for elapsed times (server clock)
 
 
 # ---- output options, presets, track probe, hand-offs ----
@@ -471,6 +472,21 @@ def probe(request: Request, path: str):
         return JSONResponse({"error": "file not found"}, status_code=404)
     return {"streams": [st for st in adpatch.probe_streams(path)
                         if st["type"] in ("audio", "subtitle")]}
+
+
+@app.get("/api/sizes")
+def sizes(request: Request, path: str):
+    """Exact size of every track of a local file (one fast copy-read of
+    the file, a few seconds for a 2 GB film). Localhost only."""
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    if not os.path.isfile(path):
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    by_index = adpatch.stream_sizes(path)
+    return {"file": os.path.getsize(path),
+            "streams": [dict(st, bytes=by_index.get(st["index"], 0))
+                        for st in adpatch.probe_streams(path)]}
 
 
 @app.post("/api/handoff")
@@ -678,6 +694,11 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
         <label><input type="checkbox" id="o_loud"> match AD loudness to the original</label>
       </div>
       <div class="og">
+        <label><input type="checkbox" id="o_inplace"> modify the original video
+          (no copy: the result takes its name, the original goes to the
+          Recycle Bin)</label>
+      </div>
+      <div class="og">
         <label>Voice boost <select id="o_vb">
           <option value="off">off</option><option value="low">low</option>
           <option value="high">high</option></select></label>
@@ -753,6 +774,7 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
       <button id="bstart">Patch selected</button>
     </div>
     <div id="bqueue" hidden style="margin-top:.8rem">
+      <div class="hint" id="bqsum"></div>
       <table class="bt" id="bqtable"></table>
       <div style="display:flex;gap:.5rem;margin-top:.6rem">
         <button id="bresume" hidden>Resume batch</button>
@@ -1252,22 +1274,59 @@ let qTimer = null;
 function renderQueue(q) {
   $('bqueue').hidden = !q.items.length;
   const tb = $('bqtable'); tb.replaceChildren();
-  for (const it of q.items) {
+  const head = tb.insertRow();
+  for (const h of ['#', 'Episode', 'Video', 'Status', 'Progress', 'Sync',
+                   'Time', 'Size']) {
+    const th = document.createElement('th'); th.textContent = h; head.append(th); }
+  const dur = sec => sec >= 3600 ? Math.floor(sec / 3600) + 'h ' +
+    Math.floor(sec % 3600 / 60) + 'm' : Math.floor(sec / 60) + 'm ' +
+    Math.round(sec % 60) + 's';
+  const now = q.now || Date.now() / 1000;
+  let lastSeason = '';
+  q.items.forEach((it, n) => {
+    const season = (it.episode || '').startsWith('S') ? it.episode.slice(0, 3) : '';
+    if (season && season !== lastSeason) {   // TV shows: a row per season
+      const items = q.items.filter(x => (x.episode || '').startsWith(season));
+      const hr = tb.insertRow(); hr.className = 'season';
+      const c = hr.insertCell(); c.colSpan = 8;
+      c.textContent = (season === 'S00' ? 'Specials' : 'Season ' + (+season.slice(1))) +
+        '  ·  ' + items.filter(x => x.status === 'done').length + '/' +
+        items.length + ' done';
+      lastSeason = season;
+    }
     const tr = tb.insertRow();
+    tr.insertCell().textContent = n + 1;
+    tr.insertCell().textContent = it.episode || '';
     tr.insertCell().textContent = base(it.video);
-    const c = tr.insertCell();
-    if (it.status === 'running' && it.phase) {
+    tr.insertCell().textContent = ST[it.status] + (it.error ? ': ' + it.error : '');
+    const pc = tr.insertCell();
+    if (it.status === 'running') {
       const pr = document.createElement('progress');
-      pr.max = 100; pr.value = 100 * it.frac;
-      c.append((PHASES[it.phase] || [''])[1] || it.phase, pr);
-    } else if (it.status === 'done') {
+      pr.max = 100; pr.value = 100 * (it.frac || 0);
+      pc.append(pr, ' ' + ((PHASES[it.phase] || [])[1] || 'starting') + ' ' +
+        Math.round(100 * (it.frac || 0)) + '%');
+    } else if (it.status === 'done') pc.textContent = '100%';
+    const sc = tr.insertCell();
+    if (it.status === 'done') {
       const b = document.createElement('span');
       b.className = 'badge ' + (it.band === 'likely wrong' ? 'wrong' : it.band);
       b.textContent = (it.band === 'good' ? '✔ ' : '⚠ ') + Math.round(100 * it.confidence) + '%' +
         (it.pieces > 1 ? '  ·  ' + it.pieces + ' pieces' : '');
-      c.append(b);
-    } else c.textContent = ST[it.status] + (it.error ? ': ' + it.error : '');
-  }
+      sc.append(b);
+    }
+    tr.insertCell().textContent = it.started
+      ? dur((it.ended || now) - it.started) : '';
+    tr.insertCell().textContent = it.size ? fmtBytes(it.size) : '';
+  });
+  // summary + rough time left (average of the finished ones)
+  const done = q.items.filter(it => it.status === 'done');
+  const left = q.items.filter(it => it.status === 'pending' || it.status === 'running').length;
+  const errs = q.items.filter(it => it.status === 'error').length;
+  const avg = done.length ? done.reduce((t, it) => t + (it.ended - it.started), 0) / done.length : 0;
+  $('bqsum').textContent = done.length + '/' + q.items.length + ' done' +
+    (errs ? '  ·  ' + errs + ' failed' : '') +
+    (q.running && avg && left ? '  ·  about ' + dur(avg * left) + ' left' : '') +
+    (done.length ? '  ·  ' + fmtBytes(done.reduce((t, it) => t + (it.size || 0), 0)) + ' written' : '');
   const pending = q.items.some(it => it.status === 'pending');
   const failed = q.items.some(it => it.status === 'error');
   $('bresume').hidden = q.running || !(pending || failed);
@@ -1293,6 +1352,7 @@ fetch('api/info').then(r => r.json()).then(j => {
 const O = id => document.getElementById(id);
 let optInfo = {presets: {}, builtin: [], tools: {}};
 let probedTracks = null;   // desktop: tracks of the chosen video
+let probeSeq = 0;          // newest probeTracks() call wins
 let extraSub = null;       // {path} (desktop) or File (browser)
 
 function collectOptions() {
@@ -1302,6 +1362,7 @@ function collectOptions() {
              ad_channels: O('o_channels').value ? +O('o_channels').value : null,
              keep_audio: O('o_keepa').value, keep_subs: O('o_keeps').value,
              loudness_match: O('o_loud').checked,
+             replace_original: O('o_inplace').checked,
              voice_boost: O('o_vb').value,
              voice_boost_track: O('o_vbtrack').checked,
              voice_boost_ad: O('o_vbad').checked,
@@ -1325,6 +1386,7 @@ function applyOptions(o) {
   O('o_keepa').value = Array.isArray(d.keep_audio) ? 'all' : d.keep_audio;
   O('o_keeps').value = Array.isArray(d.keep_subs) ? 'all' : d.keep_subs;
   O('o_loud').checked = !!d.loudness_match;
+  O('o_inplace').checked = !!d.replace_original;
   O('o_vb').value = d.voice_boost || 'off';
   O('o_vbtrack').checked = d.voice_boost_track !== false;
   O('o_vbad').checked = !!d.voice_boost_ad;
@@ -1341,7 +1403,8 @@ function syncOptionsUi() {
     o.ad_codec.toUpperCase() + ' ' + o.ad_bitrate,
     o.fit_gb ? 'fit ' + o.fit_gb + ' GB' : null,
     o.loudness_match ? 'loudness' : null,
-    o.voice_boost !== 'off' ? 'voice boost ' + o.voice_boost : null]
+    o.voice_boost !== 'off' ? 'voice boost ' + o.voice_boost : null,
+    o.replace_original ? 'modifies the original' : null]
     .filter(Boolean).join(' · ');
   try { localStorage.setItem('adp-options', JSON.stringify(o)); } catch {}
 }
@@ -1393,6 +1456,7 @@ const engSub = (st, streams) => {
 
 // desktop: list the video's tracks with checkboxes
 async function probeTracks(path) {
+  const seq = ++probeSeq;
   probedTracks = null; O('o_tracks').hidden = true;
   const r = await fetch('api/probe?path=' + encodeURIComponent(path));
   if (!r.ok) return;
@@ -1407,15 +1471,38 @@ async function probeTracks(path) {
       ? (keepA === 'all' || (keepA === 'first' && st.type_index === 0))
       : keepS === 'all' || (keepS === 'english' && engSub(st, streams));
     c.onchange = syncOptionsUi;
+    const size = document.createElement('span');
+    size.className = 'hint'; size.dataset.idx = st.index;
     l.append(c, ' ' + (st.type === 'audio' ? 'Audio ' : 'Subtitle ') +
       (st.type_index + 1) + ': ' + [st.language, st.codec, st.channels,
-      st.title].filter(Boolean).join(', '));
+      st.title].filter(Boolean).join(', '), size);
     box.append(l);
   }
   if (streams.length) { probedTracks = streams; box.hidden = false;
     box.prepend(Object.assign(document.createElement('div'),
       {textContent: 'Keep these tracks from the video:'})); }
+  // what's inside the file, measured (takes a few seconds)
+  const sum = Object.assign(document.createElement('div'),
+    {id: 'o_breakdown', textContent: 'Measuring track sizes…'});
+  box.prepend(sum); box.hidden = false;
+  try {
+    const z = await (await fetch('api/sizes?path=' + encodeURIComponent(path))).json();
+    if (seq !== probeSeq) return;   // another video was picked
+    const kinds = {};
+    for (const st of z.streams) {
+      const k = kinds[st.type] = kinds[st.type] || {n: 0, b: 0};
+      k.n++; k.b += st.bytes;
+      const el = box.querySelector('span[data-idx="' + st.index + '"]');
+      if (el) el.textContent = '  ·  ' + fmtBytes(st.bytes);
+    }
+    const name = {video: 'Video', audio: 'Audio', subtitle: 'Subtitles'};
+    sum.textContent = 'In this file (' + fmtBytes(z.file) + '): ' +
+      Object.entries(kinds).map(([t, k]) => (name[t] || t) + ' ' +
+        fmtBytes(k.b) + (k.n > 1 ? ' (' + k.n + ' tracks)' : '')).join(', ');
+  } catch { sum.textContent = ''; }
 }
+const fmtBytes = b => b >= 2 ** 30 ? (b / 2 ** 30).toFixed(2) + ' GB'
+  : b >= 2 ** 20 ? (b / 2 ** 20).toFixed(0) + ' MB' : (b / 1024).toFixed(0) + ' KB';
 
 // hand-off buttons after a job (desktop / same PC)
 function showHandoffs(path) {

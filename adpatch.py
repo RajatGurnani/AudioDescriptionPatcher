@@ -94,6 +94,8 @@ DEFAULT_OPTIONS = {
     "voice_boost": "off",      # off | low | high (dialogue clarity)
     "voice_boost_track": True,  # add "original + voice boost" track
     "voice_boost_ad": False,   # also boost the AD track itself
+    "replace_original": False,  # result takes the video's name; the
+                                # original goes to the Recycle Bin
 }
 # Voice boost (dialogue clarity) - the PC twin of android VoiceBoost.kt,
 # same parameter table: (side gain, low-shelf dB @150 Hz, presence dB
@@ -213,6 +215,10 @@ def add_option_args(p):
     g.add_argument("--ad-channels", type=int, choices=(1, 2))
     g.add_argument("--ad-lang", help="AD track language (default eng)")
     g.add_argument("--ad-title", help="AD track title")
+    g.add_argument("--replace-original", action="store_true",
+                   help="modify the original video instead of writing a "
+                        "copy: the result takes its name and the original "
+                        "goes to the Recycle Bin")
     g.add_argument("--original-default", action="store_true",
                    help="make the original audio the default track")
     g.add_argument("--keep-audio", help="original audio tracks to keep: "
@@ -266,6 +272,8 @@ def options_from_args(args):
             opts[key] = val
     if args.original_default:
         opts["default_track"] = "original"
+    if args.replace_original:
+        opts["replace_original"] = True
     if args.keep_audio:
         opts["keep_audio"] = tracks(args.keep_audio)
     if args.keep_subs:
@@ -332,30 +340,62 @@ FIT_MARGIN = 0.97  # container overhead + encoder overshoot
 _copied_bytes_cache = {}
 
 
+def _stats_bytes(line):
+    """Bytes in an ffmpeg final-stats line ("video:12KiB audio:3KiB ...")."""
+    total = 0.0
+    for kind, num, unit in re.findall(
+            r"\b(video|audio|subtitle|other streams):\s*([\d.]+)"
+            r"\s*(Ki|k|Mi|M)?B", line):
+        # ffmpeg's "kB"/"MB" (older builds) are binary too
+        total += float(num) * {"Ki": 1024, "k": 1024, "Mi": 1024 ** 2,
+                               "M": 1024 ** 2}.get(unit, 1)
+    return total
+
+
+def stream_sizes(path):
+    """{stream index: payload bytes} for every stream of `path`, measured
+    in ONE `-c copy` read (one null output per stream), cached per file.
+    Exact, unlike the BPS/NUMBER_OF_BYTES tags, which releases often copy
+    over unchanged from their source; and lossless tracks (TrueHD, DTS-HD,
+    FLAC) often have no bitrate in `ffmpeg -i` at all."""
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_size, st.st_mtime)
+    if key not in _copied_bytes_cache:
+        streams = probe_streams(path)
+        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-i", path]
+        for s in streams:
+            cmd += ["-map", f"0:{s['index']}", "-c", "copy", "-f", "null",
+                    "-"]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace")
+        measured = {}
+        for k, line in re.findall(r"\[out#(\d+)/null[^\]]*\]\s*(video:.*)",
+                                  r.stderr):
+            if int(k) < len(streams):
+                measured[streams[int(k)]["index"]] = _stats_bytes(line)
+        # fallback for anything ffmpeg didn't report: bitrate x duration
+        dur = probe_duration(path) or 0.0
+        sizes = {s["index"]: measured.get(
+            s["index"], (s["kbps"] or 0) * 1000 * dur / 8) for s in streams}
+        if r.returncode != 0 or len(measured) != len(streams):
+            return sizes   # partly estimated: don't cache it
+        _copied_bytes_cache[key] = sizes
+    return _copied_bytes_cache[key]
+
+
 def copied_stream_bytes(path, maps):
-    """Exact payload bytes of the streams in `maps` ("0:a:1", "0:s:0", ...)
-    when stream-copied: one `-c copy -f null` read of the file, cached
-    per file + stream set. Needed because lossless tracks (TrueHD, DTS-HD,
-    FLAC) often have no bitrate in `ffmpeg -i`."""
+    """Exact payload bytes of the streams in `maps` ("0:a:1", "0:s:0",
+    "0:v:0") when stream-copied (see stream_sizes())."""
     if not maps:
         return 0
-    st = os.stat(path)
-    key = (os.path.abspath(path), st.st_size, st.st_mtime, tuple(maps))
-    if key not in _copied_bytes_cache:
-        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-i", path]
-        for m in maps:
-            cmd += ["-map", m]
-        r = subprocess.run(cmd + ["-c", "copy", "-f", "null", "-"],
-                           capture_output=True, text=True, errors="replace")
-        total = 0.0
-        for kind, num, unit in re.findall(
-                r"\b(video|audio|subtitle|other streams):\s*([\d.]+)"
-                r"\s*(Ki|k|Mi|M)?B", r.stderr):
-            # ffmpeg's "kB"/"MB" (older builds) are binary too
-            total += float(num) * {"Ki": 1024, "k": 1024, "Mi": 1024 ** 2,
-                                   "M": 1024 ** 2}.get(unit, 1)
-        _copied_bytes_cache[key] = total
-    return _copied_bytes_cache[key]
+    sizes, streams = stream_sizes(path), probe_streams(path)
+    kinds = {"v": "video", "a": "audio", "s": "subtitle"}
+    total = 0.0
+    for m in maps:
+        _, t, i = m.split(":")
+        total += sum(sizes.get(s["index"], 0.0) for s in streams
+                     if s["type"] == kinds[t] and s["type_index"] == int(i))
+    return total
 
 
 def _video_args(opts, streams, duration, other_bytes):
@@ -508,6 +548,44 @@ def _drain(pipe):
 class Cancelled(Exception):
     """Raised from a `progress` callback to stop a job: the running ffmpeg
     is killed and patch() removes its partial output."""
+
+
+def replace_target(video, opts):
+    """Where "replace the original" writes: the video's own name, with the
+    container's extension (Movie.mp4 + mkv output -> Movie.mkv)."""
+    return os.path.splitext(video)[0] + (
+        ".mp4" if opts["container"] == "mp4" else ".mkv")
+
+
+def has_ad_track(path, title="Audio Description"):
+    """True if `path` already carries our AD track (a replaced original
+    keeps its name, so the name can't tell)."""
+    return any(st["type"] == "audio" and st["title"] == title
+               for st in probe_streams(path))
+
+
+def recycle(path):
+    """Move a file to the Windows Recycle Bin (undoable delete)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_uint16),
+                    ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", wintypes.LPCWSTR)]
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, \
+        FOF_NOERRORUI = 3, 0x40, 0x10, 0x4, 0x400
+    op = SHFILEOPSTRUCTW(
+        None, FO_DELETE, os.path.abspath(path) + "\0", None,
+        FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        False, None, None)
+    rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if rc or op.fAnyOperationsAborted or os.path.exists(path):
+        raise RuntimeError(f"couldn't move {path} to the Recycle Bin "
+                           f"(code {rc}) - nothing was changed")
 
 
 def run_ffmpeg(cmd, duration=None, progress=None):
@@ -1677,6 +1755,14 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             raise ValueError(f"file not found: {f}")
     video, ad_audio = classify_inputs(input_a, input_b)
     opts = resolve_options(options, replace)
+    if opts["replace_original"]:
+        output = replace_target(video, opts)
+        if os.path.normcase(os.path.abspath(output)) != os.path.normcase(
+                os.path.abspath(video)) and os.path.exists(output):
+            raise ValueError(
+                f"{os.path.basename(output)} already exists next to the "
+                "video - modifying the original would overwrite it. Move "
+                "it away, or turn off 'modify the original'.")
     output = output or (os.path.splitext(video)[0] + ".AD." +
                         ("mp4" if opts["container"] == "mp4" else "mkv"))
     if os.path.splitext(output)[1].lower() not in (".mkv", ".mp4", ".m4v"):
@@ -1788,6 +1874,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             "(dropped)")
 
     notes = []
+    video_mb = os.path.getsize(video) / 1e6
     # mux into a .partial file and rename it when ffmpeg succeeds, so a
     # failed or interrupted run never leaves a half-written output that
     # looks finished (batch skips outputs that already exist)
@@ -1841,20 +1928,34 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
                 notes.append(f"still {os.path.getsize(part) / GIB:.2f} GB "
                              f"after a second encode (target "
                              f"{opts['fit_gb']} GB)")
-        os.replace(part, output)
+        if opts["replace_original"]:
+            # the original must be safely in the Recycle Bin before the
+            # result takes its name; if that fails, nothing has changed
+            log(f"  moving the original to the Recycle Bin: {video}")
+            recycle(video)
+        else:
+            os.replace(part, output)
     except BaseException:   # incl. Ctrl+C: no half-written leftovers
         try:
             os.remove(part)
         except OSError:
             pass
         raise
+    if opts["replace_original"]:
+        try:
+            os.replace(part, output)
+        except OSError as e:
+            raise RuntimeError(
+                f"the patched video is at {part} but couldn't be renamed "
+                f"to {os.path.basename(output)} ({e}); the original is in "
+                "the Recycle Bin") from e
     for n in notes:
         log(f"  note: {n}")
     lap("mux")
     timings["total"] = time.perf_counter() - t_start
 
     log(f"done: {output} ({os.path.getsize(output) / 1e6:.0f} MB)")
-    mb = os.path.getsize(video) / 1e6
+    mb = video_mb   # (the video may be in the Recycle Bin by now)
     log(f"timings: analyze {timings['analyze']:.1f}s (video "
         f"{timings['video_env']:.1f}s, "
         f"{mb / max(timings['video_env'], 1e-9):.0f} MB/s; AD "
