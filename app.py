@@ -474,6 +474,26 @@ def probe(request: Request, path: str):
                         if st["type"] in ("audio", "subtitle")]}
 
 
+@app.get("/api/folder_kind")
+def folder_kind(request: Request, path: str):
+    """"video" or "ad": what a dropped folder mostly holds (first 2000
+    files), so it lands in the right batch zone. Localhost only."""
+    if not is_local(request):
+        return JSONResponse({"error": "only allowed from this PC"},
+                            status_code=403)
+    vids = auds = seen = 0
+    for root, _, names in os.walk(path):
+        for n in names:
+            e = os.path.splitext(n)[1].lower()
+            vids += e in adpatch.VIDEO_EXTS
+            auds += e in batch.AUDIO_EXTS
+            seen += 1
+        if seen > 2000:
+            break
+    return {"kind": "ad" if auds > vids else "video",
+            "videos": vids, "audio": auds}
+
+
 @app.get("/api/sizes")
 def sizes(request: Request, path: str):
     """Exact size of every track of a local file (one fast copy-read of
@@ -567,6 +587,30 @@ INDEX_HTML = """<!doctype html>
          color: #e8e8e8; margin: 0; padding: 1.2rem;
          display: flex; justify-content: center; }
   main { width: 100%; max-width: 540px; }
+  main.wide { max-width: 1100px; }
+  nav.tabs { display: flex; gap: .4rem; margin-bottom: 1rem; }
+  nav.tabs button { flex: 1; padding: .65rem; font-size: .95rem;
+                    background: #262a31; }
+  nav.tabs button.on { background: #3d6bd6; }
+  .zones { display: grid; gap: .8rem;
+           grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+           margin-bottom: .6rem; }
+  @media (max-width: 640px) { .zones { grid-template-columns: 1fr; } }
+  .zone { border: 2px dashed #3a3f4a; border-radius: 10px; padding: .8rem;
+          min-height: 6rem; }
+  .zone.set { border-color: #4c8f5d; }
+  .chips { margin: .4rem 0; }
+  .chip { display: inline-flex; align-items: center; gap: .2rem;
+          background: #262a31; border-radius: 6px; padding: .2rem .2rem
+          .2rem .55rem; margin: .2rem .3rem .2rem 0; font-size: .85rem;
+          max-width: 100%; }
+  .chip span { overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; }
+  .chip button { width: auto; padding: 0 .4rem; background: none;
+                 color: #9aa2af; font-size: 1rem; }
+  .zadd { display: flex; gap: .3rem; margin: .3rem 0; }
+  .zadd input { flex: 1; min-width: 0; }
+  .zbrowse { margin-bottom: .3rem; }
   h1 { font-size: 1.4rem; margin: .3rem 0 1rem; }
   .card { background: #1e2127; border-radius: 12px; padding: 1rem;
           margin-bottom: 1rem; }
@@ -631,6 +675,10 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
               title="Stop the server on this PC and close">&#9211; Stop</button>
     </div>
   </header>
+  <nav class="tabs" id="tabs" hidden>
+    <button type="button" data-tab="one" class="on">&#127902; One video</button>
+    <button type="button" data-tab="batch">&#128193; Folder / TV show</button>
+  </nav>
   <div class="card" id="pick">
     <label class="file" id="lv" data-slot="video">&#128249; Choose video
       <div class="hint" id="hv">tap to select &middot; or drop it here</div>
@@ -754,20 +802,38 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
       </summary><div id="overlay"></div></details>
   </div>
   <div class="card" id="batch" hidden>
-    <h2 style="font-size:1.1rem;margin:0 0 .3rem">Batch &mdash; folders on this PC</h2>
-    <div class="hint" style="margin-bottom:.6rem">Point at folders with
-      movies and AD files (names don't matter &mdash; files are paired by
-      their audio). Check the pairs, then patch them all.</div>
-    <textarea id="bfolders" rows="3" style="width:100%;box-sizing:border-box"
-      placeholder="one folder per line, e.g. D:/Movies"></textarea>
-    <button class="stop" id="baddf" hidden style="margin-top:.3rem">
-      + Add folder&hellip;</button>
-    <input id="boutdir" style="width:100%;box-sizing:border-box;margin:.4rem 0"
-      placeholder="output folder (optional - default: next to each video)">
-    <button class="stop" id="bout" hidden style="margin-bottom:.4rem">
-      Choose output folder&hellip;</button>
-    <label class="hint" style="display:block;margin-bottom:.6rem">
-      <input type="checkbox" id="brec" checked> include subfolders</label>
+    <div class="hint" style="margin-bottom:.8rem">Every video is paired
+      with its AD file by their audio (names don't matter; TV episodes are
+      matched by SxxEyy first), then all are patched in one go.</div>
+    <div class="zones">
+      <div class="zone" id="bzv" data-kind="video">
+        <b>&#128249; Videos</b>
+        <div class="chips"></div>
+        <div class="zadd"><input placeholder="paste a folder path">
+          <button class="stop" type="button">Add</button></div>
+        <button class="stop zbrowse" type="button" hidden>Browse&hellip;</button>
+        <div class="hint">or drop folders onto the window</div>
+      </div>
+      <div class="zone" id="bza" data-kind="ad">
+        <b>&#127911; AD files</b>
+        <div class="chips"></div>
+        <div class="zadd"><input placeholder="paste a folder path">
+          <button class="stop" type="button">Add</button></div>
+        <button class="stop zbrowse" type="button" hidden>Browse&hellip;</button>
+        <div class="hint">can be the same folder as the videos</div>
+      </div>
+    </div>
+    <textarea id="bfolders" hidden></textarea>
+    <div class="og">Output:
+      <label><input type="radio" name="bo" id="bonext" checked> next to each video</label>
+      <label><input type="radio" name="bo" id="boin"> in this folder</label>
+      <input id="boutdir" placeholder="e.g. D:\\Patched" style="flex:1;min-width:12em">
+      <button class="stop" id="bout" hidden type="button">Choose&hellip;</button>
+    </div>
+    <div class="og">
+      <label><input type="checkbox" id="brec" checked> include subfolders</label>
+    </div>
+    <div id="boptsbox"></div>
     <button id="bscan">Find pairs</button>
     <div id="bscanprog" hidden style="margin-top:.6rem">
       <div class="hint" id="bscanstage"></div>
@@ -897,9 +963,18 @@ document.addEventListener('drop', e => {
 
 // Called by desktop.py with full paths (window drops, AudioVault saves).
 async function adpDropPaths(paths, source) {
-  if (busy) return;
-  const infos = (await Promise.all(paths.map(p => api().file_info(p))))
+  let infos = (await Promise.all(paths.map(p => api().file_info(p))))
     .filter(Boolean);
+  const dirs = infos.filter(f => f.dir);
+  if (dirs.length && !$('tabs').hidden) {
+    for (const d of dirs) {
+      const r = await fetch('api/folder_kind?path=' + encodeURIComponent(d.path));
+      addFolder(r.ok && (await r.json()).kind === 'ad' ? 'ad' : 'video', d.path);
+    }
+    showTab('batch');
+  }
+  infos = infos.filter(f => !f.dir);
+  if (busy || !infos.length) return;
   const vids = infos.filter(isVideo);
   for (const f of infos) {
     if (isVideo(f) && !(files.video && vids.length > 1)) setFile('video', f);
@@ -1158,24 +1233,78 @@ new ResizeObserver(() => {
 const $ = id => document.getElementById(id);
 const base = p => p ? p.split(/[\\\\/]/).pop() : '';
 let scanRows = [];
-for (const [id, key] of [['bfolders', 'adp-bfolders'], ['boutdir', 'adp-boutdir']]) {
-  try { $(id).value = localStorage.getItem(key) || ''; } catch {}
-  $(id).oninput = () => { try { localStorage.setItem(key, $(id).value); } catch {} };
+const store = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+const load = k => { try { return localStorage.getItem(k); } catch { return null; } };
+// folders: two zones (videos / AD files); the scan just gets all of them
+const zones = {video: [], ad: []};
+try {
+  Object.assign(zones, JSON.parse(load('adp-bzones') || 'null') ||
+    {video: (load('adp-bfolders') || '').split('\\n').map(s => s.trim()).filter(Boolean)});
+} catch {}
+const zoneEl = {video: $('bzv'), ad: $('bza')};
+function renderZones() {
+  for (const [kind, el] of Object.entries(zoneEl)) {
+    const box = el.querySelector('.chips'); box.replaceChildren();
+    for (const p of zones[kind]) {
+      const chip = document.createElement('span'); chip.className = 'chip';
+      chip.title = p;
+      const x = document.createElement('button'); x.type = 'button';
+      x.textContent = '\u00d7'; x.title = 'remove';
+      x.onclick = () => { zones[kind] = zones[kind].filter(q => q !== p); renderZones(); };
+      chip.append(Object.assign(document.createElement('span'), {textContent: p}), x);
+      box.append(chip);
+    }
+    el.classList.toggle('set', zones[kind].length > 0);
+  }
+  $('bfolders').value = [...new Set([...zones.video, ...zones.ad])].join('\\n');
+  store('adp-bzones', JSON.stringify(zones));
 }
+function addFolder(kind, p) {
+  p = (p || '').trim().replace(/^"|"$/g, '');
+  if (p && !zones[kind].includes(p)) { zones[kind].push(p); renderZones(); }
+}
+for (const [kind, el] of Object.entries(zoneEl)) {
+  const inp = el.querySelector('.zadd input'), add = el.querySelector('.zadd button');
+  add.onclick = () => { addFolder(kind, inp.value); inp.value = ''; };
+  inp.onkeydown = e => { if (e.key === 'Enter') add.onclick(); };
+  const br = el.querySelector('.zbrowse');
+  if (DESKTOP) {
+    br.hidden = false;
+    br.onclick = async () => addFolder(kind,
+      await api().pick_folder('last_dir_batch_' + kind));
+  }
+}
+renderZones();
+// output: next to each video, or one folder
+$('boutdir').value = load('adp-boutdir') || '';
+$(load('adp-boin') === '1' ? 'boin' : 'bonext').checked = true;
+$('boutdir').oninput = () => { store('adp-boutdir', $('boutdir').value);
+  if ($('boutdir').value.trim()) { $('boin').checked = true; store('adp-boin', '1'); } };
+$('boin').onchange = $('bonext').onchange = () =>
+  store('adp-boin', $('boin').checked ? '1' : '0');
+const batchOutdir = () => $('boin').checked && $('boutdir').value.trim() || null;
 if (DESKTOP) {
-  $('baddf').hidden = $('bout').hidden = false;
-  $('baddf').onclick = async () => {
-    const d = await api().pick_folder('last_dir_batch');
-    if (!d) return;
-    const v = $('bfolders').value.trim();
-    $('bfolders').value = (v ? v + '\\n' : '') + d;
-    $('bfolders').oninput();
-  };
+  $('bout').hidden = false;
   $('bout').onclick = async () => {
     const d = await api().pick_folder('last_dir_out');
     if (d) { $('boutdir').value = d; $('boutdir').oninput(); }
   };
 }
+// options: the same panel as the single video, moved into whichever tab
+
+// ---- tabs: one video / folder + TV show ----
+const TABS = {one: ['pick', 'prog', 'sync'], batch: ['batch']};
+function showTab(t) {
+  for (const [name, ids] of Object.entries(TABS))
+    for (const id of ids) $(id).style.display = name === t ? '' : 'none';
+  document.querySelector('main').classList.toggle('wide', t === 'batch');
+  for (const b of $('tabs').querySelectorAll('button'))
+    b.classList.toggle('on', b.dataset.tab === t);
+  if (t === 'batch') $('boptsbox').append($('opts'));
+  else $('pick').insertBefore($('opts'), $('go'));
+  store('adp-tab', t);
+}
+for (const b of $('tabs').querySelectorAll('button')) b.onclick = () => showTab(b.dataset.tab);
 const SCAN_PHASES = {probe: 'Reading file info', analyze: 'Analyzing audio',
                      pair: 'Matching movies to AD files'};
 
@@ -1259,7 +1388,7 @@ $('bstart').onclick = async () => {
   if (!pairs.length) return;
   const r = await fetch('api/batch/start', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({pairs, outdir: $('boutdir').value.trim() || null,
+    body: JSON.stringify({pairs, outdir: batchOutdir(),
                           options: Object.assign(collectOptions(),
                             {keep_audio: O('o_keepa').value,
                              keep_subs: O('o_keeps').value, add_subs: []})})});
@@ -1349,7 +1478,8 @@ function pollQueue() {
 }
 fetch('api/info').then(r => r.json()).then(j => {
   if (!j.can_shutdown) return;   // batch reads folders on this PC only
-  $('batch').hidden = false; pollQueue();
+  $('batch').hidden = false; $('tabs').hidden = false; pollQueue();
+  showTab(load('adp-tab') === 'batch' ? 'batch' : 'one');
 }).catch(() => {});
 
 // ---- output options (see adpatch.DEFAULT_OPTIONS) ----

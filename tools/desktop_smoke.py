@@ -110,6 +110,18 @@ def selftest(win, api):
         got = open(MARKER).read().strip() if os.path.exists(MARKER) else ""
         check("hand-off launched with the output", got.strip('"') == out,
               got)
+        # dropping a folder: lands in the batch tab, in the right zone
+        folder = os.path.dirname(video)
+        win.evaluate_js(f"adpDropPaths({json.dumps([folder])})")
+        for _ in range(40):
+            z = js("JSON.stringify(zones)") or ""
+            if folder.replace("\\", "\\\\") in z:
+                break
+            time.sleep(0.25)
+        check("dropped folder -> batch tab, Videos zone",
+              js("zones.video.includes(" + json.dumps(folder) + ")") is True
+              and js("document.querySelector('main').classList"
+                     ".contains('wide')") is True, z)
         result["done"] = True
     except Exception as e:   # report, then close the window anyway
         check("selftest crashed", False, repr(e))

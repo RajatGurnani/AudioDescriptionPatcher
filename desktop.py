@@ -107,7 +107,8 @@ class Api:
     def file_info(self, path):
         try:
             return {"path": path, "name": os.path.basename(path),
-                    "size": os.path.getsize(path)}
+                    "size": os.path.getsize(path),
+                    "dir": os.path.isdir(path)}
         except OSError:
             return None
 
