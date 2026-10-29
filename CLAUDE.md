@@ -96,7 +96,9 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   CLI `--report` writes .sync.json + .sync.svg; web UI draws drift +
   waveform-match charts with vendored uPlot (static/vendor/uplot, MIT)
   from `result["plot"]` via /api/jobs/<id>/envelopes.
-  3. different edits: if linear coverage < 0.9, `_fit_piecewise()`
+  3. different edits: if linear coverage < 0.9 (or, option
+     `split_small_cuts` default on, linear p95 residual > PW_WOBBLE_MS
+     120 — PC only, Aligner.kt not yet), `_fit_piecewise()`
      (window lattice → offset families → Viterbi → vetted pieces →
      hand-over points → joint slope + per-piece intercepts). Returns
      `pieces`; `plan_pieces()` turns them into render segments + gaps;

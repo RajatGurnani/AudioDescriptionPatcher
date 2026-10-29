@@ -122,7 +122,9 @@ Everything returns `notes` that the UI and CLI show.
 ### 6. Different edits: piecewise alignment
 
 When the linear fit leaves ≥ 10 % of its segments unmatched while the
-files clearly share a soundtrack, `_fit_piecewise()` (mirrored in
+files clearly share a soundtrack — or (PC, option `split_small_cuts`,
+default on) its p95 residual exceeds 120 ms, the signature of cuts of a
+few seconds that still match inside the 5 s segment search — `_fit_piecewise()` (mirrored in
 `Aligner.fitPiecewise`) tries `video = a·ad + b_k` per piece — one
 speed, one offset per piece. Adapted from ADSync's lattice + Viterbi
 (MIT, THIRD_PARTY_NOTICES.txt):
@@ -136,7 +138,10 @@ speed, one offset per piece. Adapted from ADSync's lattice + Viterbi
    window score, so a cut needs ~3 windows of better evidence. Runs
    shorter than 3 windows merge into a neighbour. Accepted only if it
    explains ≥ 10 % more windows than any single offset — linear files
-   stay linear (harness: no phantom cuts).
+   stay linear (harness: no phantom cuts). In the wobble case the
+   reference is the best single offset at piecewise precision (±0.5 s),
+   not the linear coverage, which counted matches up to 5 s off the line
+   ([ADR 0004](adr/0004-split-on-wobbly-sync.md)).
 4. Hand-over points: coarse (4 s probes) then fine (1 s probes, 50 ms
    steps) "evidence before vs after" maximisation. Probes matching
    neither offset count as zero and ties go to the latest point, so
@@ -184,6 +189,23 @@ tools/batch_test.py  synthetic pairing + queue/resume test
 tools/parity_export.py  envelopes + results for the Kotlin parity test
 docs/            this file + usage guide; docs/plan/ = roadmap
 ```
+
+## Batch, disks and parallelism (PC)
+
+- Pairing scores candidate pairs in worker processes (`_score_pairs`,
+  in-process below 24 pairs): numpy FFT work holds the GIL, so threads
+  gave 1.5×, processes 3× ([ADR 0003](adr/0003-process-pool-pairing.md)).
+- `Queue.run` keeps up to 3 items in analyze/align at once (1 below 6
+  CPU threads) and lets one write at a time (`write_lock`): the mux and
+  any re-encode are disk/GPU bound, alignment is CPU bound
+  ([ADR 0002](adr/0002-batch-pipeline-one-writer.md)).
+- Hard drives: `is_rotational()` asks Windows for the seek penalty;
+  `disk_slot()` allows one reader per HDD (parallel reads seek: ~5 MB/s
+  each vs 100–150 MB/s for one). HDD videos are copied to the SSD scratch,
+  worked on there and copied back; scans extract only the analysis audio
+  track to the scratch ([ADR 0001](adr/0001-ssd-staging-for-hard-drives.md)).
+
+All decisions: [docs/adr](adr/README.md).
 
 ## Numbers that matter
 

@@ -110,3 +110,45 @@ files show a decode-bound analysis.
 
 Accuracy after the changes: all harness cases unchanged (Δa ≤ 3.5 ppm,
 Δb ≤ 0.7 ms, output lag ≤ 13.4 ms; realistic ≤ 16.1 ms).
+
+## Real films (2026-10-29)
+
+`tools/realmedia_test.py`: 13 public-domain films (Internet Archive,
+240p `_512kb.mp4` copies) with their AudioVault AD MP3s — real
+different-source pairs, no ground truth beyond the fit's own residuals.
+Media is local only (`.local/testmedia`, git-excluded). Envelope cache
+off for every run below; same machine, runs one after another.
+
+| | before (a785113) | after (66d78a6) | + small-cuts split (41903eb) |
+|---|---|---|---|
+| scan by content, 13 × 13 | 224 s | 181 s | 193 s |
+| as a TV show (S01E01..) | 82 s | 89 s | 94 s |
+| patch all 13 (batch queue) | 579 s | 500 s | 526 s |
+| films paired correctly | 8 / 13 | 8 / 13 | 8 / 13 |
+| verdict good / check / likely wrong | 2 / 3 / 8 | 2 / 3 / 8 | 3 / 2 / 8 |
+
+"after" = HDD layer, batch pipeline (3 in flight, one writer),
+process-pool pairing. Quality identical, ~15–20 % faster.
+
+Findings, per film (from `fit_alignment` signals):
+
+- **Little Shop of Horrors:** one offset left p95 residual 189 ms; a
+  ~0.9 s shift from 28.9–38.9 min. Fixed by the small-cuts split
+  (3 pieces, p95 113 ms, 0.56 → 0.82) — [ADR 0004](adr/0004-split-on-wobbly-sync.md).
+- **Beat the Devil, House on Haunted Hill, Night of the Living Dead:**
+  strong matches (segment scores up to 0.89, coverage 0.87–1.0) but the
+  offset wanders smoothly by ±0.4–1.6 s across the film — not cuts, a
+  wobbling timebase (likely the old web transcodes). Neither one offset
+  nor a few pieces fit; needs a warp mode (parked).
+- **Suddenly, Gulliver's Travels:** different cuts plus the same wobble
+  (p95 240 / 727 ms).
+- **McLintock!:** the AD MP3 is incomplete (21.7 min of a 118 min film)
+  — bad download, not an engine issue.
+- **Nosferatu:** silent film; the AD's score is a different music track
+  (peak 0.03) — nothing shared to align on.
+- **His Girl Friday:** "[TTS]" AD, 5 min longer, no shared soundtrack
+  (segment scores ≤ 0.16) — likely a different source mix.
+- All files carry real audio (mean −18 to −38 dB at 10 and 40 min), so
+  none of the failures is silence.
+- Black Panther: Wakanda Forever (Blu-ray, same-cut AD): 0.98 good,
+  1 piece, identical with and without the split — no regression.

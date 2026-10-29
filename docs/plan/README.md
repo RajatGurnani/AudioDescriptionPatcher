@@ -95,3 +95,4 @@ Ordering rationale:
 - [13-standalone-pc-app.md](13-standalone-pc-app.md) — PC app without upload/download, temp hygiene, fit-size fix, silent-start bug
 - [14-batch-tv-shows.md](14-batch-tv-shows.md) — batch for whole shows: episode parsing, coverage scoring, season review
 - [THIRD_PARTY.md](THIRD_PARTY.md) — every reused library/algorithm with license + verdict
+- [../adr/README.md](../adr/README.md) — architecture decision records (decisions made after the plans)

@@ -77,3 +77,10 @@ or as CLI flags, with presets. See [docs/USAGE.md](docs/USAGE.md).
   the AD doesn't cover get the original audio; on Android they're
   silent. If the verdict still says "likely wrong", the AD file is
   probably for another movie or an extended-description version.
+- **Sources whose sync wanders** (old low-bitrate web copies drifting
+  back and forth by ~0.5–1.5 s) are not fixed yet: they get a "likely
+  wrong" verdict. Small cuts of a few seconds are handled ("fix small
+  cuts" option, on by default). Real-film results:
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#real-films-2026-10-29).
+
+Design decisions are recorded in [docs/adr](docs/adr/README.md).

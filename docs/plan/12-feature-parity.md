@@ -8,6 +8,7 @@ JVM-tested (`AlignerParityTest`).
 |---|---|---|---|
 | Linear alignment (speed + offset) | ✓ | ✓ | parity test |
 | Piecewise alignment (different edits) | ✓ | ✓ | phone splice ≤ 4.4 ms |
+| Split on wobbly sync (small cuts, `split_small_cuts`) | ✓ | ✗ | Android paused; mirror at Aligner.kt piecewise trigger + acceptance ([ADR 0004](../adr/0004-split-on-wobbly-sync.md)) |
 | Confidence score + warnings | ✓ | ✓ | |
 | Envelope cache | ✓ | ✓ | Android since 0.5.0 |
 | Voice boost (dialogue clarity) | ✓ | ✓ | PC = ffmpeg graph with the same parameter table (`voice_boost_graph`); measured with `tools/voiceboost_test.py` |
