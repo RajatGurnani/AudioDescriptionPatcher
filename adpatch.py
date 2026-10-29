@@ -1379,10 +1379,14 @@ def fit_alignment(ad_env, vid_env, log=print, progress=None):
 
     # Different edit? A linear map that leaves a good part of the runtime
     # unmatched (while the files clearly share a soundtrack) is the
-    # signature of scenes added/removed. Try piecewise offsets; it only
-    # wins if it explains clearly more of the movie (no phantom cuts).
+    # signature of scenes added/removed. Cuts of a few seconds still match
+    # inside the 5 s search but show up as large residuals instead. Try
+    # piecewise offsets; it only wins if it explains clearly more of the
+    # movie (no phantom cuts).
     pieces = None
-    if signals["coverage"] < 0.9 and signals["peak"] >= 0.04:
+    if (signals["coverage"] < 0.9 or
+            signals["resid_p95_ms"] > PW_WOBBLE_MS) and \
+            signals["peak"] >= 0.04:
         if progress:
             progress(0.5)
         pw = _fit_piecewise(stretched, vid_env, ad20, vid20, a0, pool,
@@ -1412,6 +1416,7 @@ PW_HOP = int(10 * FPS)      # window step
 PW_MIN_RUN = 3              # windows a piece needs (~30-40 s of AD)
 PW_MAX_PIECES = 64          # beyond this the files are probably unrelated
 PW_FAMILY_TOL = 0.3 * FPS   # offsets closer than this are one family
+PW_WOBBLE_MS = 120           # linear p95 residual above this = small cuts
 
 
 def _window_candidates(st, vid_env, starts, pool, k=3):
@@ -1592,8 +1597,12 @@ def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log,
     runs = _runs(path)
     covered = sum(scores[i, f] > MIN_SEGMENT_SCORE
                   for i, f in enumerate(path)) / n_w
-    if len(runs) < 2 or len(runs) > PW_MAX_PIECES or \
-            covered < max(best_single, lin_signals["coverage"]) + 0.1:
+    # linear coverage counts matches up to 5 s off the line; when its
+    # residuals say those were small cuts, judge against one offset at
+    # piecewise precision (best_single) instead
+    ref = best_single if lin_signals["resid_p95_ms"] > PW_WOBBLE_MS else \
+        max(best_single, lin_signals["coverage"])
+    if len(runs) < 2 or len(runs) > PW_MAX_PIECES or covered < ref + 0.1:
         return None
 
     # hand-over points between consecutive pieces: coarse (4 s probes),
