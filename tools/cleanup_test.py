@@ -216,6 +216,34 @@ def main():
         fails.append(f"CPU control not applied: {cmd.count('-threads')} "
                      f"-threads, {kw}")
 
+    # hard drive (simulated: C: counts as one, scratch on another drive):
+    # each video is staged on the scratch, analyzed + written there, the
+    # result copied back; 3 items in flight, scratch empty afterwards
+    scratch = os.path.join(ROOT, ".local", "scratch-test")
+    os.environ["ADPATCH_FORCE_HDD"] = os.path.splitdrive(work)[0]
+    os.environ["ADPATCH_SCRATCH"] = scratch
+    real_scratch = adpatch.SCRATCH_DIR
+    adpatch.SCRATCH_DIR = scratch
+    try:
+        import batch
+        eps = []
+        for i in range(3):
+            v = os.path.join(work, f"hdd_ep{i}.mkv")
+            shutil.copy(video, v)
+            eps.append((v, ad))
+        q = batch.Queue.create(eps, path=os.path.join(work, "qhdd.json"))
+        q.run(log=lambda *a: None, parallel=3)
+        bad = [it for it in q.items if it["status"] != "done" or
+               "copy_in" not in (it.get("timings") or {})]
+        if bad or os.listdir(scratch) or leftovers(work):
+            fails.append(f"HDD staging batch: {[it['status'] for it in q.items]}"
+                         f", timings {q.items[0].get('timings')}, scratch "
+                         f"{os.listdir(scratch)}, leftovers {leftovers(work)}")
+    finally:
+        os.environ.pop("ADPATCH_FORCE_HDD", None)
+        os.environ.pop("ADPATCH_SCRATCH", None)
+        adpatch.SCRATCH_DIR = real_scratch
+
     # modify the original must never overwrite ANOTHER file of that name
     clash = os.path.join(work, "clash.mp4")
     shutil.copy(mp4[:-4] + ".mkv", clash)

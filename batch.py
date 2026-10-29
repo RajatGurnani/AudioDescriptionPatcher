@@ -243,7 +243,37 @@ def content_score(ad_env, vid_env):
     return agreed / n_seg
 
 
-def pair_files(videos, ads, envs, durations, progress=None, stats=None):
+def _score_one(args):
+    ad_env, vid_env = args
+    return content_score(ad_env, vid_env)
+
+
+def _score_pairs(pairs, envs, workers, progress=None):
+    """content_score() for every (video, ad) pair; worker processes when
+    there are enough pairs to pay for starting them (~1 s)."""
+    if not pairs:
+        return []
+    args = [(envs[d], envs[v]) for v, d in pairs]
+    if workers <= 1 or len(pairs) < 24:
+        out = []
+        for i, a in enumerate(args):
+            out.append(_score_one(a))
+            if progress:
+                progress((i + 1) / len(args))
+        return out
+    from concurrent.futures import ProcessPoolExecutor
+    n = max(1, min(workers, 16, len(pairs) // 4))
+    out = []
+    with ProcessPoolExecutor(n) as pool:
+        for i, sc in enumerate(pool.map(_score_one, args, chunksize=4)):
+            out.append(sc)
+            if progress:
+                progress((i + 1) / len(args))
+    return out
+
+
+def pair_files(videos, ads, envs, durations, progress=None, stats=None,
+               workers=1):
     """Score (video, AD) pairs and assign them one-to-one. Returns
     (rows, unused_ads): one row per video with keys video, ad (or None),
     score (coverage), status ("matched" / "check" / "no match"),
@@ -253,7 +283,11 @@ def pair_files(videos, ads, envs, durations, progress=None, stats=None):
     only. Pass 2 takes the videos that didn't settle and tries the AD
     files pass 1 didn't settle - same season first, then all (duration
     gate always). So an episode without AD costs a few comparisons, not
-    one per AD in the show. `stats["scored"]` counts comparisons."""
+    one per AD in the show. When the video has an episode code, pass 2
+    only tries AD files of its season and AD files without a code - never
+    another season's episodes. Comparisons run on `workers` processes.
+    `stats["scored"]` counts comparisons, `stats["fallbacks"]` says why a
+    video needed pass 2."""
     codes = {p: parse_episode(p) for p in list(videos) + list(ads)}
     scores = {}
 
@@ -268,37 +302,69 @@ def pair_files(videos, ads, envs, durations, progress=None, stats=None):
             return got[0][1]
         return None
 
-    def try_tiers(v, tiers):
-        tried = []
-        for tier in tiers:
-            tier = [d for d in tier if d not in tried and gate(v, d)]
-            for d in tier:
-                if (v, d) not in scores:
-                    scores[v, d] = content_score(envs[d], envs[v])
-                tried.append(d)
-            best = best_if_settled(v, tried)
-            if best:
-                return best
-        return None
+    def run_all(jobs, base):
+        """Tier by tier for every (video, tiers) at once: all the pairs of
+        one tier are scored in parallel (worker processes - the scoring is
+        partly pure Python, threads only reach ~1.5x), then each video
+        stops at its first settling tier."""
+        best, open_ = {}, {v: t for v, t in jobs}
+        tried = {v: [] for v in open_}
+        n_tiers = max((len(t) for t in open_.values()), default=0)
+        for k in range(n_tiers):
+            pairs = []
+            for v, tiers in open_.items():
+                if k < len(tiers):
+                    for d in tiers[k]:
+                        if d not in tried[v] and gate(v, d):
+                            tried[v].append(d)
+                            if (v, d) not in scores:
+                                pairs.append((v, d))
+            for (v, d), sc in zip(pairs, _score_pairs(
+                    pairs, envs, workers,
+                    (lambda f: progress(base + 0.5 * (k + f) / n_tiers))
+                    if progress else None)):
+                scores[v, d] = sc
+            for v in list(open_):
+                b = best_if_settled(v, tried[v])
+                if b:
+                    best[v] = b
+                    del open_[v]
+        return {v: best.get(v) for v, _ in jobs}
 
     done_v, done_d = set(), set()
-    for i, v in enumerate(videos):           # pass 1: same episode code
-        best = try_tiers(v, [[d for d in ads
-                              if same_episode(codes[v], codes[d])]])
+    first = run_all([(v, [[d for d in ads if same_episode(codes[v],
+                                                           codes[d])]])
+                     for v in videos], 0.0)    # pass 1: same episode code
+    for v, best in first.items():
         if best:
             done_v.add(v)
             done_d.add(best)
-        if progress:
-            progress(0.5 * (i + 1) / max(1, len(videos)))
     rest = [d for d in ads if d not in done_d]
-    for i, v in enumerate(videos):           # pass 2: everything else
-        if v not in done_v:
-            try_tiers(v, [[d for d in rest
-                           if same_season(codes[v], codes[d])], rest])
-        if progress:
-            progress(0.5 + 0.5 * (i + 1) / max(1, len(videos)))
+    fallbacks = {}
+
+    def tiers_for(v):
+        c = codes[v]
+        same = [d for d in ads if same_episode(c, codes[d])]
+        if not c:
+            fallbacks[v] = "no episode number in the name: compared with " \
+                "every AD file"
+            return [rest]
+        if same:
+            best = max(same, key=lambda d: scores.get((v, d), 0.0))
+            fallbacks[v] = (f"{os.path.basename(best)} matched only "
+                            f"{scores.get((v, best), 0.0):.0%}: trying this "
+                            "season's other and unnumbered AD files")
+        else:
+            fallbacks[v] = (f"no AD file numbered {episode_label(c)}: "
+                            "trying this season's other and unnumbered AD "
+                            "files")
+        return [[d for d in rest if same_season(c, codes[d])],
+                [d for d in rest if not codes[d]]]
+
+    run_all([(v, tiers_for(v)) for v in videos if v not in done_v], 0.5)
     if stats is not None:
         stats["scored"] = len(scores)
+        stats["fallbacks"] = fallbacks
 
     def competitors(v, d):
         """Best other score in v's row and d's column."""
@@ -380,27 +446,34 @@ def scan(folders, recursive=True, log=print, progress=None):
                    for o in others)
     need = [v for v in videos if partners(v, ads)] + \
         [d for d in ads if partners(d, videos)]
-    log(f"analyzing {len(need)} file(s) (cached ones are instant)")
-    envs, done = {}, [0]
-    lock = threading.Lock()
+    log(f"analyzing {len(need)} file(s) (cached ones are instant; files "
+        "on a hard drive are read one at a time)")
+    fracs = {p: 0.0 for p in need}
 
     def analyze(p):
-        env = adpatch.cached_envelope(p)
-        with lock:
-            done[0] += 1
+        def prog(f):   # overall % moves with every file's own progress
+            fracs[p] = f
             if progress:
-                progress("analyze", done[0] / max(1, len(need)))
+                progress("analyze", sum(fracs.values()) / max(1, len(need)))
+        try:
+            env = adpatch.analysis_envelope(p, prog)
+        except Exception as e:   # one unreadable file must not stop it
+            log(f"  can't read {os.path.basename(p)}: {e}")
+            env = None
+        prog(1.0)
         return p, env
     workers = max(1, min(8, adpatch.cpu_threads() // 2))
     with ThreadPoolExecutor(workers) as pool:
-        envs = dict(pool.map(analyze, need))
+        envs = {p: e for p, e in pool.map(analyze, need) if e is not None}
     stats = {}
     rows, unused = pair_files(
         [v for v in videos if v in envs], [d for d in ads if d in envs],
         envs, durations,
         progress=(lambda f: progress("pair", f)) if progress else None,
-        stats=stats)
+        stats=stats, workers=adpatch.cpu_threads())
     log(f"compared {stats.get('scored', 0)} video/AD pair(s)")
+    for v, why in stats.get("fallbacks", {}).items():
+        log(f"  {os.path.basename(v)}: {why}")
     rows += [{"video": v, "ad": None, "score": 0.0, "status": "no match",
               "alternatives": [], "episode": episode_label(parse_episode(v)),
               "note": ""} for v in videos if v not in envs]
@@ -421,7 +494,7 @@ class Queue:
         self.items = items or []
         self.options = options or {}
         self.path = path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.stop = threading.Event()
 
     @classmethod
@@ -476,14 +549,21 @@ class Queue:
         return q
 
     def save(self):
-        with self.lock:
-            data = json.dumps({"items": self.items,
-                               "options": self.options}, indent=1)
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(data)
-        os.replace(tmp, self.path)   # atomic: never a half-written queue
+        with self.lock:   # several items run at once: one save at a time
+            for _ in range(5):   # an item may gain a key mid-dump: retry
+                try:
+                    data = json.dumps({"items": self.items,
+                                       "options": self.options}, indent=1)
+                    break
+                except RuntimeError:
+                    time.sleep(0.01)
+            else:
+                return
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, self.path)   # atomic: never half-written
 
     def retry_failed(self):
         """Put errored items back in the queue (resume retries them)."""
@@ -496,27 +576,35 @@ class Queue:
     def pending(self):
         return [it for it in self.items if it["status"] == "pending"]
 
-    def run(self, log=print, on_update=None):
-        """Patch every pending item in order (sequential: the mux is
-        disk-bound, parallel muxes on one disk just thrash; analyzing the
-        next item during a mux was measured slower too - same disk)."""
+    def run(self, log=print, on_update=None, parallel=None):
+        """Patch every pending item. Up to `parallel` items (default 3,
+        1 on small CPUs) are in flight at once: they copy in, analyze and
+        align side by side while only one at a time writes (a write lock -
+        parallel writes on one disk just thrash). So a slow write, e.g. a
+        fit-to-size re-encode, no longer leaves the next items waiting.
+        Stop = start nothing new; items in flight finish. Each item keeps
+        its own log (item["log"], shown in the app's progress table)."""
         opts = adpatch.resolve_options(self.options.get("patch_options"))
         adpatch.set_resources(opts["threads"], opts["low_priority"])
-        for it in self.items:
-            if self.stop.is_set():
-                break
-            if it["status"] != "pending":
-                continue
-            it.update(status="running", phase=None, frac=0.0,
-                      started=time.time())
-            self.save()
-            log(f"[{it['id'] + 1}/{len(self.items)}] "
-                f"{os.path.basename(it['video'])}")
+        if parallel is None:
+            parallel = 3 if adpatch.cpu_threads() >= 6 else 1
+        write_lock = threading.Lock()
+        slots = threading.Semaphore(max(1, parallel))
 
-            def progress(phase, frac, it=it):
+        def work(it):
+            ilog = it["log"] = []
+
+            def item_log(msg):
+                if len(ilog) < 400:
+                    ilog.append(msg)
+                log(msg)
+
+            def progress(phase, frac):
                 it["phase"], it["frac"] = phase, frac
                 if on_update:
                     on_update(it)
+            item_log(f"[{it['id'] + 1}/{len(self.items)}] "
+                     f"{os.path.basename(it['video'])}")
             try:
                 os.makedirs(os.path.dirname(it["output"]), exist_ok=True)
                 res = adpatch.patch(it["video"], it["ad"],
@@ -524,18 +612,44 @@ class Queue:
                                     replace=self.options.get("replace"),
                                     options=self.options.get(
                                         "patch_options"),
-                                    log=log, progress=progress)
+                                    log=item_log, progress=progress,
+                                    write_lock=write_lock)
                 it.update(status="done", confidence=res["confidence"],
                           band=res["band"], warnings=res["warnings"],
                           pieces=len(res["pieces"]) or 1,
-                          size=os.path.getsize(it["output"]))
+                          size=os.path.getsize(it["output"]),
+                          timings={k: round(v, 1) for k, v in
+                                   res["timings"].items()})
             except Exception as e:   # one bad pair must not stop the batch
                 it.update(status="error", error=str(e))
-                log(f"  error: {e}")
-            it["ended"] = time.time()
+                item_log(f"  error: {e}")
+            finally:
+                try:
+                    it["ended"] = time.time()
+                    self.save()
+                    if on_update:
+                        on_update(it)
+                except Exception as e:   # never block the pipeline
+                    log(f"  (queue save failed: {e})")
+                finally:
+                    slots.release()
+
+        threads = []
+        for it in self.items:
+            if it["status"] != "pending":
+                continue
+            slots.acquire()   # wait for a free place in the pipeline
+            if self.stop.is_set():
+                slots.release()
+                break
+            it.update(status="running", phase=None, frac=0.0,
+                      started=time.time())
             self.save()
-            if on_update:
-                on_update(it)
+            t = threading.Thread(target=work, args=(it,), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
 
 
 # --------------------------------------------------------------------------

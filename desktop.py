@@ -58,6 +58,102 @@ def save_settings(s):
         json.dump(s, f, indent=1)
 
 
+def pick_folders_native(start="", owner=None, show=True):
+    """Windows' own folder dialog with multi-select (IFileOpenDialog with
+    FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT) - pywebview's folder dialog
+    takes one folder only. Raw COM through ctypes, on its own STA thread.
+    Returns the chosen paths ([] if cancelled); raises if COM fails (the
+    caller then falls back to the one-folder dialog). show=False only
+    builds and frees the dialog (headless self-test)."""
+    import ctypes
+    import uuid
+    from ctypes import POINTER, byref, c_void_p, wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                    ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+    def guid(text):
+        u = uuid.UUID(text)
+        return GUID(u.fields[0], u.fields[1], u.fields[2],
+                    (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+    def call(obj, index, *args, argtypes=()):
+        vtbl = ctypes.cast(obj, POINTER(POINTER(c_void_p))).contents
+        fn = ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, *argtypes)(
+            vtbl[index])
+        return fn(obj, *args)
+
+    def check(hr, what):
+        if hr < 0:
+            raise OSError(f"{what} failed (0x{hr & 0xFFFFFFFF:08X})")
+
+    result, error = [], []
+
+    def run():
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx(None, 2)            # apartment threaded
+        dialog = c_void_p()
+        try:
+            check(ole32.CoCreateInstance(
+                byref(guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")), None,
+                1, byref(guid("d57c7288-d4ad-4768-be02-9d969532d960")),
+                byref(dialog)), "CoCreateInstance")
+            opts = wintypes.DWORD()
+            check(call(dialog, 10, byref(opts),
+                       argtypes=(POINTER(wintypes.DWORD),)), "GetOptions")
+            check(call(dialog, 9, opts.value | 0x20 | 0x40 | 0x200,
+                       argtypes=(wintypes.DWORD,)), "SetOptions")
+            if start and os.path.isdir(start):
+                item = c_void_p()
+                if ctypes.windll.shell32.SHCreateItemFromParsingName(
+                        ctypes.c_wchar_p(start), None,
+                        byref(guid("43826d1e-e718-42ee-bc55-a1e261c37bfe")),
+                        byref(item)) >= 0:
+                    call(dialog, 12, item, argtypes=(c_void_p,))  # SetFolder
+                    call(item, 2)                                  # Release
+            if not show:
+                return
+            hr = call(dialog, 3, owner, argtypes=(wintypes.HWND,))  # Show
+            if hr & 0xFFFFFFFF == 0x800704C7:       # cancelled
+                return
+            check(hr, "Show")
+            items = c_void_p()
+            check(call(dialog, 27, byref(items),
+                       argtypes=(POINTER(c_void_p),)), "GetResults")
+            try:
+                count = wintypes.DWORD()
+                check(call(items, 7, byref(count),
+                           argtypes=(POINTER(wintypes.DWORD),)), "GetCount")
+                for i in range(count.value):
+                    item = c_void_p()
+                    check(call(items, 8, i, byref(item),
+                               argtypes=(wintypes.DWORD,
+                                         POINTER(c_void_p))), "GetItemAt")
+                    name = ctypes.c_wchar_p()
+                    if call(item, 5, 0x80058000, byref(name),
+                            argtypes=(ctypes.c_int,
+                                      POINTER(ctypes.c_wchar_p))) >= 0:
+                        result.append(name.value)
+                        ole32.CoTaskMemFree(name)
+                    call(item, 2)
+            finally:
+                call(items, 2)
+        except Exception as e:
+            error.append(e)
+        finally:
+            if dialog:
+                call(dialog, 2)
+            ole32.CoUninitialize()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join()
+    if error:
+        raise error[0]
+    return result
+
+
 def downloads_dir():
     """The user's Downloads folder (it can be moved, so ask the shell)."""
     try:
@@ -103,6 +199,23 @@ class Api:
         self._settings[key] = res[0]
         save_settings(self._settings)
         return res[0]
+
+    def pick_folders(self, key="last_dir_batch"):
+        """Several folders at once (Ctrl/Shift-click in the dialog)."""
+        try:
+            owner = None
+            try:
+                owner = int(self._window.native.Handle.ToInt64())
+            except Exception:
+                pass
+            res = pick_folders_native(self._settings.get(key, ""), owner)
+        except Exception:   # COM trouble: the one-folder dialog still works
+            one = self.pick_folder(key)
+            return [one] if one else []
+        if res:
+            self._settings[key] = res[0]
+            save_settings(self._settings)
+        return res
 
     def file_info(self, path):
         try:
@@ -184,6 +297,7 @@ def main(selftest=None):
     started on a thread once the page has loaded."""
     os.makedirs(web.JOBS_DIR, exist_ok=True)
     adpatch.clean_stale_partials()   # left by a job killed last time
+    adpatch.clean_scratch()   # SSD copies of a job killed last time
     # test hooks: fixed port, and a hidden (never shown) window for
     # headless checks - tools/desktop_smoke.py and the built-exe check
     port = int(os.environ.get("ADPATCH_DESKTOP_PORT") or free_port())
@@ -239,4 +353,6 @@ def main(selftest=None):
 
 
 if __name__ == "__main__":
+    import multiprocessing   # batch pairing uses worker processes; a
+    multiprocessing.freeze_support()   # frozen exe must allow that
     sys.exit(main())

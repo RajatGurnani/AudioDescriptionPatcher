@@ -265,6 +265,20 @@ def main():
         check(f"fit lossless: {target} GB target, under it "
               f"(flac shows {flac_kb} kb/s in ffmpeg -i)",
               0.7 <= size / target <= 1.0, f"{size:.3f} GB")
+        # 8b. lower resolution without a size target: fixed-quality HEVC;
+        # asking for more than the video has keeps it as is (no re-encode)
+        out8, res8, s8 = run("downscale", big, big_ad, "mkv", {"max_height": 144})
+        v = kinds(s8, "video")[0]
+        check("downscale only: hevc 144p, fixed-quality note",
+              v["codec"] == "hevc" and "x144" in v["details"] and
+              any("fixed quality" in n for n in res8["notes"]),
+              f"{v['codec']} {v['details'][:40]} {res8['notes']}")
+        check("downscale only: sync", *in_sync(out8, adpatch.onset_envelope(big)))
+        out8, res8, s8 = run("noscale", big, big_ad, "mkv", {"max_height": 1080})
+        check("resolution above the video's: copied, not re-encoded",
+              kinds(s8, "video")[0]["codec"] == "rawvideo",
+              kinds(s8, "video")[0]["codec"])
+
         # 9. the second-try path: plan with a margin that's too generous so
         # the first encode overshoots; the retry must land under target.
         # Noise video: it uses every bit it gets (simple test footage

@@ -119,7 +119,7 @@ def main():
              if r["status"] == "matched"][:2]
     outdir = os.path.join(work, "out")
     q = batch.Queue.create(pairs, outdir, path=qpath)
-    q.run(log=lambda *a: None,
+    q.run(log=lambda *a: None, parallel=1,
           on_update=lambda it: q.stop.set() if it["status"] == "done"
           else None)
     q2 = batch.Queue.load(qpath)
@@ -131,6 +131,36 @@ def main():
     if states != ["done", "done"] or not all(
             os.path.exists(it["output"]) for it in q2.items):
         fails.append(f"after resume: {states}")
+    # pipeline: several items in flight, but only one ever writes
+    many = [(r["video"], r["ad"]) for r in rows if r["status"] == "matched"]
+    qp = batch.Queue.create(many, os.path.join(work, "out_pipe"),
+                            path=os.path.join(work, "qpipe.json"))
+    peak, in_flight, writers = [0, 0], set(), [0]
+    real_ff = batch.adpatch.run_ffmpeg
+
+    def counted(cmd, *a, **k):   # count the mux ffmpegs running at once
+        is_mux = "-max_interleave_delta" in cmd
+        if is_mux:
+            writers[0] += 1
+            peak[0] = max(peak[0], writers[0])
+        try:
+            return real_ff(cmd, *a, **k)
+        finally:
+            if is_mux:
+                writers[0] -= 1
+
+    def watch(it):
+        busy = it["status"] == "running"
+        (in_flight.add if busy else in_flight.discard)(it["id"])
+        peak[1] = max(peak[1], len(in_flight))
+    batch.adpatch.run_ffmpeg = counted
+    try:
+        qp.run(log=lambda *a: None, on_update=watch, parallel=3)
+    finally:
+        batch.adpatch.run_ffmpeg = real_ff
+    if [it["status"] for it in qp.items] != ["done"] * len(many) or             peak[0] > 1 or peak[1] < 2 or             not all(it.get("log") for it in qp.items):
+        fails.append(f"pipeline: {[it['status'] for it in qp.items]}, "
+                     f"max writing {peak[0]}, max in flight {peak[1]}")
     # a new queue over existing outputs skips them
     q3 = batch.Queue.create(pairs, outdir, path=qpath)
     if [it["status"] for it in q3.items] != ["skipped", "skipped"]:
@@ -288,7 +318,8 @@ def show_test(work):
                                  ("B", [vids, rand], want_b)):
         logs = []
         rows, unused = batch.scan(folders, log=logs.append)
-        print(f"\nshow case {label}: " + logs[-1])
+        compared = [x for x in logs if x.startswith("compared ")][0]
+        print(f"\nshow case {label}: " + compared)
         batch._print_rows(rows, unused)
         for r in rows:
             v = r["video"]
@@ -302,7 +333,8 @@ def show_test(work):
                              f"{r['ad'] and os.path.basename(r['ad'])} "
                              f"({r['status']}), want "
                              f"{exp and os.path.basename(exp)}")
-        n_scored = int(logs[-1].split()[1])
+        compared = [x for x in logs if x.startswith("compared ")][0]
+        n_scored = int(compared.split()[1])
         if label == "A":
             notes = {os.path.basename(r["video"]): r["note"] for r in rows}
             for code in ("S03E07", "S03E08"):

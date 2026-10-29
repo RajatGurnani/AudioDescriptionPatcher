@@ -106,30 +106,50 @@ too. Running `start_web.bat` again while the server is up just reopens
 the page. A job's folder (upload + output) is deleted 15 min after the
 output is downloaded, or after 6 h.
 
-## Option 4 — a whole folder at once (batch, PC)
+## Option 4 — a whole folder or TV show at once (batch, PC)
 
-Put movies and AD files in one or more folders — **names don't matter**;
-each movie is matched to its AD file by comparing the audio itself.
+Put videos and AD files in one or more folders — **names don't matter**;
+each video is matched to its AD file by comparing the audio itself. TV
+episodes named S01E02 / 1x02 / "Episode 2" are matched by number first.
 
-- **Web app (on the PC's own browser):** the *Batch* card. Paste folder
-  paths (one per line), optionally an output folder, **Find pairs**.
-  Each row shows the movie, the best AD file with its match score, and
-  ✔ matched / ⚠ check / – no match. Change any row's AD in its dropdown
-  (unpaired AD files can be picked by hand), untick rows to skip,
-  **Patch selected**. Jobs run one after another with progress and a
-  sync verdict per movie. **Stop after current** pauses; the batch
-  survives closing the app — reopen it and press **Resume batch**.
-- **CLI:** `adpatch.py batch D:\Movies D:\AD [-o D:\Out] [--yes]` prints
-  the pairing table and asks before starting (`--yes`: process the
-  ✔ rows without asking). Ctrl+C stops; `adpatch.py batch --resume`
-  continues.
+- **Desktop / PC browser:** the **Folder / TV show** tab. Add folders to
+  the **Videos** and **AD files** zones (Browse picks several at once
+  with Ctrl/Shift-click, or drop folders on the window, or paste a
+  path), choose the output (next to each video, or one folder),
+  **Find pairs**. Rows are grouped per season with a select-all box;
+  change any row's AD in its dropdown, untick rows to skip, **Patch
+  selected**. The progress table shows every episode's step, %, sync,
+  time and size; click a name for its log (incl. step timings). **Stop
+  after current** pauses; the batch survives closing the app — reopen
+  it and press **Resume batch** (failed episodes are retried).
+- **CLI:** `adpatch.py batch D:\Shows D:\AD [-o D:\Out] [--yes]` prints
+  the pairing table and asks before starting. Ctrl+C stops;
+  `adpatch.py batch --resume` continues.
 
-How pairing decides: files whose lengths differ by more than 15 % are
-never paired; the rest are scored by how well their audio lines up
-(score ≥ 0.08 needed, and a pair must clearly beat every rival —
-otherwise it's marked ⚠ check and preselected for you to confirm). File
-names only break near-ties. Outputs that already exist are skipped.
-Batch is PC-only (phones get the single-file page).
+How pairing decides: lengths more than 15 % apart are never paired;
+the rest are scored by how much of the audio lines up (shared intros,
+recaps and credits don't count). A pair must clearly beat every rival,
+otherwise it's ⚠ check for you to confirm. An episode is first compared
+only with the AD file of the same number; if that doesn't settle it,
+only with that season's other AD files and AD files without a number —
+never with every file of the show. The scan log says why an episode
+needed that. Comparisons use all CPU cores.
+
+Speed on big batches:
+- Up to 3 episodes are worked on at once: while one is being written
+  (or re-encoded), the next ones are already analyzed and aligned.
+  Only one writes at a time.
+- **Hard drives** are detected automatically. Each one is read by one
+  process at a time (parallel reads make an HDD seek: ~5 MB/s each
+  instead of ~100-150 MB/s for one). A video on a hard drive is copied
+  to an SSD scratch folder (`%LOCALAPPDATA%\ADPatcher\scratch`) in one
+  sequential read, worked on there and the result copied back — needs
+  ~2.3x the video's size free (2 GB is always kept free; otherwise it
+  works on the hard drive directly). Turn off with the option
+  `staging: off`. Scratch copies of a job killed mid-way are removed at
+  the next start.
+- The first scan of a folder must read every file once (the audio is
+  interleaved with the video); scans after that come from the cache.
 
 ## Option 3 — Android app (fully on-phone, offline)
 
@@ -162,6 +182,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | AD codec / bitrate / channels | AAC (default), Opus (small, great quality), AC-3 / E-AC-3 (TV receivers) |
 | Original audio | first track (default), all, or none (AD only) |
 | Subtitles | **English only** (default: tracks tagged eng; if no track has a language tag, all are kept), keep all, or drop |
+| Resolution | keep, or scale down to 2160/1080/720/480p - with a size target inside that size, without one at a fixed visually-clean quality (HEVC on the GPU). Asking for more than the video has keeps it as is |
 | Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox and its measured size, plus a breakdown of the whole file (video / audio / subtitles) |
 | CPU | how many threads ffmpeg may use (all / 75 % / 50 % / 25 % of this PC's), and **low priority** so the PC stays responsive while it works. CLI `--threads N --low-priority`. Batch scans analyze up to 8 files at once, scaled to this setting |
 | Modify the original video | no copy: the result takes the video's name (extension of the chosen container) and the original goes to the Recycle Bin, so it can be restored. If the Recycle Bin move fails nothing is changed. Batch skips videos that already carry the AD track. CLI `--replace-original` |

@@ -134,8 +134,13 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
   when 2+ agree on an offset and each peak stands clear of noise; shared
   intros/recaps stay low) → greedy one-to-one with uniqueness (else
   "check"; episode codes / names only break ties; double-episode AD →
-  note, not patched) → `Queue` persisted atomically to
-  %LOCALAPPDATA%\ADPatcher\queue.json, sequential, resumable. Test:
+  note, not patched; pairing runs in worker processes) → `Queue` persisted atomically to
+  %LOCALAPPDATA%\ADPatcher\queue.json, resumable; Queue.run keeps up to 3
+  items in flight (analyze/align) with one writer (`write_lock`).
+  Disks (adpatch.py): `is_rotational()` (seek-penalty query, env
+  ADPATCH_FORCE_HDD for tests), `disk_slot()` = one reader per HDD,
+  `analysis_envelope()` pulls the analysis track to the SSD scratch,
+  `patch()` stages HDD videos on the scratch (copy_in/copy_out). Test:
   `tools\batch_test.py`.
 - `desktop.py` — pywebview shell: `?desktop=1` page mode, js_api `Api`
   (native dialogs with per-slot remembered folders in

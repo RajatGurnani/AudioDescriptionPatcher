@@ -110,6 +110,14 @@ def selftest(win, api):
         got = open(MARKER).read().strip() if os.path.exists(MARKER) else ""
         check("hand-off launched with the output", got.strip('"') == out,
               got)
+        # the multi-select folder dialog: built and freed (not shown)
+        import desktop
+        try:
+            ok = desktop.pick_folders_native(os.path.dirname(video), None,
+                                             show=False) == []
+        except Exception as e:
+            ok = repr(e)
+        check("multi-folder dialog builds", ok is True, str(ok))
         # dropping a folder: lands in the batch tab, in the right zone
         folder = os.path.dirname(video)
         win.evaluate_js(f"adpDropPaths({json.dumps([folder])})")

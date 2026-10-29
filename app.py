@@ -768,15 +768,20 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
         </select></label>
         <span id="o_fitbox" hidden>
           <input id="o_gb" type="number" min="0.1" step="0.1" value="2"
-                 style="width:5em"> GB,
-          <select id="o_height">
-            <option value="">keep resolution</option>
-            <option>2160</option><option>1080</option><option>720</option>
-            <option>480</option></select>
-          <select id="o_fitprio">
-            <option value="speed">faster encode</option>
-            <option value="size">best picture for the size (slower)</option>
-          </select></span>
+                 style="width:5em"> GB</span>
+      </div>
+      <div class="og">
+        <label>Resolution <select id="o_height">
+            <option value="">keep (fast)</option>
+            <option value="2160">2160p</option><option value="1080">1080p</option>
+            <option value="720">720p</option><option value="480">480p</option>
+          </select></label>
+        <label id="o_priobox" hidden>Encode <select id="o_fitprio">
+            <option value="speed">faster</option>
+            <option value="size">best picture (slower)</option>
+          </select></label>
+        <span class="hint" id="o_reshint" hidden>lower resolution =
+          re-encode at a fixed quality (no size target needed)</span>
       </div>
     </details>
     <button id="go" disabled>Patch it</button>
@@ -845,6 +850,8 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
     <div id="bscanprog" hidden style="margin-top:.6rem">
       <div class="hint" id="bscanstage"></div>
       <progress id="bscanbar" max="100" value="0"></progress></div>
+    <details id="bscanlogbox" hidden><summary class="hint">scan log</summary>
+      <pre id="bscanlog"></pre></details>
     <div id="bpairs" hidden style="margin-top:.8rem">
       <table class="bt" id="btable"></table>
       <div class="hint" id="bunused" style="margin:.4rem 0"></div>
@@ -992,9 +999,12 @@ async function adpDropPaths(paths, source) {
 }
 
 // ---- run + progress ----
-const PHASES = {analyze: ['1/3', 'Analyzing video + AD audio'],
+const PHASES = {copy_in: ['0/3', 'Copying the video to the SSD'],
+                analyze: ['1/3', 'Analyzing video + AD audio'],
                 align: ['2/3', 'Aligning'],
+                wait: ['2/3', 'Aligned - waiting for its turn to write'],
                 mux: ['3/3', 'Writing output'],
+                copy_out: ['3/3', 'Copying the result back to the hard drive'],
                 gaps: ['1/4', 'Finding pauses in the dialogue'],
                 shots: ['2/4', 'Finding shot changes'],
                 describe: ['3/4', 'Describing scenes (AI)']};
@@ -1278,8 +1288,10 @@ for (const [kind, el] of Object.entries(zoneEl)) {
   const br = el.querySelector('.zbrowse');
   if (DESKTOP) {
     br.hidden = false;
-    br.onclick = async () => addFolder(kind,
-      await api().pick_folder('last_dir_batch_' + kind));
+    br.onclick = async () => {   // several folders: Ctrl/Shift-click
+      for (const d of (await api().pick_folders('last_dir_batch_' + kind)) || [])
+        addFolder(kind, d);
+    };
   }
 }
 renderZones();
@@ -1332,6 +1344,8 @@ $('bscan').onclick = async () => {
     $('bscanstage').textContent = (SCAN_PHASES[s.phase] || 'Working') + '…' +
       (s.log.length ? '  ' + s.log[s.log.length - 1] : '');
     $('bscanbar').value = 100 * (s.frac || 0);
+    $('bscanlogbox').hidden = !s.log.length;
+    $('bscanlog').textContent = s.log.join('\\n');
     if (s.status === 'running') return;
     clearInterval(t); $('bscan').disabled = false;
     if (s.status === 'error') { $('bscanstage').textContent = s.error; return; }
@@ -1413,6 +1427,7 @@ $('bstop').onclick = async () => {
 const ST = {pending: '… waiting', running: '▶ running', done: '✔ done',
             error: '✖ error', skipped: '↷ exists'};
 let qTimer = null;
+const openLogs = new Set();   // episode logs the user has opened
 function renderQueue(q) {
   $('bqueue').hidden = !q.items.length;
   const tb = $('bqtable'); tb.replaceChildren();
@@ -1439,7 +1454,18 @@ function renderQueue(q) {
     const tr = tb.insertRow();
     tr.insertCell().textContent = n + 1;
     tr.insertCell().textContent = it.episode || '';
-    tr.insertCell().textContent = base(it.video);
+    const vc = tr.insertCell();
+    if (it.log && it.log.length) {   // click the name: that episode's log
+      const det = document.createElement('details');
+      det.open = openLogs.has(it.id);
+      det.ontoggle = () => det.open ? openLogs.add(it.id) : openLogs.delete(it.id);
+      const sum = document.createElement('summary');
+      sum.textContent = base(it.video);
+      const pre = document.createElement('pre');
+      pre.textContent = it.log.join('\\n') + (it.timings ? '\\ntimings: ' +
+        Object.entries(it.timings).map(([k, v]) => k + ' ' + v + 's').join(', ') : '');
+      det.append(sum, pre); vc.append(det);
+    } else vc.textContent = base(it.video);
     tr.insertCell().textContent = ST[it.status] + (it.error ? ': ' + it.error : '');
     const pc = tr.insertCell();
     if (it.status === 'running') {
@@ -1526,7 +1552,7 @@ function collectOptions() {
              voice_boost_ad: O('o_vbad').checked,
              fit_gb: O('o_fit').value ? +O('o_gb').value : null,
              fit_priority: O('o_fitprio').value,
-             max_height: O('o_fit').value && O('o_height').value ? +O('o_height').value : null};
+             max_height: O('o_height').value ? +O('o_height').value : null};
   if (probedTracks) {   // per-track picks override the coarse choices
     const picked = t => [...document.querySelectorAll('#o_tracks input[data-t="' + t + '"]')]
       .filter(c => c.checked).map(c => +c.dataset.i);
@@ -1564,6 +1590,9 @@ function applyOptions(o) {
 
 function syncOptionsUi() {
   O('o_fitbox').hidden = !O('o_fit').value;
+  // any re-encode (size target or lower resolution) gets the speed choice
+  O('o_priobox').hidden = !(O('o_fit').value || O('o_height').value);
+  O('o_reshint').hidden = !(O('o_height').value && !O('o_fit').value);
   const o = collectOptions();
   O('optsum').textContent = '  ' + [o.container.toUpperCase(),
     o.ad_codec.toUpperCase() + ' ' + o.ad_bitrate,
@@ -1774,6 +1803,7 @@ if __name__ == "__main__":
     os.makedirs(JOBS_DIR, exist_ok=True)
     clean_old_jobs()
     adpatch.clean_stale_partials()   # left by a job killed last time
+    adpatch.clean_scratch()   # SSD copies of a job killed last time
     threading.Thread(target=_sweep_jobs_forever, daemon=True).start()
     url = f"http://{lan_ip()}:{PORT}"
     print(f"\n  On this PC:    {local_url}")

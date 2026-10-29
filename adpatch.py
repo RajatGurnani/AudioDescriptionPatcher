@@ -33,12 +33,15 @@ the video itself. Such files are detected and reported as weak matches.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -98,6 +101,9 @@ DEFAULT_OPTIONS = {
     "voice_boost_ad": False,   # also boost the AD track itself
     "threads": 0,              # CPU threads for ffmpeg; 0 = all cores
     "low_priority": False,     # run ffmpeg below normal priority
+    "staging": "auto",         # auto: videos on a hard drive are copied to
+                               # the SSD scratch, worked on there and the
+                               # result copied back; off: work in place
     "replace_original": False,  # result takes the video's name; the
                                 # original goes to the Recycle Bin
 }
@@ -244,7 +250,9 @@ def add_option_args(p):
     g.add_argument("--fit-priority", choices=("speed", "size"),
                    help="with --fit-gb: speed (default) or size = slowest "
                         "encoder preset, best picture for the size")
-    g.add_argument("--max-height", type=int, help="with --fit-gb: "
+    g.add_argument("--max-height", type=int, help="scale down to this "
+                   "height (re-encodes; with --fit-gb inside that size, "
+                   "alone at a fixed quality) - "
                    "downscale to this height, e.g. 720")
     g.add_argument("--voice-boost", choices=("off", "low", "high"),
                    help="dialogue clarity: adds an 'original + voice "
@@ -416,6 +424,38 @@ def copied_stream_bytes(path, maps):
 
 _nvenc_size = None
 
+# Quality targets for "lower resolution, no size target": visually clean
+# HEVC at typical TV/laptop viewing (CRF/CQ ~23-24).
+QUALITY_CQ = 24
+
+
+def _quality_args(opts):
+    """Downscale without a size target: constant-quality HEVC."""
+    enc = video_encoder()
+    small = opts.get("fit_priority") == "size"
+    args = ["-map", "0:v:0", "-c:v", enc]
+    if enc == "hevc_nvenc":
+        args += ["-preset", "p7" if small else "p5", "-rc", "vbr",
+                 "-cq", str(QUALITY_CQ), "-b:v", "0"]
+        if small:
+            args += _nvenc_size_args()
+    elif enc == "hevc_qsv":
+        args += ["-global_quality", str(QUALITY_CQ)]
+        if small:
+            args += ["-preset", "veryslow"]
+    elif enc == "hevc_amf":
+        args += ["-rc", "cqp", "-qp_i", str(QUALITY_CQ - 2),
+                 "-qp_p", str(QUALITY_CQ)]
+        if small:
+            args += ["-quality", "quality"]
+    else:
+        args += ["-crf", str(QUALITY_CQ - 1),
+                 "-preset", "slow" if small else "medium"]
+    args += ["-tag:v", "hvc1",
+             "-vf", f"scale=-2:'min({int(opts['max_height'])},ih)'"]
+    return args, [f"video re-encoded with {enc} at fixed quality, scaled "
+                  f"down to {int(opts['max_height'])}p"]
+
 
 def _nvenc_size_args():
     """Best-compression extras for hevc_nvenc that THIS GPU accepts (HEVC
@@ -450,13 +490,21 @@ def _video_args(opts, streams, duration, other_bytes):
     (`-c:v copy` when not requested). `other_bytes` = everything else in
     the output (audio, subtitles); `opts["_fit_scale"]` < 1 shrinks the
     video bitrate for a second try when the first came out too big."""
-    if not opts.get("fit_gb"):
-        return ["-map", "0:v", "-c:v", "copy"], []
     vids = [st for st in streams if st["type"] == "video"
             and not st["attached_pic"]]
+    height = None
+    if vids:
+        m = re.search(r"\b\d{2,5}x(\d{2,5})\b", vids[0]["details"])
+        height = int(m.group(1)) if m else None
+    shrink = bool(opts.get("max_height") and height and
+                  height > int(opts["max_height"]))
+    if not opts.get("fit_gb") and not shrink:
+        return ["-map", "0:v", "-c:v", "copy"], []
     if vids and vids[0]["hdr"]:
-        raise ValueError("HDR video: fit-to-size would wash out the "
-                         "colours - use HandBrake for HDR re-encodes")
+        raise ValueError("HDR video: re-encoding it here would wash out "
+                         "the colours - use HandBrake for HDR re-encodes")
+    if not opts.get("fit_gb"):
+        return _quality_args(opts)
     budget = opts["fit_gb"] * GIB * FIT_MARGIN - other_bytes
     v_bps = budget * 8 / duration * opts.get("_fit_scale", 1.0)
     if v_bps < 300_000:
@@ -772,7 +820,7 @@ def classify_inputs(a, b):
 # Envelope extraction
 # --------------------------------------------------------------------------
 
-def onset_envelope(path, progress=None):
+def onset_envelope(path, progress=None, audio_index=0):
     """Decode the first audio stream and return its onset-strength envelope.
 
     The envelope is the half-wave-rectified frame-to-frame change in log
@@ -790,7 +838,7 @@ def onset_envelope(path, progress=None):
         total = dur * SR * 4 if dur else None
     # -vn/-sn/-dn: don't set up decoders for streams we never read
     cmd = [FFMPEG, "-v", "error", *ff_threads(), "-i", path, "-vn", "-sn",
-           "-dn", "-map", "0:a:0", "-ac", "1", "-ar", str(SR),
+           "-dn", "-map", f"0:a:{audio_index}", "-ac", "1", "-ar", str(SR),
            *ff_threads(), "-f", "f32le", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, **popen_kw())
@@ -840,11 +888,13 @@ CACHE_DIR = os.environ.get("ADPATCH_CACHE_DIR") or os.path.join(
 CACHE_LIMIT = 500e6   # bytes; oldest entries pruned beyond this
 
 
-def _cache_key(path):
-    """Content-based key (size + first/last MB), so re-uploads and renamed
-    copies of the same file still hit."""
+def _cache_key(path, audio_index=0):
+    """Content-based key (size + first/last MB), so re-uploads, renamed
+    and SSD-staged copies of the same file still hit."""
     size = os.path.getsize(path)
-    h = hashlib.sha1(f"v{ENVELOPE_VERSION}:{SR}:{HOP}:{size}".encode())
+    track = f":a{audio_index}" if audio_index else ""
+    h = hashlib.sha1(
+        f"v{ENVELOPE_VERSION}:{SR}:{HOP}:{size}{track}".encode())
     with open(path, "rb") as f:
         h.update(f.read(1 << 20))
         if size > 2 << 20:
@@ -853,13 +903,16 @@ def _cache_key(path):
     return h.hexdigest()
 
 
-def cached_envelope(path, progress=None):
+def cached_envelope(path, progress=None, audio_index=0, read_from=None):
     """onset_envelope() with an on-disk cache (~3 MB per 2 h of audio).
-    Set ADPATCH_NO_CACHE=1 to bypass (e.g. for timing measurements)."""
+    Keyed by `path`; decoded from `read_from` (an SSD copy of its audio
+    track) if given. Set ADPATCH_NO_CACHE=1 to bypass (e.g. for timing
+    measurements)."""
+    src, idx = (read_from, 0) if read_from else (path, audio_index)
     if os.environ.get("ADPATCH_NO_CACHE"):
-        return onset_envelope(path, progress)
+        return onset_envelope(src, progress, idx)
     try:
-        cache = os.path.join(CACHE_DIR, _cache_key(path) + ".npy")
+        cache = os.path.join(CACHE_DIR, _cache_key(path, audio_index) + ".npy")
         if os.path.exists(cache):
             env = np.load(cache)
             os.utime(cache)   # mark recently used for pruning
@@ -868,7 +921,7 @@ def cached_envelope(path, progress=None):
             return env
     except (OSError, ValueError):
         cache = None
-    env = onset_envelope(path, progress)
+    env = onset_envelope(src, progress, idx)
     if cache:
         try:
             os.makedirs(CACHE_DIR, exist_ok=True)
@@ -888,6 +941,218 @@ def _prune_cache():
             break
         os.remove(path)
         total -= size
+
+
+# --------------------------------------------------------------------------
+# Disks: hard drives get one reader at a time; their files can be staged on
+# an SSD scratch folder (parallel readers on one HDD seek themselves down
+# to ~5 MB/s each, one sequential reader gets ~100-150 MB/s)
+# --------------------------------------------------------------------------
+
+_rotational = {}
+_disk_locks = {}
+_disk_locks_guard = threading.Lock()
+SCRATCH_DIR = os.environ.get("ADPATCH_SCRATCH") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "ADPatcher", "scratch")
+_scratch_reserved = [0]
+_scratch_guard = threading.Lock()
+
+
+def drive_of(path):
+    d = os.path.splitdrive(os.path.abspath(path))[0]
+    return (d or "/").upper()
+
+
+def is_rotational(path):
+    """True if `path` is on a spinning hard drive (Windows seek-penalty
+    query; no admin needed). ADPATCH_FORCE_HDD=C:,D: forces it (tests)."""
+    d = drive_of(path)
+    forced = os.environ.get("ADPATCH_FORCE_HDD")
+    if forced is not None:
+        return d in {x.strip().upper() for x in forced.split(",") if x}
+    if d not in _rotational:
+        _rotational[d] = _seek_penalty(d)
+    return _rotational[d]
+
+
+def _seek_penalty(drive):
+    if os.name != "nt" or not drive.endswith(":"):
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = wintypes.HANDLE
+    h = k32.CreateFileW("\\\\.\\" + drive, 0, 3, None, 3, 0, None)
+    if not h or h == wintypes.HANDLE(-1).value:
+        return False
+    try:
+        query = (ctypes.c_uint32 * 3)(7, 0, 0)   # SeekPenalty, standard
+        out = (ctypes.c_uint32 * 3)()             # version, size, flag
+        got = wintypes.DWORD()
+        ok = k32.DeviceIoControl(
+            wintypes.HANDLE(h), 0x2D1400, ctypes.byref(query),
+            ctypes.sizeof(query), ctypes.byref(out), ctypes.sizeof(out),
+            ctypes.byref(got), None)
+        return bool(ok) and bool(out[2] & 0xFF)
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(h))
+
+
+class disk_slot:
+    """`with disk_slot(*paths):` holds the read/write turn of every hard
+    drive among `paths` (SSDs: no limit). Locks are taken in drive order,
+    so two holders can't deadlock."""
+
+    def __init__(self, *paths):
+        drives = sorted({drive_of(p) for p in paths
+                         if p and is_rotational(p)})
+        with _disk_locks_guard:
+            self.locks = [_disk_locks.setdefault(d, threading.Lock())
+                          for d in drives]
+
+    def __enter__(self):
+        for lk in self.locks:
+            lk.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        for lk in reversed(self.locks):
+            lk.release()
+
+
+def scratch_reserve(nbytes):
+    """Reserve SSD scratch space; returns a job folder or None when the
+    scratch drive is a hard drive itself or hasn't the room (keeps 2 GB
+    free for everything else)."""
+    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    if is_rotational(SCRATCH_DIR) and not os.environ.get("ADPATCH_SCRATCH"):
+        return None
+    with _scratch_guard:
+        free = shutil.disk_usage(SCRATCH_DIR).free - _scratch_reserved[0]
+        if free - nbytes < 2 * GIB:
+            return None
+        _scratch_reserved[0] += nbytes
+        try:   # job-<pid>-...: another running instance's jobs are kept
+            job = tempfile.mkdtemp(prefix=f"job-{os.getpid()}-",
+                                   dir=SCRATCH_DIR)
+        except OSError:
+            _scratch_reserved[0] -= nbytes
+            return None
+        _scratch_jobs[job] = nbytes
+    return job
+
+
+_scratch_jobs = {}
+
+
+def scratch_release(job):
+    if not job:
+        return
+    shutil.rmtree(job, ignore_errors=True)
+    with _scratch_guard:
+        _scratch_reserved[0] -= _scratch_jobs.pop(job, 0)
+
+
+def _pid_alive(pid):
+    if pid == os.getpid():
+        return True
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        k32.GetExitCodeProcess(h, ctypes.byref(code))
+        return code.value == 259                # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
+def clean_scratch():
+    """Scratch folders of jobs killed last time (startup). A folder is
+    named job-<pid>-...; one whose process is still running (the app and
+    the CLI at once) is left alone."""
+    if not os.path.isdir(SCRATCH_DIR):
+        return
+    for e in os.scandir(SCRATCH_DIR):
+        if not e.name.startswith("job-") or e.path in _scratch_jobs:
+            continue
+        try:
+            pid = int(e.name.split("-")[1])
+        except (IndexError, ValueError):
+            pid = None
+        if pid is None or not _pid_alive(pid):
+            shutil.rmtree(e.path, ignore_errors=True)
+
+
+def copy_file(src, dst, progress=None, chunk=16 << 20):
+    """Sequential copy in 16 MB chunks, reporting 0..1 (hard drives love
+    one big sequential stream)."""
+    total = max(1, os.path.getsize(src))
+    done = 0
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while True:
+            buf = fi.read(chunk)
+            if not buf:
+                break
+            fo.write(buf)
+            done += len(buf)
+            if progress:
+                progress(min(1.0, done / total))
+    shutil.copystat(src, dst)
+
+
+def analysis_audio_index(path):
+    """Which audio track the analysis uses: the first English one (that's
+    what AD files are made from), else the first."""
+    audio = [s for s in probe_streams(path) if s["type"] == "audio"]
+    eng = [s for s in audio if s["language"] in ("eng", "en")]
+    return (eng or audio or [{"type_index": 0}])[0]["type_index"]
+
+
+def analysis_envelope(path, progress=None):
+    """Envelope for pairing/alignment, the hard-drive-friendly way: from
+    the cache if possible; a file on an HDD gets its analysis track copied
+    to the SSD scratch in one sequential read while holding that drive's
+    turn, and is decoded from there (the next file's copy can run while
+    this one decodes)."""
+    idx = analysis_audio_index(path)
+    try:
+        if not os.environ.get("ADPATCH_NO_CACHE") and os.path.exists(
+                os.path.join(CACHE_DIR, _cache_key(path, idx) + ".npy")):
+            return cached_envelope(path, progress, audio_index=idx)
+    except OSError:
+        pass
+    if not is_rotational(path):
+        return cached_envelope(path, progress, audio_index=idx)
+    job = scratch_reserve(os.path.getsize(path) // 4 + (64 << 20))
+    if job is None:   # no SSD room: read it in place, one reader at a time
+        with disk_slot(path):
+            return cached_envelope(path, progress, audio_index=idx)
+    try:
+        tmp = os.path.join(job, "audio.mka")
+        dur = probe_duration(path)
+        with disk_slot(path):
+            rc, err = run_ffmpeg(
+                [FFMPEG, "-y", "-v", "error", "-i", path, "-map",
+                 f"0:a:{idx}", "-c", "copy", "-vn", "-sn", "-dn", tmp],
+                dur, (lambda f: progress(0.5 * f)) if progress else None)
+        if rc != 0:   # e.g. a codec mka can't hold: decode in place
+            with disk_slot(path):
+                return cached_envelope(path, progress, audio_index=idx)
+        return cached_envelope(
+            path, (lambda f: progress(0.5 + 0.5 * f)) if progress else None,
+            audio_index=idx, read_from=tmp)
+    finally:
+        scratch_release(job)
 
 
 # --------------------------------------------------------------------------
@@ -995,7 +1260,7 @@ def segment_match(ad_env, vid_env, seg_start, seg_len, expected_vpos,
     return w0 + _parabolic(score, k), float(score[k])
 
 
-def fit_alignment(ad_env, vid_env, log=print):
+def fit_alignment(ad_env, vid_env, log=print, progress=None):
     """Recover video_time = a * ad_time + b (seconds).
 
     Stage 1 - speed scan: grid-search stretch factors 0.95-1.05 (coarse
@@ -1019,8 +1284,12 @@ def fit_alignment(ad_env, vid_env, log=print):
     coarse_grid = np.arange(0.95, 1.0501, 0.002)
     coarse_scores = []
     a, _, _ = _speed_scan(ad20, vid20, coarse_grid, coarse_scores)
+    if progress:
+        progress(0.3)
     fine_grid = np.arange(a - 0.002, a + 0.00201, 0.0002)
     a, lag20, peak = _speed_scan(ad20, vid20, fine_grid)
+    if progress:
+        progress(0.4)
 
     # Snap to a "special" ratio (exact 1.0, PAL<->film) when one sits
     # within a coarse grid step of the winner and correlates almost as
@@ -1114,8 +1383,12 @@ def fit_alignment(ad_env, vid_env, log=print):
     # wins if it explains clearly more of the movie (no phantom cuts).
     pieces = None
     if signals["coverage"] < 0.9 and signals["peak"] >= 0.04:
+        if progress:
+            progress(0.5)
         pw = _fit_piecewise(stretched, vid_env, ad20, vid20, a0, pool,
-                            signals, log)
+                            signals, log,
+                            (lambda f: progress(0.5 + 0.5 * f))
+                            if progress else None)
         if pw is not None:
             a, b, report, signals, pieces = pw
     return float(a), float(b / FPS), report, signals, pieces
@@ -1283,7 +1556,8 @@ def _split_point(st, vid_env, lo, hi, off_a, off_b, probe, step,
     return (int(ps[t] + probe // 2) if t > 0 else int(ps[0])), thr
 
 
-def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log):
+def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log,
+                   progress=None):
     """Piecewise fit on the stretched AD envelope `st`. Returns
     (a, b_frames_of_longest_piece, report, signals, pieces) or None when
     one offset explains the movie as well."""
@@ -1305,6 +1579,8 @@ def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log):
     pos = np.full((n_w, n_f), np.nan)
     search = int(0.5 * FPS)
     for i, u in enumerate(starts):
+        if progress and i % 50 == 0:
+            progress(i / n_w)
         for f, off in enumerate(fams):
             m = segment_match(st, vid_env, u, PW_WIN, u + off, search)
             if m is not None:
@@ -1864,7 +2140,19 @@ def write_report_svg(path, result, plot):
 # --------------------------------------------------------------------------
 
 def patch(input_a, input_b, output=None, replace=False, log=print,
-          progress=None, save_report=False, options=None):
+          progress=None, save_report=False, options=None, write_lock=None):
+    """Full pipeline: classify inputs, align, verify, mux. See _patch()."""
+    scratch = []
+    try:
+        return _patch(input_a, input_b, output, replace, log, progress,
+                      save_report, options, write_lock, scratch)
+    finally:
+        for job in scratch:
+            scratch_release(job)
+
+
+def _patch(input_a, input_b, output, replace, log, progress, save_report,
+           options, write_lock, scratch):
     """Full pipeline: classify inputs, align, verify, mux.
 
     Returns a dict:
@@ -1883,7 +2171,11 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
                     and ad_env run in parallel inside it), align, mux,
                     total
     `progress(phase, fraction)`, if given, is called as work advances;
-    phases in order: "analyze", "align", "mux". `save_report` also writes
+    phases in order: ["copy_in"], "analyze", "align", "mux", ["copy_out"]
+    (copy_*: a video on a hard drive staged on the SSD scratch).
+    `write_lock` (batch): held while muxing, so several jobs can analyze
+    and align while one writes (copying a staged result back to its hard
+    drive happens after it, under that drive's disk_slot). `save_report` also writes
     <output>.sync.json and <output>.sync.svg. `options`: see
     DEFAULT_OPTIONS (container, AD codec, tracks, subtitles, size...);
     result["notes"] lists conversions/drops they caused.
@@ -1935,6 +2227,26 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     # Both envelopes decode in parallel: the work is in the ffmpeg child
     # processes and numpy, so threads overlap fine despite the GIL. The
     # phase finishes with the slower one, so that one drives progress.
+    # A video on a hard drive: one sequential copy to the SSD scratch,
+    # then analysis + mux run there and the result is copied back - the
+    # HDD never has to seek between several readers or a read and a write
+    src = video
+    if opts["staging"] != "off" and is_rotational(video):
+        job = scratch_reserve(int(os.path.getsize(video) * 2.3))
+        if job is None:
+            log("  no room on the SSD scratch - working on the hard drive")
+        else:
+            scratch.append(job)
+            src = os.path.join(job, os.path.basename(video))
+            log("copying the video to the SSD (it's on a hard drive)...")
+            t0 = time.perf_counter()
+            with disk_slot(video):
+                copy_file(video, src, report("copy_in"))
+            timings["copy_in"] = time.perf_counter() - t0
+            log(f"  copied in {timings['copy_in']:.1f}s "
+                f"({os.path.getsize(src) / 1e6 / max(timings['copy_in'], 1e-9):.0f} MB/s)")
+            clock = time.perf_counter()
+
     log("analyzing video and AD audio...")
     fracs = {"video": 0.0, "ad": 0.0}
 
@@ -1945,14 +2257,14 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
             fracs[which] = f
             if progress:
                 progress("analyze", min(fracs.values()))
-        env = cached_envelope(path, prog)
+        env = analysis_envelope(path, prog)
         timings[f"{which}_env"] = time.perf_counter() - t0
         log(f"  {which}: {len(env) / FPS / 60:.1f} min "
             f"({timings[which + '_env']:.1f}s)")
         return env
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_v = pool.submit(analyze, "video", video)
+        fut_v = pool.submit(analyze, "video", src)
         fut_a = pool.submit(analyze, "ad", ad_audio)
         vid_env, ad_env = fut_v.result(), fut_a.result()
     lap("analyze")
@@ -1960,8 +2272,8 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     log("aligning...")
     if progress:
         progress("align", 0.0)
-    a, b_sec, rows, signals, pieces = fit_alignment(ad_env, vid_env,
-                                                    log=log)
+    a, b_sec, rows, signals, pieces = fit_alignment(
+        ad_env, vid_env, log=log, progress=report("align"))
     if progress:
         progress("align", 1.0)
     lap("align")
@@ -2026,9 +2338,11 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
     root, ext = os.path.splitext(output)
     part = root + ".partial" + ext
     _partials(lambda s: s | {os.path.abspath(part)})
+    staged = src != video
+    mux_out = os.path.join(scratch[0], "out" + ext) if staged else part
 
     def mux(with_subs, encoder):
-        cmd, n = build_mux_cmd(video, ad_audio, part, a, b_sec, opts,
+        cmd, n = build_mux_cmd(src, ad_audio, mux_out, a, b_sec, opts,
                                streams, encoder, pieces, fill, with_subs,
                                gain_db, duration)
         notes[:] = n
@@ -2036,44 +2350,61 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
     encoder = None if opts["ad_codec"] in AD_CODECS else ad_encoder()
     try:
-        rc, err = mux(True, encoder)
-        if rc != 0 and "Subtitle" in err:
-            # some subtitle codecs can't go into the container - retry
-            # without subtitles rather than failing the whole job
-            log("  subtitles couldn't be muxed - retrying without them")
-            rc, err = mux(False, encoder)
-            notes.append("subtitles dropped: the container rejected them")
-        if rc != 0 and encoder is not None and encoder != AD_ENCODERS[-1]:
-            # the fast encoder can reject odd inputs (channel layouts etc.)
-            log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
-            encoder = AD_ENCODERS[-1]
+        # one job writes at a time (batch); unstaged, the mux also holds
+        # the hard drive's turn (it reads the video and writes the
+        # output there)
+        if write_lock is not None and progress:
+            progress("wait", 0.0)   # aligned; waiting for its turn
+        with (write_lock or contextlib.nullcontext()), \
+                (contextlib.nullcontext() if staged
+                 else disk_slot(video, part)):
+            if write_lock is not None and progress:
+                progress("mux", 0.0)
             rc, err = mux(True, encoder)
-        if rc != 0:
-            raise RuntimeError(f"muxing failed:\n{err}")
-        target = (opts["fit_gb"] or 0) * GIB
-        if target and os.path.getsize(part) > target:
-            # VBR overshot: one more encode, bitrate scaled down to fit
-            # only the video shrinks: scale it by (room left for video) /
-            # (video it actually took); audio/subs stay as they were
-            size = os.path.getsize(part)
-            video_bytes = copied_stream_bytes(part, ["0:v:0"])
-            room = target * 0.98 - (size - video_bytes)
-            scale = max(0.1, room / max(video_bytes, 1.0))
-            opts = dict(opts, _fit_scale=scale)
-            log(f"  {size / GIB:.2f} GB is over {opts['fit_gb']} GB - "
-                f"encoding again at {scale:.0%} of the video bitrate")
-            subs_ok = not any(n.startswith("subtitles dropped")
-                              for n in notes)
-            rc, err = mux(subs_ok, encoder)   # (mux resets `notes`)
+            if rc != 0 and "Subtitle" in err:
+                # some subtitle codecs can't go into the container - retry
+                # without subtitles rather than failing the whole job
+                log("  subtitles couldn't be muxed - retrying without them")
+                rc, err = mux(False, encoder)
+                notes.append("subtitles dropped: the container rejected them")
+            if rc != 0 and encoder is not None and encoder != AD_ENCODERS[-1]:
+                # the fast encoder can reject odd inputs (channel layouts etc.)
+                log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
+                encoder = AD_ENCODERS[-1]
+                rc, err = mux(True, encoder)
             if rc != 0:
                 raise RuntimeError(f"muxing failed:\n{err}")
-            if not subs_ok:
-                notes.append("subtitles dropped: the container rejected "
-                             "them")
-            if os.path.getsize(part) > target:
-                notes.append(f"still {os.path.getsize(part) / GIB:.2f} GB "
-                             f"after a second encode (target "
-                             f"{opts['fit_gb']} GB)")
+            target = (opts["fit_gb"] or 0) * GIB
+            if target and os.path.getsize(mux_out) > target:
+                # VBR overshot: one more encode, bitrate scaled down to fit
+                # only the video shrinks: scale it by (room left for video) /
+                # (video it actually took); audio/subs stay as they were
+                size = os.path.getsize(mux_out)
+                video_bytes = copied_stream_bytes(mux_out, ["0:v:0"])
+                room = target * 0.98 - (size - video_bytes)
+                scale = max(0.1, room / max(video_bytes, 1.0))
+                opts = dict(opts, _fit_scale=scale)
+                log(f"  {size / GIB:.2f} GB is over {opts['fit_gb']} GB - "
+                    f"encoding again at {scale:.0%} of the video bitrate")
+                subs_ok = not any(n.startswith("subtitles dropped")
+                                  for n in notes)
+                rc, err = mux(subs_ok, encoder)   # (mux resets `notes`)
+                if rc != 0:
+                    raise RuntimeError(f"muxing failed:\n{err}")
+                if not subs_ok:
+                    notes.append("subtitles dropped: the container rejected "
+                                 "them")
+                if os.path.getsize(mux_out) > target:
+                    notes.append(f"still {os.path.getsize(mux_out) / GIB:.2f} GB "
+                                 f"after a second encode (target "
+                                 f"{opts['fit_gb']} GB)")
+        if staged:   # one sequential copy back to the hard drive
+            log("copying the result back to the hard drive...")
+            t0 = time.perf_counter()
+            with disk_slot(part):
+                copy_file(mux_out, part, report("copy_out"))
+            os.remove(mux_out)
+            timings["copy_out"] = time.perf_counter() - t0
         if opts["replace_original"]:
             # the original must be safely in the Recycle Bin before the
             # result takes its name; if that fails, nothing has changed
@@ -2109,7 +2440,10 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
         f"{timings['video_env']:.1f}s, "
         f"{mb / max(timings['video_env'], 1e-9):.0f} MB/s; AD "
         f"{timings['ad_env']:.1f}s) | align {timings['align']:.1f}s | "
-        f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s")
+        f"mux {timings['mux']:.1f}s | total {timings['total']:.1f}s" +
+        (f" | copy in {timings['copy_in']:.1f}s, copy out "
+         f"{timings.get('copy_out', 0):.1f}s" if 'copy_in' in timings
+         else ""))
     log("AD track is the default audio." if opts["default_track"] != "original"
         else "original audio is the default; AD is track 1.")
     result = {
@@ -2134,6 +2468,7 @@ def patch(input_a, input_b, output=None, replace=False, log=print,
 
 def main():
     clean_stale_partials()   # left by a job killed last time
+    clean_scratch()   # SSD copies of a job killed last time
     if len(sys.argv) > 1 and sys.argv[1] == "batch":
         import batch   # folder mode: content-based pairing + queue
         return batch.main(sys.argv[2:])
