@@ -106,6 +106,8 @@ DEFAULT_OPTIONS = {
                                # result copied back; off: work in place
     "replace_original": False,  # result takes the video's name; the
                                 # original goes to the Recycle Bin
+    "split_small_cuts": True,  # wobbly single-offset sync -> try pieces;
+                               # off = older fit (low coverage only)
 }
 # Voice boost (dialogue clarity) - the PC twin of android VoiceBoost.kt,
 # same parameter table: (side gain, low-shelf dB @150 Hz, presence dB
@@ -233,6 +235,9 @@ def add_option_args(p):
                    help="modify the original video instead of writing a "
                         "copy: the result takes its name and the original "
                         "goes to the Recycle Bin")
+    g.add_argument("--no-split-small-cuts", action="store_true",
+                   help="older fit: split into pieces only when large "
+                        "parts don't match, not when sync wobbles")
     g.add_argument("--original-default", action="store_true",
                    help="make the original audio the default track")
     g.add_argument("--keep-audio", help="original audio tracks to keep: "
@@ -298,6 +303,8 @@ def options_from_args(args):
         opts["threads"] = args.threads
     if args.low_priority:
         opts["low_priority"] = True
+    if args.no_split_small_cuts:
+        opts["split_small_cuts"] = False
     if args.keep_audio:
         opts["keep_audio"] = tracks(args.keep_audio)
     if args.keep_subs:
@@ -1260,7 +1267,8 @@ def segment_match(ad_env, vid_env, seg_start, seg_len, expected_vpos,
     return w0 + _parabolic(score, k), float(score[k])
 
 
-def fit_alignment(ad_env, vid_env, log=print, progress=None):
+def fit_alignment(ad_env, vid_env, log=print, progress=None,
+                  split_small_cuts=True):
     """Recover video_time = a * ad_time + b (seconds).
 
     Stage 1 - speed scan: grid-search stretch factors 0.95-1.05 (coarse
@@ -1384,15 +1392,16 @@ def fit_alignment(ad_env, vid_env, log=print, progress=None):
     # piecewise offsets; it only wins if it explains clearly more of the
     # movie (no phantom cuts).
     pieces = None
+    wobble_ms = PW_WOBBLE_MS if split_small_cuts else float("inf")
     if (signals["coverage"] < 0.9 or
-            signals["resid_p95_ms"] > PW_WOBBLE_MS) and \
+            signals["resid_p95_ms"] > wobble_ms) and \
             signals["peak"] >= 0.04:
         if progress:
             progress(0.5)
         pw = _fit_piecewise(stretched, vid_env, ad20, vid20, a0, pool,
                             signals, log,
                             (lambda f: progress(0.5 + 0.5 * f))
-                            if progress else None)
+                            if progress else None, wobble_ms)
         if pw is not None:
             a, b, report, signals, pieces = pw
     return float(a), float(b / FPS), report, signals, pieces
@@ -1562,7 +1571,7 @@ def _split_point(st, vid_env, lo, hi, off_a, off_b, probe, step,
 
 
 def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log,
-                   progress=None):
+                   progress=None, wobble_ms=PW_WOBBLE_MS):
     """Piecewise fit on the stretched AD envelope `st`. Returns
     (a, b_frames_of_longest_piece, report, signals, pieces) or None when
     one offset explains the movie as well."""
@@ -1600,7 +1609,7 @@ def _fit_piecewise(st, vid_env, ad20, vid20, a0, pool, lin_signals, log,
     # linear coverage counts matches up to 5 s off the line; when its
     # residuals say those were small cuts, judge against one offset at
     # piecewise precision (best_single) instead
-    ref = best_single if lin_signals["resid_p95_ms"] > PW_WOBBLE_MS else \
+    ref = best_single if lin_signals["resid_p95_ms"] > wobble_ms else \
         max(best_single, lin_signals["coverage"])
     if len(runs) < 2 or len(runs) > PW_MAX_PIECES or covered < ref + 0.1:
         return None
@@ -2282,7 +2291,8 @@ def _patch(input_a, input_b, output, replace, log, progress, save_report,
     if progress:
         progress("align", 0.0)
     a, b_sec, rows, signals, pieces = fit_alignment(
-        ad_env, vid_env, log=log, progress=report("align"))
+        ad_env, vid_env, log=log, progress=report("align"),
+        split_small_cuts=opts["split_small_cuts"])
     if progress:
         progress("align", 1.0)
     lap("align")

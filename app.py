@@ -749,6 +749,10 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
           the PC responsive)</label>
       </div>
       <div class="og">
+        <label><input type="checkbox" id="o_cuts" checked> fix small cuts
+          (split the sync into pieces when it wobbles; off = older fit)</label>
+      </div>
+      <div class="og">
         <label><input type="checkbox" id="o_inplace"> modify the original video
           (no copy: the result takes its name, the original goes to the
           Recycle Bin)</label>
@@ -1545,6 +1549,7 @@ function collectOptions() {
              keep_audio: O('o_keepa').value, keep_subs: O('o_keeps').value,
              loudness_match: O('o_loud').checked,
              replace_original: O('o_inplace').checked,
+             split_small_cuts: O('o_cuts').checked,
              threads: +O('o_threads').value,
              low_priority: O('o_lowprio').checked,
              voice_boost: O('o_vb').value,
@@ -1572,6 +1577,7 @@ function applyOptions(o) {
   O('o_keeps').value = Array.isArray(d.keep_subs) ? 'all' : d.keep_subs;
   O('o_loud').checked = !!d.loudness_match;
   O('o_inplace').checked = !!d.replace_original;
+  O('o_cuts').checked = d.split_small_cuts !== false;
   O('o_threads').value = String(d.threads || 0);
   if (O('o_threads').value === '') {   // saved on another PC: add it
     O('o_threads').append(new Option(d.threads + ' threads', String(d.threads)));
@@ -1600,6 +1606,7 @@ function syncOptionsUi() {
     o.loudness_match ? 'loudness' : null,
     o.voice_boost !== 'off' ? 'voice boost ' + o.voice_boost : null,
     o.replace_original ? 'modifies the original' : null,
+    o.split_small_cuts ? null : 'older fit',
     o.threads ? o.threads + ' threads' : null,
     o.low_priority ? 'low priority' : null]
     .filter(Boolean).join(' · ');

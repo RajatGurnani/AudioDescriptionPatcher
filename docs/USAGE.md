@@ -185,6 +185,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | Resolution | keep, or scale down to 2160/1080/720/480p - with a size target inside that size, without one at a fixed visually-clean quality (HEVC on the GPU). Asking for more than the video has keeps it as is |
 | Track picks (desktop app) | after choosing the video, every audio and subtitle track is listed with a checkbox and its measured size, plus a breakdown of the whole file (video / audio / subtitles) |
 | CPU | how many threads ffmpeg may use (all / 75 % / 50 % / 25 % of this PC's), and **low priority** so the PC stays responsive while it works. CLI `--threads N --low-priority`. Batch scans analyze up to 8 files at once, scaled to this setting |
+| Fix small cuts | on by default: when one offset leaves the sync wobbling (> 120 ms, typical of a few seconds cut here and there), the movie is split into pieces with their own offsets. Off = the older fit, which splits only when large parts don't match. CLI `--no-split-small-cuts` |
 | Modify the original video | no copy: the result takes the video's name (extension of the chosen container) and the original goes to the Recycle Bin, so it can be restored. If the Recycle Bin move fails nothing is changed. Batch skips videos that already carry the AD track. CLI `--replace-original` |
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |
