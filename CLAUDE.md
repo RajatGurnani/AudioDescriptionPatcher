@@ -153,6 +153,10 @@ relabeling. Roadmap + per-iteration plans: docs/plan/README.md. An end-to-end we
 - `app.py` — FastAPI wrapper around `adpatch.patch()`: multipart upload →
   background thread → poll `/api/jobs/<id>` → download. Inline single-page
   UI (mobile-first). Jobs live in `jobs/<id>/`; uploads deleted after run.
+  `_busy()` + `start_lock`: single patch / batch scan / batch run never
+  overlap (409). Every `patch()` writes a job log to
+  %LOCALAPPDATA%\ADPatcher\logs (`job_log()`: options, phases, ffmpeg
+  cmds, errors) — read these first when diagnosing a user's run.
 - `android/` — package `com.fuzzypyjamas.adpatcher` (renamed from
   com.renderedideas.adpatcher in 0.4.1 — a separate app id, so the old
   install has to be removed by hand). Standalone Kotlin port, NO ffmpeg: `AudioEngine`

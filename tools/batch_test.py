@@ -161,6 +161,34 @@ def main():
     if [it["status"] for it in qp.items] != ["done"] * len(many) or             peak[0] > 1 or peak[1] < 2 or             not all(it.get("log") for it in qp.items):
         fails.append(f"pipeline: {[it['status'] for it in qp.items]}, "
                      f"max writing {peak[0]}, max in flight {peak[1]}")
+    # cancel one item mid-run: it ends "cancelled" with no output or
+    # partial left, the others finish
+    qc = batch.Queue.create(many, os.path.join(work, "out_cancel"),
+                            path=os.path.join(work, "qcancel.json"))
+    qc.run(log=lambda *a: None, parallel=3,
+           on_update=lambda it: qc.cancel(0) if it["id"] == 0 and
+           it["phase"] == "align" else None)
+    left = [f for f in os.listdir(os.path.join(work, "out_cancel"))
+            if ".partial" in f] if os.path.isdir(
+                os.path.join(work, "out_cancel")) else []
+    st = [it["status"] for it in qc.items]
+    if st != ["cancelled"] + ["done"] * (len(many) - 1) or left or \
+            os.path.exists(qc.items[0]["output"]):
+        fails.append(f"cancel one: {st}, partials {left}")
+    # cancel the whole batch: nothing finishes, in-flight items go back
+    # to pending (Resume redoes them)
+    qa = batch.Queue.create(many, os.path.join(work, "out_abort"),
+                            path=os.path.join(work, "qabort.json"))
+    qa.run(log=lambda *a: None, parallel=3,
+           on_update=lambda it: qa.cancel() if it["phase"] == "analyze"
+           else None)
+    st = [it["status"] for it in qa.items]
+    if any(s != "pending" for s in st):
+        fails.append(f"cancel all: {st}")
+    # clear finished: done / cancelled rows leave the list
+    qc.clear_finished()
+    if qc.items:
+        fails.append(f"clear finished left {[it['status'] for it in qc.items]}")
     # a new queue over existing outputs skips them
     q3 = batch.Queue.create(pairs, outdir, path=qpath)
     if [it["status"] for it in q3.items] != ["skipped", "skipped"]:

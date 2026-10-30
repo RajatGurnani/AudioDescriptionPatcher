@@ -488,14 +488,47 @@ def scan(folders, recursive=True, log=print, progress=None):
 
 class Queue:
     """Jobs persisted to QUEUE_FILE after every change. Item status:
-    pending / running / done / error / skipped (output already there)."""
+    pending / running / done / error / cancelled / skipped (output
+    already there)."""
 
     def __init__(self, items=None, options=None, path=QUEUE_FILE):
         self.items = items or []
         self.options = options or {}
         self.path = path
         self.lock = threading.RLock()
-        self.stop = threading.Event()
+        self.stop = threading.Event()    # start nothing new
+        self.abort = threading.Event()   # also kill the items in flight
+        self.cancel_ids = set()
+
+    def cancel(self, item_id=None):
+        """Cancel one item (its ffmpeg is killed and the partial output
+        removed; a pending one is just dropped) or, with no id, stop the
+        whole batch now - pending items stay pending for Resume."""
+        if item_id is None:
+            self.stop.set()
+            self.abort.set()
+            return
+        with self.lock:
+            for it in self.items:
+                if it["id"] == item_id:
+                    if it["status"] == "pending":
+                        it.update(status="cancelled")
+                        self.save()
+                    elif it["status"] == "running":
+                        self.cancel_ids.add(item_id)
+
+    def clear_finished(self):
+        """Drop done / skipped / cancelled items from the list."""
+        with self.lock:
+            self.items = [it for it in self.items if it["status"] not in
+                          ("done", "skipped", "cancelled")]
+            if self.items:
+                self.save()
+            else:
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
 
     @classmethod
     def create(cls, pairs, outdir=None, replace=False, path=QUEUE_FILE,
@@ -586,6 +619,8 @@ class Queue:
         its own log (item["log"], shown in the app's progress table)."""
         opts = adpatch.resolve_options(self.options.get("patch_options"))
         adpatch.set_resources(opts["threads"], opts["low_priority"])
+        self.abort.clear()
+        self.cancel_ids.clear()
         if parallel is None:
             parallel = 3 if adpatch.cpu_threads() >= 6 else 1
         write_lock = threading.Lock()
@@ -600,6 +635,8 @@ class Queue:
                 log(msg)
 
             def progress(phase, frac):
+                if self.abort.is_set() or it["id"] in self.cancel_ids:
+                    raise adpatch.Cancelled()   # kills ffmpeg, drops partial
                 it["phase"], it["frac"] = phase, frac
                 if on_update:
                     on_update(it)
@@ -620,6 +657,12 @@ class Queue:
                           size=os.path.getsize(it["output"]),
                           timings={k: round(v, 1) for k, v in
                                    res["timings"].items()})
+            except adpatch.Cancelled:
+                if it["id"] in self.cancel_ids:
+                    it.update(status="cancelled", phase=None, frac=0.0)
+                else:   # whole batch stopped: run it again on Resume
+                    it.update(status="pending", phase=None, frac=0.0)
+                item_log("  cancelled")
             except Exception as e:   # one bad pair must not stop the batch
                 it.update(status="error", error=str(e))
                 item_log(f"  error: {e}")
@@ -635,15 +678,21 @@ class Queue:
                     slots.release()
 
         threads = []
-        for it in self.items:
+        for it in list(self.items):
             if it["status"] != "pending":
                 continue
             slots.acquire()   # wait for a free place in the pipeline
             if self.stop.is_set():
                 slots.release()
                 break
-            it.update(status="running", phase=None, frac=0.0,
-                      started=time.time())
+            with self.lock:   # cancel() can't slip in between
+                claimed = it["status"] == "pending"
+                if claimed:
+                    it.update(status="running", phase=None, frac=0.0,
+                              started=time.time())
+            if not claimed:   # cancelled while waiting
+                slots.release()
+                continue
             self.save()
             t = threading.Thread(target=work, args=(it,), daemon=True)
             threads.append(t)

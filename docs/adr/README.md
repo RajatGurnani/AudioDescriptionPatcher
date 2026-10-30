@@ -11,3 +11,6 @@ noted. Earlier decisions live in the iteration plans
 | [0002](0002-batch-pipeline-one-writer.md) | Batch pipeline: 3 items aligning, one writing | 2026-10-29 |
 | [0003](0003-process-pool-pairing.md) | Pairing scores in worker processes, not threads | 2026-10-29 |
 | [0004](0004-split-on-wobbly-sync.md) | Try piecewise when one offset's sync wobbles (> 120 ms) | 2026-10-29 |
+| [0005](0005-size-is-a-ceiling.md) | Fit-to-size is a ceiling (constant quality, capped rate) | 2026-10-30 |
+| [0006](0006-gpu-decode-for-reencodes.md) | Decode + scale on the GPU for NVENC re-encodes | 2026-10-30 |
+| [0007](0007-one-job-at-a-time.md) | Find pairs, single patch and batch never overlap; cancel; job logs | 2026-10-30 |

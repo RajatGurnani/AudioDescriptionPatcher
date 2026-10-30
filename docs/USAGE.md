@@ -119,9 +119,19 @@ episodes named S01E02 / 1x02 / "Episode 2" are matched by number first.
   **Find pairs**. Rows are grouped per season with a select-all box;
   change any row's AD in its dropdown, untick rows to skip, **Patch
   selected**. The progress table shows every episode's step, %, sync,
-  time and size; click a name for its log (incl. step timings). **Stop
-  after current** pauses; the batch survives closing the app — reopen
-  it and press **Resume batch** (failed episodes are retried).
+  time, size and the settings it was made with (720p, ≤ 2 GB…); click a
+  name for its log (incl. step timings). **✕** on a row cancels that
+  episode (its half-written file is removed); **Cancel now** stops the
+  whole batch at once (in-progress episodes go back to waiting);
+  **Stop after current** lets the running ones finish; **Clear
+  finished** empties done/cancelled rows. The batch survives closing
+  the app — reopen it and press **Resume batch** (failed episodes are
+  retried). One thing at a time: while Find pairs, a batch or a single
+  patch runs, the others wait (they could write the same file).
+- **Log files:** every patch writes
+  `%LOCALAPPDATA%\ADPatcher\logs\<time>-<video>.log` (options, steps,
+  ffmpeg commands, errors, timings); the newest 300 are kept. Send one
+  along when something went wrong.
 - **CLI:** `adpatch.py batch D:\Shows D:\AD [-o D:\Out] [--yes]` prints
   the pairing table and asks before starting. Ctrl+C stops;
   `adpatch.py batch --resume` continues.
@@ -190,7 +200,7 @@ TV-friendly MP4/AC-3, Archive MKV/Opus, Phone 720p ≤ 2 GB, AD only;
 | Add subtitles | an external .srt/.ass/.vtt with its language |
 | Voice boost | off / low / high: adds an "Original + voice boost" track (clearer dialogue, not louder) and optionally boosts the AD itself — same as the Android app |
 | Match AD loudness | measures both and levels the AD to the original (±12 dB max; costs one extra decode of each) |
-| Size | *fit to N GB* (choose **faster encode** or **best picture for the size**: slowest GPU preset plus the extras the GPU supports, ~1.5-2x slower) re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down; N is an upper limit in GB as Windows shows them, counting the real size of every kept audio/subtitle track (lossless ones included); if the first encode still comes out over, it encodes once more, smaller. Refused for HDR video: use HandBrake. Slow compared to the default copy. |
+| Size | *fit to N GB* (choose **faster encode** or **best picture for the size**: slowest GPU preset plus the extras the GPU supports, ~1.5-2x slower) re-encodes the video (HEVC on the GPU when there is one — NVIDIA/Intel/AMD — else CPU) and optionally scales it down (on NVIDIA the decode and scaling run on the GPU too); N is a ceiling, not a target: NVIDIA and CPU encodes use fixed quality capped at N GB's bitrate, so 720p or easy footage comes out smaller (Intel/AMD still aim at N). N is in GB as Windows shows them, counting the real size of every kept audio/subtitle track (lossless ones included); if the first encode still comes out over, it encodes once more, smaller. Refused for HDR video: use HandBrake. Slow compared to the default copy. |
 
 CLI examples:
 

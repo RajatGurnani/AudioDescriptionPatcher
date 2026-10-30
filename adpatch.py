@@ -44,6 +44,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -436,6 +437,20 @@ _nvenc_size = None
 QUALITY_CQ = 24
 
 
+def hw_decode(opts, enc):
+    """Decode + scale on the GPU for an NVENC re-encode: the CPU no longer
+    feeds the encoder (720p re-encode of 1080p: 9.7 s -> 5.5 s per 2 min
+    measured, and CPU free for the other batch items). patch() retries
+    with opts["_hwdec"] = False when the GPU can't decode the input."""
+    return enc == "hevc_nvenc" and opts.get("_hwdec", True)
+
+
+def _scale_filter(opts, enc):
+    h = int(opts["max_height"])
+    return (f"scale_cuda=-2:'min({h},ih)'" if hw_decode(opts, enc)
+            else f"scale=-2:'min({h},ih)'")
+
+
 def _quality_args(opts):
     """Downscale without a size target: constant-quality HEVC."""
     enc = video_encoder()
@@ -458,8 +473,7 @@ def _quality_args(opts):
     else:
         args += ["-crf", str(QUALITY_CQ - 1),
                  "-preset", "slow" if small else "medium"]
-    args += ["-tag:v", "hvc1",
-             "-vf", f"scale=-2:'min({int(opts['max_height'])},ih)'"]
+    args += ["-tag:v", "hvc1", "-vf", _scale_filter(opts, enc)]
     return args, [f"video re-encoded with {enc} at fixed quality, scaled "
                   f"down to {int(opts['max_height'])}p"]
 
@@ -521,15 +535,24 @@ def _video_args(opts, streams, duration, other_bytes):
             "audio/subtitles kept - drop original audio tracks (lossless "
             "ones are big) or pick a bigger size")
     enc = video_encoder()
-    b = f"{int(v_bps)}"
-    args = ["-map", "0:v:0", "-c:v", enc, "-b:v", b,
-            "-maxrate", f"{int(v_bps * 1.25)}", "-bufsize", f"{int(v_bps * 2)}"]
     small = opts.get("fit_priority") == "size"
+    # The size is a ceiling, not a target: NVENC / x265 encode at constant
+    # quality and the budget only caps the rate, so a 720p or an easy
+    # episode comes out smaller. QSV / AMF (untested here) keep the
+    # average-bitrate target.
+    ceiling = enc in ("hevc_nvenc", "libx265")
+    if ceiling:
+        args = ["-map", "0:v:0", "-c:v", enc,
+                "-maxrate", f"{int(v_bps)}", "-bufsize", f"{int(v_bps * 2)}"]
+    else:
+        args = ["-map", "0:v:0", "-c:v", enc, "-b:v", f"{int(v_bps)}",
+                "-maxrate", f"{int(v_bps * 1.25)}",
+                "-bufsize", f"{int(v_bps * 2)}"]
     if enc == "hevc_nvenc":
         args += ["-preset", "p7" if small else "p5", "-rc", "vbr",
-                 "-multipass", "fullres"]
+                 "-cq", str(QUALITY_CQ), "-b:v", "0"]
         if small:   # slowest + smartest: more bits where the eye looks
-            args += _nvenc_size_args()
+            args += ["-multipass", "fullres"] + _nvenc_size_args()
     elif enc == "hevc_qsv":
         if small:
             args += ["-preset", "veryslow"]
@@ -538,11 +561,16 @@ def _video_args(opts, streams, duration, other_bytes):
         if small:
             args += ["-quality", "quality"]
     elif enc == "libx265":
-        args += ["-preset", "slow" if small else "medium"]
+        args += ["-crf", str(QUALITY_CQ - 1),
+                 "-preset", "slow" if small else "medium"]
     args += ["-tag:v", "hvc1"]   # plays in Apple/TV players from mp4
     if opts.get("max_height"):
-        args += ["-vf", f"scale=-2:'min({int(opts['max_height'])},ih)'"]
-    notes = [f"video re-encoded with {enc} at {v_bps / 1e6:.2f} Mb/s "
+        args += ["-vf", _scale_filter(opts, enc)]
+    notes = [f"video re-encoded with {enc} at fixed quality, at most "
+             f"{v_bps / 1e6:.2f} Mb/s: up to {opts['fit_gb']} GB (as "
+             "Windows counts), smaller when the picture allows"
+             if ceiling else
+             f"video re-encoded with {enc} at {v_bps / 1e6:.2f} Mb/s "
              f"to fit {opts['fit_gb']} GB (as Windows counts)"]
     return args, notes
 
@@ -1967,6 +1995,9 @@ def build_mux_cmd(video, ad_audio, output, a, b_sec, opts=None,
             sum(os.path.getsize(s["path"]) for s in opts["add_subs"])
     v_args, v_notes = _video_args(opts, streams, duration or 1.0,
                                   other_bytes)
+    if "-c:v" in v_args and hw_decode(opts, v_args[v_args.index("-c:v") + 1]):
+        i = cmd.index(video) - 1   # the video's "-i"
+        cmd[i:i] = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
     cmd += v_args
     notes += v_notes
 
@@ -2159,18 +2190,84 @@ def write_report_svg(path, result, plot):
 
 def patch(input_a, input_b, output=None, replace=False, log=print,
           progress=None, save_report=False, options=None, write_lock=None):
-    """Full pipeline: classify inputs, align, verify, mux. See _patch()."""
+    """Full pipeline: classify inputs, align, verify, mux. See _patch().
+    Everything it logs, plus options, ffmpeg commands, phase changes and
+    any error, also goes to a log file in LOG_DIR (see job_log())."""
     scratch = []
+    jl = job_log(input_a, input_b, output, options)
+
+    def tee(msg):
+        jl(msg)
+        log(msg)
+
+    def prog(phase, frac):
+        if phase != prog.last:
+            prog.last = phase
+            jl(f"[phase] {phase}")
+        if progress:
+            progress(phase, frac)
+    prog.last = None
     try:
-        return _patch(input_a, input_b, output, replace, log, progress,
-                      save_report, options, write_lock, scratch)
+        r = _patch(input_a, input_b, output, replace, tee, prog,
+                   save_report, options, write_lock, scratch, jl)
+        jl(f"[done] {r['output']} confidence {r['confidence']} "
+           f"({r['band']}) timings {r.get('timings')}")
+        return r
+    except BaseException as e:
+        jl(f"[error] {type(e).__name__}: {e}\n" + traceback.format_exc())
+        raise
     finally:
         for job in scratch:
             scratch_release(job)
+        jl(None)
+
+
+LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or
+                       os.path.expanduser("~"), "ADPatcher", "logs")
+LOG_KEEP = 300   # newest job logs kept
+
+
+def job_log(input_a, input_b, output, options):
+    """Per-job log file (LOG_DIR/<time>-<video name>.log) for diagnosing
+    runs after the fact. Returns write(msg); write(None) closes it. Best
+    effort: a log that can't be written never fails the job."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        old = sorted(e.path for e in os.scandir(LOG_DIR)
+                     if e.name.endswith(".log"))
+        for p in old[:max(0, len(old) - LOG_KEEP + 1)]:
+            try:
+                os.remove(p)
+            except OSError:   # still open (another running job): later
+                pass
+        stem = re.sub(r"[^\w.-]+", "_", os.path.splitext(
+            os.path.basename(input_a))[0])[:60]
+        path = os.path.join(LOG_DIR, time.strftime("%Y%m%d-%H%M%S-") +
+                            f"{os.getpid()}-{stem}.log")
+        f = open(path, "a", encoding="utf-8")
+    except OSError:
+        return lambda msg: None
+    lock = threading.Lock()
+
+    def write(msg):
+        with lock:
+            try:
+                if msg is None:
+                    f.close()
+                elif not f.closed:
+                    f.write(time.strftime("%H:%M:%S ") + str(msg) + "\n")
+                    f.flush()
+            except (OSError, ValueError):
+                pass
+    write(f"[start] inputs {input_a!r} {input_b!r} output {output!r}")
+    write(f"[options] {resolve_options(options)}")
+    write(f"[system] cpu threads {os.cpu_count()}, resources {RESOURCES}, "
+          f"ffmpeg {FFMPEG}")
+    return write
 
 
 def _patch(input_a, input_b, output, replace, log, progress, save_report,
-           options, write_lock, scratch):
+           options, write_lock, scratch, jl=lambda msg: None):
     """Full pipeline: classify inputs, align, verify, mux.
 
     Returns a dict:
@@ -2365,7 +2462,10 @@ def _patch(input_a, input_b, output, replace, log, progress, save_report,
                                streams, encoder, pieces, fill, with_subs,
                                gain_db, duration)
         notes[:] = n
-        return run_ffmpeg(cmd, duration, report("mux"))
+        jl("[ffmpeg] " + subprocess.list2cmdline(cmd))
+        rc, err = run_ffmpeg(cmd, duration, report("mux"))
+        jl(f"[ffmpeg] rc {rc}" + (f"\n{err[-4000:]}" if rc else ""))
+        return rc, err
 
     encoder = None if opts["ad_codec"] in AD_CODECS else ad_encoder()
     try:
@@ -2379,18 +2479,26 @@ def _patch(input_a, input_b, output, replace, log, progress, save_report,
                  else disk_slot(video, part)):
             if write_lock is not None and progress:
                 progress("mux", 0.0)
-            rc, err = mux(True, encoder)
+            subs_ok = True
+            rc, err = mux(subs_ok, encoder)
             if rc != 0 and "Subtitle" in err:
                 # some subtitle codecs can't go into the container - retry
                 # without subtitles rather than failing the whole job
                 log("  subtitles couldn't be muxed - retrying without them")
-                rc, err = mux(False, encoder)
-                notes.append("subtitles dropped: the container rejected them")
+                subs_ok = False
+                rc, err = mux(subs_ok, encoder)
+            if rc != 0 and (opts["fit_gb"] or opts["max_height"]) and \
+                    hw_decode(opts, video_encoder()):
+                # the GPU can't decode this input (codec / bit depth /
+                # chroma): decode and scale on the CPU instead
+                log("  GPU decoding failed - retrying with CPU decoding")
+                opts = dict(opts, _hwdec=False)
+                rc, err = mux(subs_ok, encoder)
             if rc != 0 and encoder is not None and encoder != AD_ENCODERS[-1]:
                 # the fast encoder can reject odd inputs (channel layouts etc.)
                 log(f"  {encoder[0]} failed - retrying with ffmpeg's aac")
                 encoder = AD_ENCODERS[-1]
-                rc, err = mux(True, encoder)
+                rc, err = mux(subs_ok, encoder)
             if rc != 0:
                 raise RuntimeError(f"muxing failed:\n{err}")
             target = (opts["fit_gb"] or 0) * GIB
@@ -2405,18 +2513,15 @@ def _patch(input_a, input_b, output, replace, log, progress, save_report,
                 opts = dict(opts, _fit_scale=scale)
                 log(f"  {size / GIB:.2f} GB is over {opts['fit_gb']} GB - "
                     f"encoding again at {scale:.0%} of the video bitrate")
-                subs_ok = not any(n.startswith("subtitles dropped")
-                                  for n in notes)
                 rc, err = mux(subs_ok, encoder)   # (mux resets `notes`)
                 if rc != 0:
                     raise RuntimeError(f"muxing failed:\n{err}")
-                if not subs_ok:
-                    notes.append("subtitles dropped: the container rejected "
-                                 "them")
                 if os.path.getsize(mux_out) > target:
                     notes.append(f"still {os.path.getsize(mux_out) / GIB:.2f} GB "
                                  f"after a second encode (target "
                                  f"{opts['fit_gb']} GB)")
+            if not subs_ok:
+                notes.append("subtitles dropped: the container rejected them")
         if staged:   # one sequential copy back to the hard drive
             log("copying the result back to the hard drive...")
             t0 = time.perf_counter()

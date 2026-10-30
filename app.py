@@ -113,6 +113,12 @@ async def start_patch(video: UploadFile = File(...),
                       subs: list[UploadFile] = File(default=[]),
                       subs_lang: str = Form("")):
     job_id = uuid.uuid4().hex[:12]
+    with start_lock:   # claim the slot now; the upload copy comes after
+        if (why := _busy()):
+            return JSONResponse({"error": why}, status_code=409)
+        jobs[job_id] = {"status": "queued", "log": [], "output": None,
+                        "error": None, "name": "upload",
+                        "phase": None, "frac": 0.0}
     job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -123,12 +129,18 @@ async def start_patch(video: UploadFile = File(...),
             shutil.copyfileobj(upload.file, f)
         return dst
 
-    video_path = save(video, "video.mp4")
-    ad_path = save(ad, "ad.mp3")
-    opts = _parse_options(options)
-    opts["add_subs"] = [{"path": save(sub, "subs.srt"),
-                         "language": subs_lang} for sub in subs
-                        if sub.filename]
+    try:
+        video_path = save(video, "video.mp4")
+        ad_path = save(ad, "ad.mp3")
+        opts = _parse_options(options)
+        opts["add_subs"] = [{"path": save(sub, "subs.srt"),
+                             "language": subs_lang} for sub in subs
+                            if sub.filename]
+    except OSError as e:   # e.g. disk full: free the claimed slot
+        jobs[job_id].update(status="error", error=f"upload failed: {e}")
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return JSONResponse({"error": f"upload failed: {e}"},
+                            status_code=500)
     stem = os.path.splitext(os.path.basename(video_path))[0]
     ext = "mp4" if opts.get("container") == "mp4" else "mkv"
     output_path = os.path.join(job_dir, f"{stem}.AD.{ext}")
@@ -166,9 +178,12 @@ def start_patch_local(request: Request, payload: dict = Body(...)):
     output = os.path.join(payload.get("outdir") or os.path.dirname(video),
                           f"{stem}.AD.{ext}")
     job_id = uuid.uuid4().hex[:12]
-    jobs[job_id] = {"status": "queued", "log": [], "output": None,
-                    "error": None, "name": f"{stem}.AD.{ext}",
-                    "phase": None, "frac": 0.0}
+    with start_lock:
+        if (why := _busy()):
+            return JSONResponse({"error": why}, status_code=409)
+        jobs[job_id] = {"status": "queued", "log": [], "output": None,
+                        "error": None, "name": f"{stem}.AD.{ext}",
+                        "phase": None, "frac": 0.0}
     threading.Thread(target=run_job,
                      args=(job_id, video, ad, output,
                            bool(payload.get("replace"))),
@@ -211,6 +226,26 @@ def run_ai_job(job_id, video_path, output_path, model, cleanup):
 def _patch_running():
     return any(j.get("kind") != "ai" and j["status"] in ("queued", "running")
                for j in jobs.values())
+
+
+start_lock = threading.Lock()   # _busy() check + claiming the slot
+
+
+def _busy():
+    """Why new work can't start now, or None. A single patch, a batch
+    scan (find pairs) and a batch run never overlap: two of them could
+    write the same output file, and they fight for the same disks/CPU.
+    Callers hold start_lock across this check and registering their
+    work, so two requests can't both pass."""
+    if _patch_running():
+        return "a patch job is running - try again when it is done"
+    sc = batch_state["scan"]
+    if sc and sc["status"] == "running":
+        return "finding pairs is still running - try again when it is done"
+    if _batch_running():
+        return ("a batch is running (or finishing its current items "
+                "after Stop) - try again when it is done")
+    return None
 
 
 def _start_ai(video, output, model, cleanup):
@@ -344,7 +379,10 @@ def batch_scan(request: Request, payload: dict = Body(...)):
                             status_code=400)
     sc = {"status": "running", "phase": "probe", "frac": 0.0, "log": [],
           "rows": None, "unused": None, "error": None}
-    batch_state["scan"] = sc
+    with start_lock:
+        if (why := _busy()):
+            return JSONResponse({"error": why}, status_code=409)
+        batch_state["scan"] = sc
     o = _parse_options(payload.get("options"))   # CPU use for the scan
     adpatch.set_resources(o.get("threads", 0), o.get("low_priority", False))
 
@@ -384,16 +422,16 @@ def _start_queue(q):
 def batch_start(request: Request, payload: dict = Body(...)):
     if (denied := _local_only(request)):
         return denied
-    if _batch_running():
-        return JSONResponse({"error": "a batch is already running"},
-                            status_code=409)
     pairs = [(p["video"], p["ad"]) for p in payload.get("pairs", [])
              if p.get("video") and p.get("ad")]
     if not pairs:
         return JSONResponse({"error": "no pairs selected"}, status_code=400)
-    _start_queue(batch.Queue.create(
-        pairs, payload.get("outdir"), bool(payload.get("replace")),
-        options=_parse_options(payload.get("options"))))
+    with start_lock:
+        if (why := _busy()):
+            return JSONResponse({"error": why}, status_code=409)
+        _start_queue(batch.Queue.create(
+            pairs, payload.get("outdir"), bool(payload.get("replace")),
+            options=_parse_options(payload.get("options"))))
     return {"started": len(pairs)}
 
 
@@ -401,13 +439,17 @@ def batch_start(request: Request, payload: dict = Body(...)):
 def batch_resume(request: Request):
     if (denied := _local_only(request)):
         return denied
-    q = batch_state["queue"] or batch.Queue.load()
-    if q and not _batch_running():
-        q.retry_failed()
-    if _batch_running() or not q or not q.pending:
-        return JSONResponse({"error": "nothing to resume"}, status_code=409)
-    _start_queue(q)
-    return {"resumed": len(q.pending)}
+    with start_lock:
+        if (why := _busy()):
+            return JSONResponse({"error": why}, status_code=409)
+        q = batch_state["queue"] or batch.Queue.load()
+        if q:
+            q.retry_failed()
+        if not q or not q.pending:
+            return JSONResponse({"error": "nothing to resume"},
+                                status_code=409)
+        _start_queue(q)
+        return {"resumed": len(q.pending)}
 
 
 @app.post("/api/batch/stop")
@@ -423,7 +465,31 @@ def batch_stop(request: Request):
 def batch_status():
     q = batch_state["queue"]
     return {"items": q.items if q else [], "running": _batch_running(),
+            "options": q.options.get("patch_options") if q else None,
             "now": time.time()}   # for elapsed times (server clock)
+
+
+@app.post("/api/batch/cancel")
+def batch_cancel(request: Request, payload: dict = Body(default={})):
+    """{"id": n}: cancel that item; {}: cancel the whole batch now (items
+    in flight are killed and go back to pending)."""
+    if (denied := _local_only(request)):
+        return denied
+    q = batch_state["queue"]
+    if q:
+        q.cancel(payload.get("id"))
+    return {"cancelling": True}
+
+
+@app.post("/api/batch/clear")
+def batch_clear(request: Request):
+    """Drop finished (done / skipped / cancelled) items from the list."""
+    if (denied := _local_only(request)):
+        return denied
+    q = batch_state["queue"]
+    if q and not _batch_running():
+        q.clear_finished()
+    return {"items": len(q.items) if q else 0}
 
 
 # ---- output options, presets, track probe, hand-offs ----
@@ -867,6 +933,8 @@ to Downloads is picked up as the AD file">&#127911; AudioVault</button>
       <div style="display:flex;gap:.5rem;margin-top:.6rem">
         <button id="bresume" hidden>Resume batch</button>
         <button id="bstop" hidden>Stop after current</button>
+        <button id="bcancel" hidden>Cancel now</button>
+        <button id="bclear" hidden>Clear finished</button>
       </div>
     </div>
   </div>
@@ -1423,13 +1491,42 @@ $('bstart').onclick = async () => {
   $('bpairs').hidden = true; pollQueue();
 };
 $('bresume').onclick = async () => {
-  await fetch('api/batch/resume', {method: 'POST'}); pollQueue(); };
+  const r = await fetch('api/batch/resume', {method: 'POST'});
+  if (!r.ok) alert((await r.json()).error);
+  pollQueue(); };
 $('bstop').onclick = async () => {
   await fetch('api/batch/stop', {method: 'POST'});
   $('bstop').textContent = 'Stopping after current…'; };
+const bcancel = async id => {
+  await fetch('api/batch/cancel', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(id === undefined ? {} : {id})});
+  pollQueue(); };
+$('bcancel').onclick = () => {
+  if (confirm('Cancel the batch now? Items in progress are stopped and ' +
+              'their half-written files removed; Resume picks them up again.'))
+    bcancel(); };
+$('bclear').onclick = async () => {
+  await fetch('api/batch/clear', {method: 'POST'}); pollQueue(); };
 
 const ST = {pending: '… waiting', running: '▶ running', done: '✔ done',
-            error: '✖ error', skipped: '↷ exists'};
+            error: '✖ error', skipped: '↷ exists', cancelled: '⊘ cancelled'};
+// what an item's output changes vs its source (resolution, size cap...)
+function changes(o) {
+  if (!o) return '';
+  return [o.max_height ? o.max_height + 'p' : null,
+          o.fit_gb ? '≤ ' + o.fit_gb + ' GB' : null,
+          o.fit_gb && o.fit_priority === 'size' ? 'smallest' : null,
+          o.container ? o.container.toUpperCase() : null,
+          o.ad_codec && o.ad_codec !== 'aac' ? 'AD ' + o.ad_codec.toUpperCase() : null,
+          o.keep_subs === 'none' ? 'no subs' : null,
+          o.keep_audio === 'none' ? 'AD only' : null,
+          o.voice_boost && o.voice_boost !== 'off' ? 'voice boost ' + o.voice_boost : null,
+          o.loudness_match ? 'loudness' : null,
+          o.split_small_cuts === false ? 'older fit' : null,
+          o.replace_original ? 'replaces original' : null]
+    .filter(Boolean).join(' · ');
+}
 let qTimer = null;
 const openLogs = new Set();   // episode logs the user has opened
 function renderQueue(q) {
@@ -1437,7 +1534,7 @@ function renderQueue(q) {
   const tb = $('bqtable'); tb.replaceChildren();
   const head = tb.insertRow();
   for (const h of ['#', 'Episode', 'Video', 'Status', 'Progress', 'Sync',
-                   'Time', 'Size']) {
+                   'Time', 'Size', 'Settings', '']) {
     const th = document.createElement('th'); th.textContent = h; head.append(th); }
   const dur = sec => sec >= 3600 ? Math.floor(sec / 3600) + 'h ' +
     Math.floor(sec % 3600 / 60) + 'm' : Math.floor(sec / 60) + 'm ' +
@@ -1449,7 +1546,7 @@ function renderQueue(q) {
     if (season && season !== lastSeason) {   // TV shows: a row per season
       const items = q.items.filter(x => (x.episode || '').startsWith(season));
       const hr = tb.insertRow(); hr.className = 'season';
-      const c = hr.insertCell(); c.colSpan = 8;
+      const c = hr.insertCell(); c.colSpan = 10;
       c.textContent = (season === 'S00' ? 'Specials' : 'Season ' + (+season.slice(1))) +
         '  ·  ' + items.filter(x => x.status === 'done').length + '/' +
         items.length + ' done';
@@ -1489,6 +1586,13 @@ function renderQueue(q) {
     tr.insertCell().textContent = it.started
       ? dur((it.ended || now) - it.started) : '';
     tr.insertCell().textContent = it.size ? fmtBytes(it.size) : '';
+    tr.insertCell().textContent = changes(q.options);
+    const xc = tr.insertCell();
+    if (it.status === 'pending' || it.status === 'running') {
+      const x = document.createElement('button');
+      x.textContent = '✕'; x.title = 'Cancel this one';
+      x.onclick = () => bcancel(it.id); xc.append(x);
+    }
   });
   // summary + rough time left (average of the finished ones)
   const done = q.items.filter(it => it.status === 'done');
@@ -1504,6 +1608,9 @@ function renderQueue(q) {
   $('bresume').hidden = q.running || !(pending || failed);
   $('bresume').textContent = pending ? 'Resume batch' : 'Retry failed';
   $('bstop').hidden = !q.running;
+  $('bcancel').hidden = !q.running;
+  $('bclear').hidden = q.running ||
+    !q.items.some(it => ['done', 'skipped', 'cancelled'].includes(it.status));
   if (!q.running) $('bstop').textContent = 'Stop after current';
 }
 function pollQueue() {
