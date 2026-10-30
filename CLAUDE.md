@@ -10,6 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Mistakes:** no apologies. Mistake = gap or issue in instruction files → name the gap + suggest the fix. Solution oriented.
 - **YAGNI:** don't overengineer; never expand scope without permission. Suggest scope improvements when they make sense. All work must be justifiable. Judge where the project sits on "quick and dirty" ↔ "production grade" and match engineering to it.
 - **Reply budget:** a mistake-gap note and a scope suggestion get at most 1 line each, counted inside the 8-line cap. A scope suggestion only when it changes what the user decides; unsure → cut.
+- **Shell scripts:** never pipe a heredoc into `python -` (or mix a heredoc with `< /dev/null`) — it hangs waiting on stdin. Write the script to a file under `.local/scratch/` and run it with `< /dev/null`.
 - **Review:** after making changes, spin up a subagent on a cheap model with minimal context to review them with fresh eyes. Report its findings only; fix only when told. Skip for one-line or docs-only edits.
 
 ## Project Goal
